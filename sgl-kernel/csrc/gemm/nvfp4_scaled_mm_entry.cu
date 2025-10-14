@@ -15,14 +15,30 @@ limitations under the License.
 
 #include <torch/all.h>
 
-#if defined ENABLE_NVFP4 && ENABLE_NVFP4
-void cutlass_scaled_fp4_mm_sm100a(
+#if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
+    (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
+void cutlass_scaled_fp4_mm_sm100_sm120(
     torch::Tensor& D,
     torch::Tensor const& A,
     torch::Tensor const& B,
     torch::Tensor const& A_sf,
     torch::Tensor const& B_sf,
     torch::Tensor const& alpha);
+
+// SM120 specific dispatch functions
+void cutlass_fp4_bf16_gemm_dispatch_sm120(torch::Tensor& D, torch::Tensor const& A,
+                                          torch::Tensor const& B,
+                                          torch::Tensor const& A_sf,
+                                          torch::Tensor const& B_sf,
+                                          torch::Tensor const& alpha, int m, int n,
+                                          int k, cudaStream_t stream);
+
+void cutlass_fp4_f16_gemm_dispatch_sm120(torch::Tensor& D, torch::Tensor const& A,
+                                         torch::Tensor const& B,
+                                         torch::Tensor const& A_sf,
+                                         torch::Tensor const& B_sf,
+                                         torch::Tensor const& alpha, int m, int n,
+                                         int k, cudaStream_t stream);
 #endif
 
 void cutlass_scaled_fp4_mm(
@@ -32,8 +48,9 @@ void cutlass_scaled_fp4_mm(
     torch::Tensor const& A_sf,
     torch::Tensor const& B_sf,
     torch::Tensor const& alpha) {
-#if defined ENABLE_NVFP4 && ENABLE_NVFP4
-  return cutlass_scaled_fp4_mm_sm100a(D, A, B, A_sf, B_sf, alpha);
+#if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
+    (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
+  return cutlass_scaled_fp4_mm_sm100_sm120(D, A, B, A_sf, B_sf, alpha);
 #endif
   TORCH_CHECK_NOT_IMPLEMENTED(false, "No compiled nvfp4 mm kernel.");
 }

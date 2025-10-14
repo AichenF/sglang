@@ -57,6 +57,9 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
     __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
     fp8SFVal = tmp.__x;
     SFValue = static_cast<float>(tmp);
+    // reinterpret_cast<__nv_fp8_e4m3&>(fp8SFVal) = tmp;
+    // // Convert back to fp32.
+    // SFValue = float(tmp);
   }
   // Get the output scale.
   // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) *
@@ -199,10 +202,10 @@ inline int getMultiProcessorCount() {
   return multi_processor_count;  // Return the cached value on subsequent calls
 }
 
-void scaled_fp4_quant_sm100a(
-    torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_sf, torch::Tensor const& input_sf) {
+void scaled_fp4_quant_sm100_sm120(
+    torch::Tensor const& output, torch::Tensor const& input, torch::Tensor const& output_sf, torch::Tensor const& input_sf) {
   auto sm_version = getSMVersion();
-  TORCH_CHECK(sm_version == 100 || sm_version == 103, "fp4_quant is only supported on sm100a/sm103a");
+  TORCH_CHECK(sm_version == 100 || sm_version == 103 || sm_version == 120, "fp4_quant is only supported on sm100a/sm103a/sm120a");
 
   int32_t m = input.size(0);
   int32_t n = input.size(1);
