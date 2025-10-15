@@ -567,6 +567,10 @@ void run_fp4_blockwise_scaled_group_mm_sm100(
   TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to run GEMM");
 }
 
+// Undefine macros from utils.h to redefine with custom signatures
+#undef CHECK_CONTIGUOUS
+#undef CHECK_INPUT
+
 #define CHECK_TYPE(x, st, m) TORCH_CHECK(x.scalar_type() == st, ": Inconsistency of Tensor type:", m)
 #define CHECK_TH_CUDA(x, m) TORCH_CHECK(x.is_cuda(), m, ": must be a CUDA tensor.")
 #define CHECK_CONTIGUOUS(x, m) TORCH_CHECK(x.is_contiguous(), m, ": must be contiguous.")

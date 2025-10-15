@@ -15,8 +15,7 @@ limitations under the License.
 
 #include <torch/all.h>
 
-#if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
-    (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
+#if defined(ENABLE_NVFP4) && ENABLE_NVFP4
 void cutlass_scaled_fp4_mm_sm100_sm120(
     torch::Tensor& D,
     torch::Tensor const& A,
@@ -48,8 +47,7 @@ void cutlass_scaled_fp4_mm(
     torch::Tensor const& A_sf,
     torch::Tensor const& B_sf,
     torch::Tensor const& alpha) {
-#if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
-    (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
+#if defined(ENABLE_NVFP4) && ENABLE_NVFP4
   return cutlass_scaled_fp4_mm_sm100_sm120(D, A, B, A_sf, B_sf, alpha);
 #endif
   TORCH_CHECK_NOT_IMPLEMENTED(false, "No compiled nvfp4 mm kernel.");

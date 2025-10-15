@@ -693,6 +693,6 @@ def test_grouped_gemm_nt_masked(
 
 if __name__ == "__main__":
     test_cutlass_fp4_moe_no_graph(224, 1024, 1024, 256, 8, torch.half)
-    test_flashinfer_fp4_moe_no_graph(224, 1024, 1024, 256, 8, torch.half)
-    test_flashinfer_cutedsl_moe_masked(16, 128, 512, 4)
-    test_grouped_gemm_nt_masked(16, 128, 512, 4)
+    # test_flashinfer_fp4_moe_no_graph(224, 1024, 1024, 256, 8, torch.half)
+    # test_flashinfer_cutedsl_moe_masked(16, 128, 512, 4)
+    # test_grouped_gemm_nt_masked(16, 128, 512, 4)
