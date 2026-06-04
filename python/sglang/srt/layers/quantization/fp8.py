@@ -1311,7 +1311,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
                 layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
 
-                if get_moe_a2a_backend().is_megamoe():
+                if (
+                    get_moe_a2a_backend().is_megamoe()
+                    and is_sm100_supported()
+                ):
                     from sglang.srt.layers.moe.mega_moe import (
                         build_mega_moe_experts_weights,
                     )
@@ -1319,25 +1322,38 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     build_mega_moe_experts_weights(layer)
                     return
 
-                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and will_use_deepgemm:
-                    from deep_gemm import transform_sf_into_required_layout
+            if (
+                not self.is_fp4_expert
+                and get_moe_a2a_backend().is_megamoe()
+                and is_sm90_supported()
+                and not is_sm100_supported()
+            ):
+                from sglang.srt.layers.moe.mega_moe import (
+                    build_mega_moe_experts_weights,
+                )
 
-                    for scale_param, weight_param in [
-                        (layer.w13_weight_scale_inv, layer.w13_weight),
-                        (layer.w2_weight_scale_inv, layer.w2_weight),
-                    ]:
-                        num_experts, n, _ = scale_param.data.shape
-                        k = weight_param.shape[2] * 2
-                        scale_param.data = transform_sf_into_required_layout(
-                            scale_param.data,
-                            mn=n,
-                            k=k,
-                            recipe=(1, 32),
-                            num_groups=num_experts,
-                            disable_ue8m0_cast=False,
-                        )
-                    layer.w13_weight_scale_inv.format_ue8m0 = True
-                    layer.w2_weight_scale_inv.format_ue8m0 = True
+                build_mega_moe_experts_weights(layer)
+                return
+
+            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and will_use_deepgemm:
+                from deep_gemm import transform_sf_into_required_layout
+
+                for scale_param, weight_param in [
+                    (layer.w13_weight_scale_inv, layer.w13_weight),
+                    (layer.w2_weight_scale_inv, layer.w2_weight),
+                ]:
+                    num_experts, n, _ = scale_param.data.shape
+                    k = weight_param.shape[2] * 2
+                    scale_param.data = transform_sf_into_required_layout(
+                        scale_param.data,
+                        mn=n,
+                        k=k,
+                        recipe=(1, 32),
+                        num_groups=num_experts,
+                        disable_ue8m0_cast=False,
+                    )
+                layer.w13_weight_scale_inv.format_ue8m0 = True
+                layer.w2_weight_scale_inv.format_ue8m0 = True
 
             if (
                 not self.is_fp4_expert
