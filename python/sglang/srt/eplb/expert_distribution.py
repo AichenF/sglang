@@ -311,9 +311,6 @@ class _SinglePassGatherer(ABC):
                 server_args, expert_location_metadata, rank
             )
 
-        if server_args.moe_a2a_backend == "megamoe":
-            return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
-
         if server_args.expert_distribution_recorder_mode == "stat_approx":
             if server_args.moe_a2a_backend != "none" and (
                 server_args.deepep_mode == "normal"
@@ -329,6 +326,10 @@ class _SinglePassGatherer(ABC):
                 return _DeepepLowLatencySinglePassGatherer(
                     expert_location_metadata, rank
                 )
+            elif server_args.moe_a2a_backend == "megamoe":
+                # MegaMoE keeps deepep_mode="auto" but uses host-side select_experts
+                # routing (same path as moe_a2a_backend=="none").
+                return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             else:
                 raise NotImplementedError
 
