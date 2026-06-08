@@ -529,26 +529,10 @@ class SchedulerDisaggregationPrefillMixin:
         logprob_pt = 0
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         next_token_ids = result.next_token_ids.tolist()
-        if batch.return_logprob:
-            if logits_output.next_token_logprobs is not None:
-                logits_output.next_token_logprobs = (
-                    logits_output.next_token_logprobs.tolist()
-                )
-            if logits_output.input_token_logprobs is not None:
-                logits_output.input_token_logprobs = tuple(
-                    logits_output.input_token_logprobs.tolist()
-                )
-            if logits_output.next_token_top_logprobs_val:
-                logits_output.next_token_top_logprobs_val = [
-                    v.tolist() for v in logits_output.next_token_top_logprobs_val
-                ]
-                logits_output.next_token_top_logprobs_idx = [
-                    x.tolist() for x in logits_output.next_token_top_logprobs_idx
-                ]
-            if logits_output.next_token_token_ids_logprobs_val:
-                logits_output.next_token_token_ids_logprobs_val = [
-                    v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
-                ]
+        self.batch_result_processor.move_logprobs_to_cpu(
+            batch=batch,
+            logits_output=logits_output,
+        )
 
         def advance_logprob_pt(i: int, req: Req) -> None:
             nonlocal logprob_pt
@@ -886,7 +870,7 @@ class SchedulerDisaggregationPrefillMixin:
             elif self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                 self.chunked_req.tmp_end_idx = min(
-                    len(self.chunked_req.fill_ids),
+                    self.chunked_req.fill_len,
                     len(self.chunked_req.origin_input_ids),
                 )
             else:
@@ -922,7 +906,7 @@ class SchedulerDisaggregationPrefillMixin:
         end_idx = (
             end_idx
             if end_idx is not None
-            else min(len(req.fill_ids), len(req.origin_input_ids))
+            else min(req.fill_len, len(req.origin_input_ids))
         )
 
         if not last_chunk:
@@ -947,7 +931,13 @@ class SchedulerDisaggregationPrefillMixin:
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
-            seq_len = len(req.fill_ids)
+            # fill_ids includes the token sampled during prefill, but decode
+            # registers state pages over origin_input_ids (DecodePreallocQueue)
+            # and the main pool send is clamped to end_idx above. Matching that
+            # length here avoids emitting an extra state page when the sampled
+            # token crosses a page boundary, which mismatched src/dst lengths in
+            # group_concurrent_contiguous.
+            seq_len = min(req.fill_len, len(req.origin_input_ids))
 
             def _mamba_payload():
                 return [
