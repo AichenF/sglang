@@ -312,6 +312,18 @@ def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
     out.mul_(routed_scaling_factor)
 
 
+def _is_prefill_disaggregation_mode() -> bool:
+    try:
+        return getattr(get_global_server_args(), "disaggregation_mode", None) == "prefill"
+    except ValueError:
+        return False
+
+
+def _moe_sum_reduce_eager(x, out, routed_scaling_factor):
+    torch.sum(x, dim=1, out=out)
+    out.mul_(routed_scaling_factor)
+
+
 @torch.compile
 def _swiglu_silu_clamp_mul(x, gemm1_limit):
     gate, up = x.chunk(2, dim=-1)
@@ -729,11 +741,18 @@ def _fused_moe_kernel_sequence(
         else:
             # According to micro benchmark results, torch.compile can get better performance for small token.
             if num_tokens <= 32:
-                moe_sum_reduce_torch_compile(
-                    intermediate_cache3.view(*intermediate_cache3.shape),
-                    out_hidden_states,
-                    routed_scaling_factor,
-                )
+                if _is_prefill_disaggregation_mode():
+                    _moe_sum_reduce_eager(
+                        intermediate_cache3.view(*intermediate_cache3.shape),
+                        out_hidden_states,
+                        routed_scaling_factor,
+                    )
+                else:
+                    moe_sum_reduce_torch_compile(
+                        intermediate_cache3.view(*intermediate_cache3.shape),
+                        out_hidden_states,
+                        routed_scaling_factor,
+                    )
             else:
                 moe_sum_reduce(
                     intermediate_cache3.view(*intermediate_cache3.shape),

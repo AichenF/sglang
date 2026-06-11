@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -32,6 +33,7 @@ from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
+from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -42,6 +44,70 @@ if TYPE_CHECKING:
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _MEGA_MOE_DG_ENV_APPLIED = False
+
+
+@dataclass(frozen=True)
+class _MegaMoeArchConfig:
+    name: str
+    deep_gemm_entry: str
+    run_recipe: tuple[int, int, int]
+    scale_recipe: tuple[int, int]
+    pre_dispatch_group_size: int
+    fp4_weight_packed: bool
+    uses_raw_fp32_scales: bool
+    use_dp_max_tokens: bool
+    fold_routed_scaling_in_pre_dispatch: bool
+
+
+_SM90_FP8_CONFIG = _MegaMoeArchConfig(
+    name="sm90_fp8",
+    deep_gemm_entry="fp8_mega_moe",
+    run_recipe=(128, 128, 128),
+    scale_recipe=(128, 128),
+    pre_dispatch_group_size=128,
+    fp4_weight_packed=False,
+    uses_raw_fp32_scales=True,
+    use_dp_max_tokens=True,
+    fold_routed_scaling_in_pre_dispatch=True,
+)
+_SM100_FP8_FP4_CONFIG = _MegaMoeArchConfig(
+    name="sm100_fp8_fp4",
+    deep_gemm_entry="fp8_fp4_mega_moe",
+    run_recipe=(1, 1, 32),
+    scale_recipe=(1, 32),
+    pre_dispatch_group_size=32,
+    fp4_weight_packed=True,
+    uses_raw_fp32_scales=False,
+    use_dp_max_tokens=False,
+    fold_routed_scaling_in_pre_dispatch=False,
+)
+_MEGA_MOE_ARCH_CONFIGS = {
+    config.name: config
+    for config in (_SM90_FP8_CONFIG, _SM100_FP8_FP4_CONFIG)
+}
+
+
+def _select_mega_moe_arch_config(
+    w13: torch.Tensor, w2: torch.Tensor
+) -> Optional[_MegaMoeArchConfig]:
+    if (
+        _device_sm == 90
+        and w13.dtype == torch.float8_e4m3fn
+        and w2.dtype == torch.float8_e4m3fn
+    ):
+        return _SM90_FP8_CONFIG
+    if (
+        _device_sm is not None
+        and _device_sm >= 100
+        and w13.dtype == torch.int8
+        and w2.dtype == torch.int8
+    ):
+        return _SM100_FP8_FP4_CONFIG
+    return None
+
+
+def _get_built_mega_moe_arch_config(experts) -> Optional[_MegaMoeArchConfig]:
+    return _MEGA_MOE_ARCH_CONFIGS.get(getattr(experts, "_mega_moe_arch", None))
 
 
 def _apply_mega_moe_dg_env() -> None:
@@ -121,35 +187,52 @@ def _get_dp_global_num_tokens_or_none() -> Optional[list[int]]:
         return None
 
 
+def _deep_gemm_supports_mega_moe_config(config: _MegaMoeArchConfig) -> bool:
+    try:
+        import deep_gemm
+    except ImportError:
+        return False
+    return hasattr(deep_gemm, config.deep_gemm_entry)
+
+
+def _get_effective_num_tokens(config: _MegaMoeArchConfig, num_tokens: int) -> int:
+    if not config.use_dp_max_tokens:
+        return num_tokens
+    global_num_tokens = _get_dp_global_num_tokens_or_none()
+    if not global_num_tokens:
+        effective_num_tokens = num_tokens
+    else:
+        effective_num_tokens = max(max(global_num_tokens), num_tokens)
+    if (
+        0 < effective_num_tokens < config.pre_dispatch_group_size
+        and _get_disaggregation_mode_or_none() == "prefill"
+    ):
+        return config.pre_dispatch_group_size
+    return effective_num_tokens
+
+
+
+def _get_disaggregation_mode_or_none() -> Optional[str]:
+    try:
+        return getattr(get_global_server_args(), "disaggregation_mode", None)
+    except ValueError:
+        return None
+
+
 def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bool:
     if not get_moe_a2a_backend().is_megamoe():
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
         return False
-    if _device_sm is None or _device_sm < 90:
+
+    config = _get_built_mega_moe_arch_config(moe.experts)
+    if config is None or not _deep_gemm_supports_mega_moe_config(config):
         return False
-    try:
-        import deep_gemm
-    except ImportError:
-        return False
-    if _device_sm == 90:
-        if not hasattr(deep_gemm, "fp8_mega_moe"):
-            return False
-        if not getattr(moe.experts, "_mega_moe_sm90_fp8_weights", False):
-            return False
-    elif _device_sm >= 100:
-        if not hasattr(deep_gemm, "fp8_fp4_mega_moe"):
-            return False
-    else:
-        return False
-    if get_is_capture_mode():
+    is_capture_mode = get_is_capture_mode()
+    max_tokens_per_rank = _get_effective_num_tokens(config, hidden_states.shape[0])
+    if is_capture_mode:
         return True
 
-    global_num_tokens = _get_dp_global_num_tokens_or_none()
-    if global_num_tokens:
-        max_tokens_per_rank = max(global_num_tokens)
-    else:
-        max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     return max_tokens_per_rank <= cap
 
@@ -202,18 +285,12 @@ def _run_mega_routed(
 
     from sglang.srt.distributed.parallel_state import get_moe_ep_group
 
+    config = _get_built_mega_moe_arch_config(moe.experts)
+    assert config is not None, "MegaMoE weights must be built before forward"
+
     hidden_size = moe.config.hidden_size
-    use_sm90_fp8_mega = _device_sm == 90 and getattr(
-        moe.experts, "_mega_moe_sm90_fp8_weights", False
-    )
-    effective_num_tokens = num_tokens
-    if use_sm90_fp8_mega:
-        # SM90 fp8_mega_moe runs with the max token count across DP ranks;
-        # the local result is sliced back to num_tokens after the kernel.
-        global_num_tokens = _get_dp_global_num_tokens_or_none()
-        effective_num_tokens = max(global_num_tokens) if global_num_tokens else num_tokens
-        effective_num_tokens = max(effective_num_tokens, num_tokens)
-    if use_sm90_fp8_mega and effective_num_tokens == 0:
+    effective_num_tokens = _get_effective_num_tokens(config, num_tokens)
+    if config.use_dp_max_tokens and effective_num_tokens == 0:
         _ensure_mega_moe_symm_buffer(moe)
         return hidden_states.new_empty((0, hidden_size))
 
@@ -242,7 +319,8 @@ def _run_mega_routed(
         topk_ids = None
         topk_weights = None
 
-    ep_group = get_moe_ep_group().device_group
+    moe_ep_group = get_moe_ep_group()
+    ep_group = moe_ep_group.device_group
     num_experts = moe.experts.num_experts
     top_k = moe.config.num_experts_per_tok + moe.num_fused_shared_experts
     intermediate_size = moe.config.moe_intermediate_size
@@ -263,6 +341,15 @@ def _run_mega_routed(
         hidden=hidden_size,
         intermediate_hidden=intermediate_size,
     )
+    dispatch_num_tokens = effective_num_tokens if config.use_dp_max_tokens else num_tokens
+    dispatch_hidden_states = hidden_states
+    pad_dispatch_inputs = dispatch_num_tokens > num_tokens
+    if pad_dispatch_inputs:
+        dispatch_hidden_states = hidden_states.new_zeros(
+            (dispatch_num_tokens, hidden_size)
+        )
+        if num_tokens > 0:
+            dispatch_hidden_states[:num_tokens].copy_(hidden_states)
 
     if num_tokens > 0:
         topk_ids_in = topk_ids.to(torch.int32)
@@ -270,16 +357,40 @@ def _run_mega_routed(
     else:
         topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
+    if pad_dispatch_inputs:
+        padded_topk_ids = hidden_states.new_full(
+            (dispatch_num_tokens, top_k), -1, dtype=torch.int32
+        )
+        padded_topk_weights = hidden_states.new_zeros(
+            (dispatch_num_tokens, top_k), dtype=torch.float32
+        )
+        if config.fold_routed_scaling_in_pre_dispatch:
+            num_experts_per_rank = num_experts // moe_ep_group.world_size
+            dummy_expert_base = moe_ep_group.rank_in_group * num_experts_per_rank
+            dummy_expert_ids = torch.arange(
+                dummy_expert_base,
+                dummy_expert_base + top_k,
+                device=hidden_states.device,
+                dtype=torch.int32,
+            )
+            padded_topk_ids[num_tokens:, :].copy_(dummy_expert_ids)
+        if num_tokens > 0:
+            padded_topk_ids[:num_tokens].copy_(topk_ids_in)
+            padded_topk_weights[:num_tokens].copy_(topk_weights_in)
+        topk_ids_in = padded_topk_ids
+        topk_weights_in = padded_topk_weights
+
 
     fused_routed_scaling = False
-    if use_sm90_fp8_mega:
+
+    if config.fold_routed_scaling_in_pre_dispatch:
         if moe.experts.should_fuse_routed_scaling_factor_in_topk:
             scale = 1.0
         else:
             scale = float(moe.routed_scaling_factor)
             fused_routed_scaling = True
         mega_moe_pre_dispatch_sm90(
-            hidden_states,
+            dispatch_hidden_states,
             topk_ids_in,
             topk_weights_in,
             buf.x,
@@ -287,38 +398,38 @@ def _run_mega_routed(
             buf.topk_idx,
             buf.topk_weights,
             routed_scaling_factor=scale,
-            quant_group_size=128,
+            quant_group_size=config.pre_dispatch_group_size,
         )
     elif envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get():
         # FP4 path goes through DeepGEMM's mega_moe_pre_dispatch which
         # handles the E2M1 packing variant. The jit implementation
         # only emits FP8.
         deep_gemm.mega_moe_pre_dispatch(
-            hidden_states,
+            dispatch_hidden_states,
             topk_ids_in,
             topk_weights_in,
             buf.x,
             buf.x_sf,
             buf.topk_idx,
             buf.topk_weights,
-            num_tokens=num_tokens,
-            group_size=32,
+            num_tokens=dispatch_num_tokens,
+            group_size=config.pre_dispatch_group_size,
             use_fp4_acts=True,
         )
     else:
         mega_moe_pre_dispatch(
-            hidden_states,
+            dispatch_hidden_states,
             topk_ids_in,
             topk_weights_in,
             buf.x,
             buf.x_sf,
             buf.topk_idx,
             buf.topk_weights,
-            quant_group_size=32,
+            quant_group_size=config.pre_dispatch_group_size,
         )
 
     y_num_tokens = (
-        effective_num_tokens if use_sm90_fp8_mega else max(num_tokens, 1)
+        effective_num_tokens if config.use_dp_max_tokens else max(num_tokens, 1)
     )
     y = torch.empty(
         (y_num_tokens, hidden_size),
@@ -326,28 +437,16 @@ def _run_mega_routed(
         device=hidden_states.device,
     )
     swiglu_limit = getattr(moe.config, "swiglu_limit", None)
-    if use_sm90_fp8_mega:
-        deep_gemm.fp8_mega_moe(
-            y,
-            moe.experts.mega_l1_weights,
-            moe.experts.mega_l2_weights,
-            buf,
-            recipe=(128, 128, 128),
-            activation="swiglu",
-            activation_clamp=swiglu_limit,
-            fast_math=True,
-        )
-    else:
-        deep_gemm.fp8_fp4_mega_moe(
-            y,
-            moe.experts.mega_l1_weights,
-            moe.experts.mega_l2_weights,
-            buf,
-            recipe=(1, 1, 32),
-            activation="swiglu",
-            activation_clamp=swiglu_limit,
-            fast_math=True,
-        )
+    getattr(deep_gemm, config.deep_gemm_entry)(
+        y,
+        moe.experts.mega_l1_weights,
+        moe.experts.mega_l2_weights,
+        buf,
+        recipe=config.run_recipe,
+        activation="swiglu",
+        activation_clamp=swiglu_limit,
+        fast_math=True,
+    )
     y = y[:num_tokens]
 
     if (
@@ -368,7 +467,7 @@ def _interleave_l1_weight_only(weight: torch.Tensor, gran: int = 8) -> torch.Ten
     )
 
 
-def build_mega_moe_experts_weights(experts) -> None:
+def build_mega_moe_experts_weights(experts) -> bool:
     from deep_gemm import (
         transform_sf_into_required_layout,
         transform_weights_for_mega_moe,
@@ -376,35 +475,25 @@ def build_mega_moe_experts_weights(experts) -> None:
     from deep_gemm.mega import _interleave_l1_weights, _transpose_sf_for_utccp
 
     if getattr(experts, "_mega_moe_weights_built", False):
-        return
+        return _get_built_mega_moe_arch_config(experts) is not None
 
     w13 = experts.w13_weight.data
     w13_sf_fp32 = experts.w13_weight_scale_inv.data
     w2 = experts.w2_weight.data
     w2_sf_fp32 = experts.w2_weight_scale_inv.data
+    config = _select_mega_moe_arch_config(w13, w2)
+    if config is None:
+        return False
 
     num_groups, n1, half_k1 = w13.shape
     _, n2, half_k2 = w2.shape
 
-    use_sm90_fp8_mega = (
-        _device_sm == 90
-        and w13.dtype == torch.float8_e4m3fn
-        and w2.dtype == torch.float8_e4m3fn
-    )
     # FP4 weights are packed as int8 and have last dim K//2; FP8 weights use K.
-    if use_sm90_fp8_mega:
-        k1 = half_k1
-        k2 = half_k2
-    else:
-        k1 = half_k1 * 2
-        k2 = half_k2 * 2
+    k_factor = 2 if config.fp4_weight_packed else 1
+    k1 = half_k1 * k_factor
+    k2 = half_k2 * k_factor
 
-    # SM90 fp8_mega_moe consumes the checkpoint's block-(128, 128) FP32 scales
-    # directly; SM100 fp8_fp4_mega_moe keeps the UE8M0 recipe.
-    recipe = (128, 128) if use_sm90_fp8_mega else (1, 32)
-    disable_ue8m0_cast = use_sm90_fp8_mega
-
-    scale_group_mn, scale_group_k = recipe
+    scale_group_mn, scale_group_k = config.scale_recipe
     assert k1 % scale_group_k == 0 and k2 % scale_group_k == 0, (
         f"invalid mega-moe K/group_size: k1={k1}, k2={k2}, "
         f"group_k={scale_group_k}"
@@ -431,14 +520,12 @@ def build_mega_moe_experts_weights(experts) -> None:
     )
 
     fix_mega_moe_memory = envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get()
-    if fix_mega_moe_memory and use_sm90_fp8_mega:
+    if fix_mega_moe_memory and config.name == _SM90_FP8_CONFIG.name:
         # SM90 shares both fp8 weights and block-(128, 128) FP32 scales with the
         # DeepEP grouped-GEMM path. SM90 has no UTCCP scale transpose, and its
         # scale tensors stay in checkpoint layout.
         w13_interleaved = _interleave_l1_weight_only(w13)
-
         experts.w13_weight.data = w13_interleaved
-
         experts.mega_l1_weights = (
             experts.w13_weight.data,
             experts.w13_weight_scale_inv.data,
@@ -452,49 +539,51 @@ def build_mega_moe_experts_weights(experts) -> None:
             w13_sf_fp32,
             mn=n1,
             k=k1,
-            recipe=recipe,
+            recipe=config.scale_recipe,
             num_groups=num_groups,
-            disable_ue8m0_cast=disable_ue8m0_cast,
+            disable_ue8m0_cast=config.uses_raw_fp32_scales,
         )
         w2_sf = transform_sf_into_required_layout(
             w2_sf_fp32,
             mn=n2,
             k=k2,
-            recipe=recipe,
+            recipe=config.scale_recipe,
             num_groups=num_groups,
-            disable_ue8m0_cast=disable_ue8m0_cast,
+            disable_ue8m0_cast=config.uses_raw_fp32_scales,
         )
 
-    if fix_mega_moe_memory and not use_sm90_fp8_mega:
-        # Build the interleaved L1 weight + scale once; share the weight buffer
-        # between `w13_weight.data` (normal deep-ep path) and `mega_l1_weights[0]`
-        # (mega moe path). Mega moe additionally needs a UTCCP-transposed scale;
-        # the deep-ep path consumes the non-transposed interleaved scale and a
-        # swizzle-aware activation kernel. L2 weight is untouched by the mega
-        # transform, so the existing `w2_weight.data` is shared directly.
-        w13_interleaved, w13_sf_interleaved = _interleave_l1_weights((w13, w13_sf))
-        w13_sf_utccp = _transpose_sf_for_utccp(w13_sf_interleaved)
-        w2_sf_utccp = _transpose_sf_for_utccp(w2_sf)
+        if fix_mega_moe_memory and config.name == _SM100_FP8_FP4_CONFIG.name:
+            # Build the interleaved L1 weight + scale once; share the weight buffer
+            # between `w13_weight.data` (normal deep-ep path) and `mega_l1_weights[0]`
+            # (mega moe path). Mega moe additionally needs a UTCCP-transposed scale;
+            # the deep-ep path consumes the non-transposed interleaved scale and a
+            # swizzle-aware activation kernel. L2 weight is untouched by the mega
+            # transform, so the existing `w2_weight.data` is shared directly.
+            w13_interleaved, w13_sf_interleaved = _interleave_l1_weights(
+                (w13, w13_sf)
+            )
+            w13_sf_utccp = _transpose_sf_for_utccp(w13_sf_interleaved)
+            w2_sf_utccp = _transpose_sf_for_utccp(w2_sf)
 
-        experts.w13_weight.data = w13_interleaved
-        experts.w13_weight_scale_inv.data = w13_sf_interleaved
-        experts.w2_weight_scale_inv.data = w2_sf
-        experts.w13_weight_scale_inv.format_ue8m0 = True
-        experts.w2_weight_scale_inv.format_ue8m0 = True
+            experts.w13_weight.data = w13_interleaved
+            experts.w13_weight_scale_inv.data = w13_sf_interleaved
+            experts.w2_weight_scale_inv.data = w2_sf
+            experts.w13_weight_scale_inv.format_ue8m0 = True
+            experts.w2_weight_scale_inv.format_ue8m0 = True
 
-        experts.mega_l1_weights = (experts.w13_weight.data, w13_sf_utccp)
-        experts.mega_l2_weights = (experts.w2_weight.data, w2_sf_utccp)
-    elif not fix_mega_moe_memory:
-        transform_fn = transform_weights_for_mega_moe
-        if use_sm90_fp8_mega:
-            from deep_gemm import transform_weights_for_mega_moe_sm90
+            experts.mega_l1_weights = (experts.w13_weight.data, w13_sf_utccp)
+            experts.mega_l2_weights = (experts.w2_weight.data, w2_sf_utccp)
+        else:
+            transform_fn = transform_weights_for_mega_moe
+            if config.name == _SM90_FP8_CONFIG.name:
+                from deep_gemm import transform_weights_for_mega_moe_sm90
 
-            transform_fn = transform_weights_for_mega_moe_sm90
+                transform_fn = transform_weights_for_mega_moe_sm90
 
-        l1_pair, l2_pair = transform_fn((w13, w13_sf), (w2, w2_sf))
+            l1_pair, l2_pair = transform_fn((w13, w13_sf), (w2, w2_sf))
+            experts.mega_l1_weights = l1_pair
+            experts.mega_l2_weights = l2_pair
 
-        experts.mega_l1_weights = l1_pair
-        experts.mega_l2_weights = l2_pair
-
-    experts._mega_moe_sm90_fp8_weights = use_sm90_fp8_mega
+    experts._mega_moe_arch = config.name
     experts._mega_moe_weights_built = True
+    return True
