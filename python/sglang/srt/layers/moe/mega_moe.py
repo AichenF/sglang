@@ -225,14 +225,6 @@ def _get_effective_num_tokens(config: _MegaMoeArchConfig, num_tokens: int) -> in
     ):
         effective_num_tokens = config.pre_dispatch_group_size
 
-    # SM90 NVFP4 MegaMoE corrupts exact power-of-two token tiles on H20.
-    # Pad one dummy token and slice back after the kernel.
-    if (
-        config.name == _SM90_NVFP4_CONFIG.name
-        and effective_num_tokens >= config.pre_dispatch_group_size
-        and effective_num_tokens & (effective_num_tokens - 1) == 0
-    ):
-        effective_num_tokens += 1
     return effective_num_tokens
 
 
@@ -703,91 +695,6 @@ def _modelopt_nvfp4_prefold_scale(
     return prefold.to(device=device, dtype=torch.float32).contiguous()
 
 
-def _requantize_modelopt_nvfp4_for_deepgemm(
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    global_scale: torch.Tensor,
-    *,
-    gated_l1: bool,
-    group_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    from deep_gemm.quantization_nvfp4 import quantize_to_nvfp4
-
-    assert weight.dtype == torch.uint8, weight.dtype
-    assert weight.dim() == 3, weight.shape
-    assert weight_scale.shape == (
-        weight.shape[0],
-        weight.shape[1],
-        weight.shape[2] * 2 // group_size,
-    ), (
-        f"NVFP4 scale shape mismatch: weight={tuple(weight.shape)}, "
-        f"scale={tuple(weight_scale.shape)}, group_size={group_size}"
-    )
-
-    global_scale = global_scale.to(device=weight.device, dtype=torch.float32)
-    if global_scale.dim() == 2 and global_scale.shape[1] == 1:
-        global_scale = global_scale[:, 0]
-
-    fp4_values = torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
-        device=weight.device,
-        dtype=torch.float32,
-    )
-    packed_out = torch.empty_like(weight)
-    scale_out = torch.empty(
-        weight_scale.shape, dtype=torch.uint8, device=weight_scale.device
-    )
-    chunk_n = int(os.environ.get("SGLANG_MEGAMOE_NVFP4_REQUANT_CHUNK_N", "128"))
-    chunk_n = max(1, chunk_n)
-    n = weight.shape[1]
-    half_n = n // 2
-
-    def tensor_scale_for_range(start: int, end: int) -> torch.Tensor:
-        if gated_l1 and global_scale.dim() == 2 and global_scale.shape[1] >= 2:
-            tensor_scale = torch.empty(
-                (weight.shape[0], end - start),
-                dtype=torch.float32,
-                device=weight.device,
-            )
-            first_end = min(end, half_n)
-            if start < first_end:
-                tensor_scale[:, : first_end - start] = global_scale[:, 0].reshape(
-                    -1, 1
-                )
-            if end > half_n:
-                offset = max(0, half_n - start)
-                tensor_scale[:, offset:] = global_scale[:, 1].reshape(-1, 1)
-            return tensor_scale
-
-        tensor_scale = global_scale[:, 0] if global_scale.dim() == 2 else global_scale
-        return tensor_scale.reshape(-1, 1)
-
-    for start in range(0, n, chunk_n):
-        end = min(start + chunk_n, n)
-        packed = weight[:, start:end, :]
-        nibbles = torch.empty(
-            (*packed.shape[:-1], packed.shape[-1] * 2),
-            dtype=torch.uint8,
-            device=packed.device,
-        )
-        nibbles[..., 0::2] = packed & 0x0F
-        nibbles[..., 1::2] = packed >> 4
-
-        dequant = fp4_values[(nibbles & 0x07).long()]
-        dequant = torch.where((nibbles & 0x08) == 0, dequant, -dequant)
-        block_scale = weight_scale[:, start:end, :].to(torch.float32)
-        dequant.mul_(block_scale.repeat_interleave(group_size, dim=-1))
-        dequant.mul_(tensor_scale_for_range(start, end).unsqueeze(-1))
-
-        requant_packed, requant_scale = quantize_to_nvfp4(
-            dequant, group_size=group_size
-        )
-        packed_out[:, start:end, :].copy_(requant_packed)
-        scale_out[:, start:end, :].copy_(requant_scale)
-
-    return packed_out.contiguous(), scale_out.contiguous()
-
-
 def _build_sm90_nvfp4_mega_moe_weights(
     experts,
     w13: torch.Tensor,
@@ -828,58 +735,6 @@ def _build_sm90_nvfp4_mega_moe_weights(
     gated_l1 = getattr(
         getattr(experts, "moe_runner_config", None), "is_gated", False
     )
-    requantize = os.environ.get("SGLANG_MEGAMOE_NVFP4_REQUANTIZE", "0") == "1"
-    if requantize:
-        from deep_gemm.mega import transform_nvfp4_weights_for_mega_moe_sm90
-
-        block_n = int(os.environ.get("DG_SM90_NVFP4_BLOCK_N", "128"))
-        block_k = 128
-        fused_env = os.environ.get("DG_SM90_NVFP4_FUSED_B_SCALE")
-        fused_b_scale = None if fused_env is None else fused_env != "0"
-        w13_requant, w13_scale_ue4m3 = _requantize_modelopt_nvfp4_for_deepgemm(
-            w13,
-            experts.w13_weight_scale.data,
-            experts.w13_weight_scale_2.data,
-            gated_l1=gated_l1,
-            group_size=group_size,
-        )
-        w2_requant, w2_scale_ue4m3 = _requantize_modelopt_nvfp4_for_deepgemm(
-            w2,
-            experts.w2_weight_scale.data,
-            experts.w2_weight_scale_2.data,
-            gated_l1=False,
-            group_size=group_size,
-        )
-        if os.environ.get("SGLANG_MEGAMOE_NVFP4_FP8_SHADOW", "0") == "1":
-            from deep_gemm.mega import (
-                materialize_nvfp4_fp8_shadow_for_mega_moe_sm90,
-            )
-
-            experts.mega_l1_weights, experts.mega_l2_weights = (
-                materialize_nvfp4_fp8_shadow_for_mega_moe_sm90(
-                    (w13_requant, w13_scale_ue4m3),
-                    (w2_requant, w2_scale_ue4m3),
-                    group_size=group_size,
-                )
-            )
-            experts.mega_l1_global_scales = None
-            experts.mega_l2_global_scales = None
-            experts._mega_moe_arch = _SM90_FP8_CONFIG.name
-            return
-
-        experts.mega_l1_weights, experts.mega_l2_weights = (
-            transform_nvfp4_weights_for_mega_moe_sm90(
-                (w13_requant, w13_scale_ue4m3),
-                (w2_requant, w2_scale_ue4m3),
-                block_n=block_n,
-                block_k=block_k,
-                group_size=group_size,
-                fused_b_scale=fused_b_scale,
-            )
-        )
-        experts.mega_l1_global_scales = None
-        experts.mega_l2_global_scales = None
-        return
 
     l1_global_scales = _modelopt_nvfp4_global_scale_1d(
         experts.w13_weight_scale_2.data,
@@ -914,8 +769,7 @@ def _build_sm90_nvfp4_mega_moe_weights(
 
     block_n = int(os.environ.get("DG_SM90_NVFP4_BLOCK_N", "128"))
     block_k = 128
-    fused_env = os.environ.get("DG_SM90_NVFP4_FUSED_B_SCALE")
-    fused_b_scale = True if fused_env is None else fused_env != "0"
+    fused_b_scale = os.environ.get("DG_SM90_NVFP4_FUSED_B_SCALE") == "1"
 
     _modelopt_nvfp4_to_deepgemm_packed_inplace(w13)
     _modelopt_nvfp4_to_deepgemm_packed_inplace(w2)
