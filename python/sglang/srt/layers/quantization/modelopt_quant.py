@@ -1904,6 +1904,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         moe_runner_backend = getattr(
             self, "_moe_runner_backend", get_moe_runner_backend()
         )
+        if get_moe_a2a_backend().is_megamoe():
+            from sglang.srt.layers.moe.mega_moe import (
+                build_mega_moe_experts_weights,
+            )
+
+            if build_mega_moe_experts_weights(layer):
+                return
+
         if moe_runner_backend.is_marlin():
             copy_or_rebind_param(
                 layer,
@@ -2173,8 +2181,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     def load_up_proj_weight_first(self) -> bool:
         # Load W13 as [Up, Gate] for FlashInfer CUTLASS and CuteDSL v2 kernels.
         # The CuteDSL v1 (deepep) path uses [Gate, Up] -- do NOT flip.
-        return self.moe_runner_config.is_gated and (
-            self.enable_flashinfer_cutlass_moe or self._is_cutedsl_v2_standard
+        # DeepGEMM MegaMoE also expects the original [Gate, Up] layout.
+        return (
+            not get_moe_a2a_backend().is_megamoe()
+            and self.moe_runner_config.is_gated
+            and (self.enable_flashinfer_cutlass_moe or self._is_cutedsl_v2_standard)
         )
 
     def create_moe_runner(
@@ -2192,6 +2203,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
 
         self._moe_runner_backend = moe_runner_backend
+
+        if get_moe_a2a_backend().is_megamoe():
+            return
 
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
