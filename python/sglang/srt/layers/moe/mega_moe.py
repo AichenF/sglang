@@ -240,18 +240,37 @@ def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bo
     if not get_moe_a2a_backend().is_megamoe():
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
-        return False
+        raise RuntimeError(
+            "MegaMoE backend is enabled, but MegaMoE expert weights were not "
+            "built. Check model quantization, GPU architecture, and DeepGEMM "
+            "MegaMoE support."
+        )
 
     config = _get_built_mega_moe_arch_config(moe.experts)
-    if config is None or not _deep_gemm_supports_mega_moe_config(config):
-        return False
+    if config is None:
+        raise RuntimeError(
+            "MegaMoE backend is enabled, but the loaded expert weights do not "
+            "match a supported MegaMoE architecture."
+        )
+    if not _deep_gemm_supports_mega_moe_config(config):
+        raise RuntimeError(
+            f"MegaMoE backend requires DeepGEMM entry "
+            f"{config.deep_gemm_entry!r}, but it is not available."
+        )
     is_capture_mode = get_is_capture_mode()
     max_tokens_per_rank = _get_effective_num_tokens(config, hidden_states.shape[0])
     if is_capture_mode:
         return True
 
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-    return max_tokens_per_rank <= cap
+    if max_tokens_per_rank > cap:
+        raise RuntimeError(
+            f"MegaMoE backend cannot handle {max_tokens_per_rank} tokens per "
+            f"rank with current buffer cap {cap}. Increase "
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK or reduce "
+            "the request batch size."
+        )
+    return True
 
 
 def forward_mega_moe(
