@@ -787,8 +787,11 @@ def _build_sm90_nvfp4_mega_moe_weights(
     l2_global_scales = l2_global_scales / w2_prefold_scale
 
     block_n = int(os.environ.get("DG_SM90_NVFP4_BLOCK_N", "128"))
+    if block_n not in (128, 256):
+        raise ValueError(
+            f"SM90 NVFP4 MegaMoE expects DG_SM90_NVFP4_BLOCK_N to be 128 or 256, got {block_n}"
+        )
     block_k = 128
-    fused_b_scale = os.environ.get("DG_SM90_NVFP4_FUSED_B_SCALE") == "1"
 
     _modelopt_nvfp4_to_deepgemm_packed_inplace(w13)
     _modelopt_nvfp4_to_deepgemm_packed_inplace(w2)
@@ -811,20 +814,18 @@ def _build_sm90_nvfp4_mega_moe_weights(
         group_size=group_size,
     )
 
-    if fused_b_scale:
-        w13_packed = nvfp4_fuse_packed_with_scale_tile_major(
-            w13_interleaved,
-            w13_scale_tile,
-            block_k=block_k,
-        )
-        w2_packed = nvfp4_fuse_packed_with_scale_tile_major(
-            w2.contiguous(),
-            w2_scale_tile,
-            block_k=block_k,
-        )
-    else:
-        w13_packed = w13_interleaved
-        w2_packed = w2 if w2.is_contiguous() else w2.contiguous()
+    # DeepGEMM SM90 NVFP4 MegaMoE expects fused B+scale storage for both
+    # BN128 split-phase and BN256 fused-phase layouts.
+    w13_packed = nvfp4_fuse_packed_with_scale_tile_major(
+        w13_interleaved,
+        w13_scale_tile,
+        block_k=block_k,
+    )
+    w2_packed = nvfp4_fuse_packed_with_scale_tile_major(
+        w2.contiguous(),
+        w2_scale_tile,
+        block_k=block_k,
+    )
 
     experts.mega_l1_weights = (w13_packed, w13_scale_tile)
     experts.mega_l2_weights = (w2_packed, w2_scale_tile)
