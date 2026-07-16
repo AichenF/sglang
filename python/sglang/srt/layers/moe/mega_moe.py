@@ -136,6 +136,7 @@ def _get_mega_moe_symm_buffer(
     num_topk: int,
     hidden: int,
     intermediate_hidden: int,
+    config: _MegaMoeArchConfig,
 ) -> SymmBuffer:
     import deep_gemm
 
@@ -148,10 +149,24 @@ def _get_mega_moe_symm_buffer(
         num_topk,
         hidden,
         intermediate_hidden,
+        config.name,
     )
     buf = _MEGA_MOE_SYMM_BUFFER.get(key)
     if buf is None:
-        buf = deep_gemm.get_symm_buffer_for_mega_moe(
+        if config.name == _SM90_FP8_CONFIG.name:
+            get_symm_buffer = getattr(
+                deep_gemm,
+                "get_symm_buffer_for_sm90_mega_moe",
+                None,
+            )
+            if get_symm_buffer is None:
+                raise RuntimeError(
+                    "DeepGEMM SM90 FP8 MegaMoE requires "
+                    "get_symm_buffer_for_sm90_mega_moe; update DeepGEMM."
+                )
+        else:
+            get_symm_buffer = deep_gemm.get_symm_buffer_for_mega_moe
+        buf = get_symm_buffer(
             group,
             num_experts,
             num_max_tokens_per_rank,
@@ -168,6 +183,9 @@ def _get_mega_moe_symm_buffer(
 def _ensure_mega_moe_symm_buffer(moe: "DeepseekV2MoE") -> SymmBuffer:
     from sglang.srt.distributed.parallel_state import get_moe_ep_group
 
+    config = _get_built_mega_moe_arch_config(moe.experts)
+    assert config is not None, "MegaMoE weights must be built before forward"
+
     return _get_mega_moe_symm_buffer(
         get_moe_ep_group().device_group,
         num_experts=moe.experts.num_experts,
@@ -177,6 +195,7 @@ def _ensure_mega_moe_symm_buffer(moe: "DeepseekV2MoE") -> SymmBuffer:
         num_topk=moe.config.num_experts_per_tok + moe.num_fused_shared_experts,
         hidden=moe.config.hidden_size,
         intermediate_hidden=moe.config.moe_intermediate_size,
+        config=config,
     )
 
 
@@ -340,6 +359,7 @@ def _run_mega_routed(
         num_topk=top_k,
         hidden=hidden_size,
         intermediate_hidden=intermediate_size,
+        config=config,
     )
     dispatch_num_tokens = effective_num_tokens if config.use_dp_max_tokens else num_tokens
     dispatch_hidden_states = hidden_states
@@ -472,7 +492,6 @@ def build_mega_moe_experts_weights(experts) -> bool:
         transform_sf_into_required_layout,
         transform_weights_for_mega_moe,
     )
-    from deep_gemm.mega import _interleave_l1_weights, _transpose_sf_for_utccp
 
     if getattr(experts, "_mega_moe_weights_built", False):
         return _get_built_mega_moe_arch_config(experts) is not None
@@ -553,6 +572,8 @@ def build_mega_moe_experts_weights(experts) -> bool:
         )
 
         if fix_mega_moe_memory and config.name == _SM100_FP8_FP4_CONFIG.name:
+            from deep_gemm.mega import _interleave_l1_weights, _transpose_sf_for_utccp
+
             # Build the interleaved L1 weight + scale once; share the weight buffer
             # between `w13_weight.data` (normal deep-ep path) and `mega_l1_weights[0]`
             # (mega moe path). Mega moe additionally needs a UTCCP-transposed scale;
