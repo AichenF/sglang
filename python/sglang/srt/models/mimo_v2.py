@@ -18,7 +18,6 @@ import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
@@ -346,17 +345,22 @@ class MoEGate(nn.Module):
     ):
         super().__init__()
         self.is_nextn = is_nextn
-        self.dtype = torch.float32
+        # An fp32 router weight pins this GEMM to an fp32 SIMT kernel, which at
+        # decode shapes fills only a handful of CTAs. bf16 storage reaches the
+        # tensor cores; logits stay fp32, so top-k keeps its ordering precision.
+        self.dtype = torch.bfloat16
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size), dtype=self.dtype)
         )
         if config.topk_method == "noaux_tc":
+            # The correction bias stays fp32: its spread is a few bf16 ULPs wide,
+            # so rounding it reorders top-k selection.
             correction_bias_dtype = (
                 torch.bfloat16
                 if quant_config is not None
                 and quant_config.get_name() == "modelopt_fp4"
                 and get_moe_runner_backend().is_flashinfer_trtllm()
-                else self.dtype
+                else torch.float32
             )
             self.e_score_correction_bias = nn.Parameter(
                 torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
@@ -364,10 +368,12 @@ class MoEGate(nn.Module):
         else:
             self.e_score_correction_bias = None
 
-    def forward(self, hidden_states):
-        logits = F.linear(hidden_states.to(self.dtype), self.weight, None)
+        from sglang.kernels.ops.attention.dsv4.gemm import linear_bf16_fp32
 
-        return logits
+        self.gemm = linear_bf16_fp32
+
+    def forward(self, hidden_states):
+        return self.gemm(hidden_states, self.weight)
 
 
 class MiMoV2MoE(nn.Module):
