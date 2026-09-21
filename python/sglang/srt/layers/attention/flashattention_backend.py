@@ -11,6 +11,10 @@ from sglang.kernels.ops.attention.metadata import (
     normal_decode_set_metadata,
     prepare_swa_spec_page_table_triton,
 )
+from sglang.kernels.ops.attention.bidir_decode import (
+    bidir_decode_attention,
+    can_use_bidir_decode,
+)
 from sglang.kernels.ops.attention.pa_page_table import _build_pa_page_table
 from sglang.kernels.ops.attention.suffix_attention_merge import (
     can_use_fused_suffix_attention_merge,
@@ -1523,6 +1527,49 @@ class FlashAttentionBackend(AttentionBackend):
                     num_splits=self.num_splits,
                     out=_fa_out,
                     **kwargs,
+                )
+            elif (
+                not use_cascade_attn
+                and not use_local_attn
+                and can_use_bidir_decode(
+                    q=q,
+                    forward_mode=forward_batch.forward_mode,
+                    num_kv_heads=layer.tp_k_head_num,
+                    num_q_heads=layer.tp_q_head_num,
+                    head_dim=layer.head_dim,
+                    v_head_dim=layer.v_head_dim,
+                    window_size=window_size,
+                    causal=causal,
+                    page_size=self.page_size,
+                    softcap=layer.logit_cap,
+                    cache_seqlens=cache_seqlens,
+                    max_seqlen_q=max_seqlen_q,
+                    kwargs=kwargs,
+                )
+            ):
+                # The DFlash draft propose block: 5 bidirectional layers, one KV
+                # head per rank, 8 query rows per request. FA3 charges ~9 us of
+                # fixed overhead per call at this shape (measured: 9.07 us at
+                # ctx 64, 14.16 us at ctx 1024, 18.99 us at ctx 8192), plus a
+                # prepare_varlen_num_blocks and a combine launch on top.
+                # reshape(), not contiguous().view(): q here is the Q slice of
+                # the fused QKV output -- row-strided but head-dim contiguous --
+                # and this kernel takes explicit (row, head) strides, so the
+                # materialising copy FA3 needs is pure loss. It costs 2.43
+                # us/call in the trace, 12.2 us/step over the five draft
+                # layers. reshape() still falls back to a copy for any layout
+                # that cannot be viewed, and the kernel re-checks the
+                # last-dim stride.
+                result = bidir_decode_attention(
+                    q.reshape(-1, layer.tp_q_head_num, layer.head_dim),
+                    key_cache,
+                    value_cache,
+                    page_table,
+                    cache_seqlens,
+                    block_tokens=max_seqlen_q,
+                    sm_scale=layer.scaling,
+                    window=window_size,
+                    out=_fa_out,
                 )
             elif (
                 is_swa_layer
