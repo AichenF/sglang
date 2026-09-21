@@ -16,6 +16,10 @@ from sglang.kernels.ops.attention.suffix_attention_merge import (
     can_use_fused_suffix_attention_merge,
     merge_suffix_attention_in_place,
 )
+from sglang.kernels.ops.attention.swa_decode import (
+    can_use_swa_decode,
+    swa_decode_attention,
+)
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
@@ -1519,6 +1523,41 @@ class FlashAttentionBackend(AttentionBackend):
                     num_splits=self.num_splits,
                     out=_fa_out,
                     **kwargs,
+                )
+            elif (
+                is_swa_layer
+                and not use_cascade_attn
+                and not use_local_attn
+                and can_use_swa_decode(
+                    q=q,
+                    forward_mode=forward_batch.forward_mode,
+                    num_kv_heads=layer.tp_k_head_num,
+                    num_q_heads=layer.tp_q_head_num,
+                    head_dim=layer.head_dim,
+                    v_head_dim=layer.v_head_dim,
+                    window_size=window_size,
+                    causal=causal,
+                    page_size=self.page_size,
+                    softcap=layer.logit_cap,
+                    cache_seqlens=cache_seqlens,
+                    max_seqlen_q=max_seqlen_q,
+                    kwargs=kwargs,
+                )
+            ):
+                # FA3 costs ~10 us per call at this shape no matter how little
+                # work it carries; the single-KV-head window kernel does the same
+                # math without that floor.
+                result = swa_decode_attention(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    key_cache,
+                    value_cache,
+                    page_table,
+                    cache_seqlens,
+                    window_tokens=max_seqlen_q,
+                    window_size=window_size[0] + 1,
+                    sm_scale=layer.scaling,
+                    sinks=kwargs.get("sinks"),
+                    out=_fa_out,
                 )
             else:
                 result = flash_attn_with_kvcache(
