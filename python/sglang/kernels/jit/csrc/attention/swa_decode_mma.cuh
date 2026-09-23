@@ -69,8 +69,8 @@ __global__ __launch_bounds__(NW * 32) void swa_mma_kernel(
     const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ K,
     const __nv_bfloat16* __restrict__ V, const int* __restrict__ PT,
     const int* __restrict__ SEQLENS, const float* __restrict__ SINKS,
-    __nv_bfloat16* __restrict__ OUT, int pt_stride, int hq, float sm_scale,
-    int has_sink) {
+    __nv_bfloat16* __restrict__ OUT, int q_stride_m, int q_stride_h, int pt_stride,
+    int hq, float sm_scale, int has_sink) {
   constexpr int NKEY = WINDOW - 1 + W;           // keys any row of this request can see
   constexpr int NPAD = (NKEY + 15) / 16 * 16;    // 135 -> 144, the PV k-dim must be x16
   constexpr int M = W * HP;
@@ -122,7 +122,7 @@ __global__ __launch_bounds__(NW * 32) void swa_mma_kernel(
   for (int i = tid; i < (MPAD - M) * KP; i += NW * 32) Qs[M * KP + i] = __float2bfloat16(0.f);
   for (int r = warp; r < M; r += NW) {
     const int t = r / HP, h = hg * HP + (r % HP);
-    const __nv_bfloat16* src = &Q[(size_t)(b * W + t) * hq * DQK + (size_t)h * DQK];
+    const __nv_bfloat16* src = &Q[(size_t)(b * W + t) * q_stride_m + (size_t)h * q_stride_h];
     if (lane < KCH) __pipeline_memcpy_async(&Qs[r * KP + lane * 8], src + lane * 8, 16);
   }
   // One 16 B cp.async per lane, lane index == chunk index: no division, and each
@@ -289,8 +289,8 @@ __global__ __launch_bounds__(NW * 32) void swa_mma_kernel(
 
 template <int W, int HP, int WINDOW, int NW>
 void launch_swa_mma(const void* q, const void* k, const void* v, const int* pt, const int* sl,
-                    const float* sinks, void* out, int bs, int hq, int pt_stride, float sm_scale,
-                    int has_sink, DLDevice device) {
+                    const float* sinks, void* out, int bs, int hq, int q_stride_m, int q_stride_h,
+                    int pt_stride, float sm_scale, int has_sink, DLDevice device) {
   constexpr int NKEY = WINDOW - 1 + W;
   constexpr int NPAD = (NKEY + 15) / 16 * 16;
   constexpr int MPAD = 16;
@@ -306,7 +306,7 @@ void launch_swa_mma(const void* q, const void* k, const void* v, const int* pt, 
   });
   host::LaunchKernel(dim3(bs, hq / HP), dim3(NW * 32), device, kSmem)(
       kern, (const __nv_bfloat16*)q, (const __nv_bfloat16*)k, (const __nv_bfloat16*)v, pt, sl,
-      sinks, (__nv_bfloat16*)out, pt_stride, hq, sm_scale, has_sink);
+      sinks, (__nv_bfloat16*)out, q_stride_m, q_stride_h, pt_stride, hq, sm_scale, has_sink);
 }
 
 }  // namespace swa_mma_detail
@@ -322,6 +322,8 @@ inline void swa_decode_mma(
     tvm::ffi::TensorView cache_seqlens,
     tvm::ffi::TensorView sinks,
     tvm::ffi::TensorView out,
+    int64_t q_stride_m,
+    int64_t q_stride_h,
     double sm_scale,
     int64_t window_tokens,
     int64_t window_size,
@@ -341,11 +343,11 @@ inline void swa_decode_mma(
   const float* skp = has_sink ? (const float*)sinks.data_ptr() : nullptr;
   void* op = out.data_ptr();
 
-#define SWA_MMA_CASE(w, hp, win)                                                              \
-  if (window_tokens == w && heads_per_program == hp && window_size == win) {                  \
-    launch_swa_mma<w, hp, win, 8>(qp, kp, vp, ptp, slp, skp, op, bs, hq, pt_stride, s,        \
-                                  (int)has_sink, device);                                     \
-    return;                                                                                   \
+#define SWA_MMA_CASE(w, hp, win)                                                          \
+  if (window_tokens == w && heads_per_program == hp && window_size == win) {              \
+    launch_swa_mma<w, hp, win, 8>(qp, kp, vp, ptp, slp, skp, op, bs, hq, (int)q_stride_m, \
+                                  (int)q_stride_h, pt_stride, s, (int)has_sink, device);  \
+    return;                                                                               \
   }
   SWA_MMA_CASE(8, 2, 129) SWA_MMA_CASE(8, 2, 128)
   SWA_MMA_CASE(8, 1, 129) SWA_MMA_CASE(8, 1, 128)

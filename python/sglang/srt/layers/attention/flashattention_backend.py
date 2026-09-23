@@ -1582,8 +1582,10 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             ):
                 # Same math as FA3 without its per-call fixed cost.
+                # reshape(), not contiguous(): q is the row-strided Q slice of
+                # the fused QKV output and this kernel takes explicit strides.
                 result = swa_decode_attention(
-                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q.reshape(-1, layer.tp_q_head_num, layer.head_dim),
                     key_cache,
                     value_cache,
                     page_table,
