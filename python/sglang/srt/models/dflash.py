@@ -620,8 +620,8 @@ class DFlashDraftModel(nn.Module):
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
+        fc_prefix = f"{prefix}.fc" if prefix else "fc"
         if self.is_nemotron_35_draft:
-            fc_prefix = f"{prefix}.fc" if prefix else "fc"
             self.fc = ReplicatedLinear(
                 self.num_context_features * hidden_size,
                 hidden_size,
@@ -630,8 +630,14 @@ class DFlashDraftModel(nn.Module):
                 prefix=fc_prefix,
             )
         else:
-            self.fc = nn.Linear(
-                self.num_context_features * hidden_size, hidden_size, bias=False
+            # Split the output columns across ranks and all-gather the result,
+            # so each rank reads only its own slice of the weight.
+            self.fc = ColumnParallelLinear(
+                self.num_context_features * hidden_size,
+                hidden_size,
+                bias=False,
+                gather_output=True,
+                prefix=fc_prefix,
             )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
@@ -690,9 +696,7 @@ class DFlashDraftModel(nn.Module):
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
-        expected = int(
-            self.fc.input_size if self.is_nemotron_35_draft else self.fc.in_features
-        )
+        expected = int(self.fc.input_size)
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "DFLASH target_hidden feature dim mismatch. "
@@ -702,9 +706,7 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        projected = self.fc(target_hidden)
-        if self.is_nemotron_35_draft:
-            projected = projected[0]
+        projected, _ = self.fc(target_hidden)
         return self.hidden_norm(projected)
 
     @torch.no_grad()
@@ -809,11 +811,12 @@ class DFlashDraftModel(nn.Module):
                     continue
                 param = params_dict[resolved_name]
                 if resolved_name.endswith("fc.weight"):
+                    # The parameter is sharded; check the full logical shape.
+                    expected_shape = (
+                        int(self.config.hidden_size),
+                        int(self.num_context_features * self.config.hidden_size),
+                    )
                     if self.is_nemotron_35_draft:
-                        expected_shape = (
-                            int(self.config.hidden_size),
-                            int(self.num_context_features * self.config.hidden_size),
-                        )
                         loaded_shape = _logical_linear_weight_shape(
                             param,
                             loaded_weight,
@@ -824,7 +827,6 @@ class DFlashDraftModel(nn.Module):
                             and tuple(loaded_weight.shape) == tuple(param.shape)
                         )
                     else:
-                        expected_shape = tuple(param.shape)
                         loaded_shape = tuple(loaded_weight.shape)
                         shape_matches = loaded_shape == expected_shape
                     if not shape_matches:
@@ -940,9 +942,7 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         return layer.input_layernorm(ctx_hidden)
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
-        expected = int(
-            self.fc.input_size if self.is_nemotron_35_draft else self.fc.in_features
-        )
+        expected = int(self.fc.input_size)
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "Laguna DFLASH target_hidden feature dim mismatch. "
@@ -961,9 +961,7 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         for i, norm in enumerate(self.aux_hidden_norms):
             normed[:, i, :] = norm(slices[:, i, :])
         fused = normed.reshape(target_hidden.shape[0], -1)
-        projected = self.fc(fused)
-        if self.is_nemotron_35_draft:
-            projected = projected[0]
+        projected, _ = self.fc(fused)
         return self.hidden_norm(projected)
 
 
