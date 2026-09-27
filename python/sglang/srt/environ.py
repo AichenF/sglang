@@ -1268,6 +1268,7 @@ class Envs:
 
     # MiMo attention optimizations (opt-in; unsupported layouts fall back).
     SGLANG_OPT_MIMO_ROPE_KV = EnvBool(False)
+    SGLANG_OPT_MIMO_O_PREFETCH = EnvBool(False)
 
     # ===================================================================
     # RoPE cache

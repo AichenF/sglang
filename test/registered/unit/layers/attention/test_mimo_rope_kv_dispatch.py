@@ -223,6 +223,86 @@ class TestMiMoRoPEKVDispatch(CustomTestCase):
             )
             self.assertEqual(module.run.call_count, 1)
 
+    def test_prefetch_weight_guards(self):
+        weight = tensor((6144, 2048))
+        weight.data_ptr = lambda: 16
+        self.attention.o_proj = types.SimpleNamespace(weight=weight)
+        self.assertIs(
+            adapter.select_o_prefetch_weight(self.attention, self.qkv), weight
+        )
+        for attribute, invalid in (
+            ("shape", (2048, 6144)),
+            ("dtype", torch.float32),
+            ("device", torch.device("cpu")),
+            ("is_contiguous", lambda: False),
+            ("data_ptr", lambda: 2),
+        ):
+            with (
+                self.subTest(attribute=attribute),
+                patch.object(weight, attribute, invalid),
+            ):
+                self.assertIsNone(
+                    adapter.select_o_prefetch_weight(self.attention, self.qkv)
+                )
+        self.attention.o_proj = None
+        self.assertIsNone(adapter.select_o_prefetch_weight(self.attention, self.qkv))
+
+    def test_prefetch_selection_and_independent_opt_in(self):
+        module = types.ModuleType("sglang.kernels.ops.attention.mimo_rope_kv")
+        prefetch = types.ModuleType(
+            "sglang.kernels.ops.attention.mimo_rope_kv_prefetch"
+        )
+        module.run = Mock()
+        prefetch.run = Mock()
+        weight = tensor((6144, 2048))
+        weight.data_ptr = lambda: 16
+        self.attention.o_proj = types.SimpleNamespace(weight=weight)
+        with (
+            envs.SGLANG_OPT_MIMO_ROPE_KV.override(True),
+            envs.SGLANG_OPT_MIMO_O_PREFETCH.override(True),
+            patch.dict(
+                sys.modules, {module.__name__: module, prefetch.__name__: prefetch}
+            ),
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+        ):
+            self.assertTrue(
+                adapter.try_fused_mimo_rope_kv(
+                    self.attention, self.qkv, self.positions, self.batch
+                )
+            )
+            prefetch.run.assert_called_once_with(
+                self.qkv,
+                self.rope.cos_sin_cache,
+                self.positions,
+                self.locations,
+                self.keys,
+                self.values,
+                weight,
+            )
+            module.run.assert_not_called()
+            with envs.SGLANG_OPT_MIMO_O_PREFETCH.override(False):
+                self.assertTrue(
+                    adapter.try_fused_mimo_rope_kv(
+                        self.attention, self.qkv, self.positions, self.batch
+                    )
+                )
+            self.assertEqual(module.run.call_count, 1)
+            with patch.object(weight, "dtype", torch.float32):
+                self.assertTrue(
+                    adapter.try_fused_mimo_rope_kv(
+                        self.attention, self.qkv, self.positions, self.batch
+                    )
+                )
+            self.assertEqual(module.run.call_count, 2)
+            with envs.SGLANG_OPT_MIMO_ROPE_KV.override(False):
+                self.assertFalse(
+                    adapter.try_fused_mimo_rope_kv(
+                        self.attention, self.qkv, self.positions, self.batch
+                    )
+                )
+            self.assertEqual(module.run.call_count, 2)
+            self.assertEqual(prefetch.run.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

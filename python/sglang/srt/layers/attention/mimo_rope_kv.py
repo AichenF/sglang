@@ -104,6 +104,22 @@ def select_mimo_rope_kv(attention, qkv, positions, forward_batch):
     return cos_sin, locations, keys, values
 
 
+def select_o_prefetch_weight(attention, qkv):
+    """Return a legal, read-only O-projection tensor or disable prefetch."""
+    weight = getattr(getattr(attention, "o_proj", None), "weight", None)
+    if weight is None:
+        return None
+    if (
+        weight.shape != (6144, 2048)
+        or weight.dtype != torch.bfloat16
+        or weight.device != qkv.device
+        or not weight.is_contiguous()
+        or weight.data_ptr() % 16 != 0
+    ):
+        return None
+    return weight
+
+
 def try_fused_mimo_rope_kv(attention, qkv, positions, forward_batch):
     """Rotate Q/K and write KV; false means the original path must run."""
     if not envs.SGLANG_OPT_MIMO_ROPE_KV.get():
@@ -114,14 +130,25 @@ def try_fused_mimo_rope_kv(attention, qkv, positions, forward_batch):
     from sglang.kernels.ops.attention.mimo_rope_kv import run
 
     cos_sin, locations, keys, values = selected
-    run(qkv, cos_sin, positions, locations, keys, values)
+    weight = None
+    if envs.SGLANG_OPT_MIMO_O_PREFETCH.get():
+        weight = select_o_prefetch_weight(attention, qkv)
+    if weight is None:
+        run(qkv, cos_sin, positions, locations, keys, values)
+    else:
+        from sglang.kernels.ops.attention.mimo_rope_kv_prefetch import (
+            run as run_prefetch,
+        )
+
+        run_prefetch(qkv, cos_sin, positions, locations, keys, values, weight)
     if torch.cuda.is_current_stream_capturing() and not getattr(
         attention, "_mimo_rope_kv_capture_logged", False
     ):
         logger.info(
-            "MIMO_ROPE_KV_CAPTURE layer=%s device=%s prefetch=0",
+            "MIMO_ROPE_KV_CAPTURE layer=%s device=%s prefetch=%s",
             attention.attn.layer_id,
             qkv.device.index,
+            int(weight is not None),
         )
         attention._mimo_rope_kv_capture_logged = True
     return True

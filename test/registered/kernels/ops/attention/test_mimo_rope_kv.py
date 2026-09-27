@@ -20,7 +20,7 @@ class TestMiMoRoPEKV(CustomTestCase):
             self.skipTest("MiMo BF16 specialization requires SM90")
         torch.manual_seed(42)
 
-    def check_case(self, dtype, locations_kind, graph, heads):
+    def check_case(self, dtype, locations_kind, graph, heads, prefetch=False):
         device = "cuda"
         original = torch.randn((32, 3392), dtype=torch.bfloat16, device=device)
         angles = torch.randn((2048, 32), device=device)
@@ -45,11 +45,32 @@ class TestMiMoRoPEKV(CustomTestCase):
         keys_expected[locations[valid].long(), 0] = k[valid]
         values_expected[locations[valid].long(), 0] = v[valid]
         actual, keys, values = original.clone(), keys0.clone(), values0.clone()
+        weight = (
+            torch.randn((6144, 2048), dtype=torch.bfloat16, device=device)
+            if prefetch
+            else None
+        )
+        weight_before = weight.clone() if prefetch else None
 
         def invoke():
-            run(
-                actual, cos_sin, positions, locations, keys, values, heads_per_cta=heads
-            )
+            if prefetch:
+                from sglang.kernels.ops.attention.mimo_rope_kv_prefetch import (
+                    run as run_prefetch,
+                )
+
+                run_prefetch(
+                    actual, cos_sin, positions, locations, keys, values, weight
+                )
+            else:
+                run(
+                    actual,
+                    cos_sin,
+                    positions,
+                    locations,
+                    keys,
+                    values,
+                    heads_per_cta=heads,
+                )
 
         invoke()  # Compile outside capture.
         torch.cuda.synchronize()
@@ -77,6 +98,9 @@ class TestMiMoRoPEKV(CustomTestCase):
             ):
                 torch.testing.assert_close(got, want, rtol=0, atol=0)
 
+        if prefetch:
+            torch.testing.assert_close(weight, weight_before, rtol=0, atol=0)
+
     def test_fallback_bitwise_and_untouched_cache(self):
         for dtype in (torch.int32, torch.int64):
             for locations in ("dense", "sparse", "padding"):
@@ -88,6 +112,13 @@ class TestMiMoRoPEKV(CustomTestCase):
         for dtype in (torch.int32, torch.int64):
             with self.subTest(dtype=dtype):
                 self.check_case(dtype, "sparse", True, 16)
+
+    def test_prefetch_is_bitwise_and_read_only(self):
+        for dtype in (torch.int32, torch.int64):
+            for locations in ("dense", "sparse", "padding"):
+                for graph in (False, True):
+                    with self.subTest(dtype=dtype, locations=locations, graph=graph):
+                        self.check_case(dtype, locations, graph, 16, prefetch=True)
 
 
 if __name__ == "__main__":
