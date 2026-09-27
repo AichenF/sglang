@@ -36,7 +36,10 @@ class TestMiMoRoPEKV(CustomTestCase):
         values0 = torch.randn((128, 1, 128), dtype=torch.bfloat16, device=device)
         expected = original.clone()
         q, k, v = expected.split((3072, 192, 128), dim=-1)
-        rotary_embedding(positions, q, k, 192, cos_sin, True)
+        # The fallback CUDA API reads int64 positions; the fused kernel also
+        # supports int32. Convert only the reference input, preserving values.
+        rotary_embedding(positions.to(torch.int64), q, k, 192, cos_sin, True)
+        torch.cuda.synchronize()
         keys_expected, values_expected = keys0.clone(), values0.clone()
         valid = locations != 0
         keys_expected[locations[valid].long(), 0] = k[valid]
