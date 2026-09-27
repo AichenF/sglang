@@ -81,6 +81,15 @@ five-request serving smoke, custom all-reduce, and exact token/text parity on
 four fixed 1024-token inputs with 64 output tokens each. Pre/post measurement
 telemetry had no active slowdown. Repository-wide CI was not run.
 
+The short text-prompt smoke is a flow check, not an exact-output oracle.
+Post-benchmark diagnostics repeated it three times with cache flushes, using
+temperature zero in both the **unmodified original** and fusion servers.
+Both servers produced different short-prompt outputs across their own repeats
+(the complete four-response batch matched neither repeat 2 nor repeat 3).
+This pre-existing repeatability limitation is retained, not attributed to the
+new kernel or called an accuracy pass. Exact E2E parity above is limited to the
+fixed 1024/64 workload; model-wide accuracy has not been established.
+
 ### Runtime and commands
 
 Use Linux, eight NVIDIA H200 GPUs, driver 615.71.09, CUDA 13, Torch 2.13 cu130,
