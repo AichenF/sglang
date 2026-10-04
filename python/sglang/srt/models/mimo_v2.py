@@ -30,6 +30,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.attention.mimo_rope_kv import try_fused_mimo_rope_kv
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -788,10 +789,19 @@ class MiMoV2Attention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
 
         # [t, h, dr]
-        q, k = self.rotary_emb(positions, q, k)
+        fused_rope_kv = try_fused_mimo_rope_kv(self, qkv, positions, forward_batch)
+        if not fused_rope_kv:
+            q, k = self.rotary_emb(positions, q, k)
         # [t, h, d]
 
-        attn_output = self.attn(q, k, v, forward_batch, sinks=self.attention_sink_bias)
+        attn_output = self.attn(
+            q,
+            k,
+            v,
+            forward_batch,
+            save_kv_cache=not fused_rope_kv,
+            sinks=self.attention_sink_bias,
+        )
         output, _ = self.o_proj(attn_output)
         return output
 
