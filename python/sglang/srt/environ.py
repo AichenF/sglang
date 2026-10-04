@@ -981,6 +981,10 @@ class Envs:
     SGLANG_HUMMING_INPUT_QUANT_CONFIG = EnvJSON(None)
     SGLANG_HUMMING_USE_F16_ACCUM = EnvBool(False)
     SGLANG_HUMMING_MOE_GEMM_TYPE = EnvStr("")
+    # Fused decode MoE over the Humming W4A8 weights: one kernel
+    # for post-attention RMSNorm + router + top-8 + experts + TP all-reduce for batches of <= MAX_TOKENS tokens per rank.
+    SGLANG_MIMO_FUSED_MOE = EnvBool(False)
+    SGLANG_MIMO_FUSED_MOE_MAX_TOKENS = EnvInt(64)
 
     # ===================================================================
     # FlashInfer, FlashMLA, and TRT-LLM
