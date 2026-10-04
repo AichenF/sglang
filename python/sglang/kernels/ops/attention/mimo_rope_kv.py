@@ -63,7 +63,7 @@ def _rope_kv(
     x = tl.load(QKV + offset)
     y = tl.load(QKV + offset + 32)
     # The pinned CUDA13 fallback contracts the left product into BF16 FMA;
-    # only the right product rounds before the final operation (iter29).
+    # only the right product rounds before the final operation.
     lo = _fma_bf16(x, c, _neg_bf16(_mul_bf16(y, s)))
     hi = _fma_bf16(y, c, _mul_bf16(x, s))
     tl.store(QKV + offset, lo)

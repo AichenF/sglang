@@ -1,12 +1,8 @@
 """Guarded MiMo target-verify RoPE and BF16 KV-cache fusion."""
 
-import logging
-
 import torch
 
 from sglang.srt.environ import envs
-
-logger = logging.getLogger(__name__)
 
 
 def select_mimo_rope_kv(attention, qkv, positions, forward_batch):
@@ -115,13 +111,4 @@ def try_fused_mimo_rope_kv(attention, qkv, positions, forward_batch):
 
     cos_sin, locations, keys, values = selected
     run(qkv, cos_sin, positions, locations, keys, values)
-    if torch.cuda.is_current_stream_capturing() and not getattr(
-        attention, "_mimo_rope_kv_capture_logged", False
-    ):
-        logger.info(
-            "MIMO_ROPE_KV_CAPTURE layer=%s device=%s prefetch=0",
-            attention.attn.layer_id,
-            qkv.device.index,
-        )
-        attention._mimo_rope_kv_capture_logged = True
     return True

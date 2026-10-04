@@ -200,7 +200,6 @@ class TestMiMoRoPEKVDispatch(CustomTestCase):
         with (
             envs.SGLANG_OPT_MIMO_ROPE_KV.override(True),
             patch.dict(sys.modules, {module.__name__: module}),
-            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
         ):
             self.assertTrue(
                 adapter.try_fused_mimo_rope_kv(

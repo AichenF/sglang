@@ -30,9 +30,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.mimo_rope_kv import (
-    try_fused_mimo_rope_kv,
-)
+from sglang.srt.layers.attention.mimo_rope_kv import try_fused_mimo_rope_kv
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -427,7 +425,6 @@ class MiMoV2MoE(nn.Module):
             )
         if checkpoint_store_dtype == "mxfp4":
             from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
-
             moe_quant_config = Mxfp4Config(is_checkpoint_mxfp4_serialized=True)
             if self.layer_id == 0:
                 logger.info("MXFP4 expert checkpoint detected; using Mxfp4Config")
@@ -457,9 +454,7 @@ class MiMoV2MoE(nn.Module):
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
             # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
             # and requires the output format to be standard. We use quant_config to determine the output format.
-            output_format=TopKOutputFormat.STANDARD
-            if moe_quant_config is None
-            else None,
+            output_format=TopKOutputFormat.STANDARD if moe_quant_config is None else None,
         )
 
         # todo : implement tbo forward needed
