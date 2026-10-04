@@ -123,6 +123,109 @@ def _fused_norm_rope_kernel_stacked(
     tl.store(k_write + offs, k_normed.to(v_raw.dtype), mask=mask_pass)
 
 
+@triton.jit
+def _fused_norm_rope_kv_store_kernel(
+    kv_ptr,  # [total_ctx, n_layers, kv_size * 2]
+    k_norm_weight_ptr,  # [n_layers, head_dim]
+    eps_ptr,  # [n_layers]
+    cos_sin_cache_ptr,  # [max_pos, rotary_dim]
+    positions_ptr,  # [total_ctx]
+    kv_cache_ptrs,  # [n_layers, 2] int64 element pointers: (k_cache, v_cache)
+    loc_ptr,  # [total_ctx] int64 cache slots (loc_2d flattened)
+    commit_len_ptr,  # [bs] int32
+    kv_stride_ctx,
+    kv_stride_layer,
+    k_norm_weight_stride_layer,
+    cos_sin_stride_pos,
+    cache_row_stride,  # elements per KV-cache row (num_kv_heads * head_dim)
+    total_ctx,
+    block_size,
+    n_layers: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    kv_size: tl.constexpr,
+    rotary_dim: tl.constexpr,
+    half_rotary_dim: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+):
+    """Fused RMSNorm(K) + RoPE(K) that writes K/V of every draft layer straight into
+    the paged KV cache (prefix-valid: row r of request b is committed only when
+    r < commit_len[b]). Grid: (total_ctx, num_kv_heads, n_layers). Replaces the
+    stacked kernel + n_layers x set_kv_buffer_prefix_valid launches."""
+    ctx_id = tl.program_id(0)
+    head_id = tl.program_id(1)
+    layer_id = tl.program_id(2)
+    if ctx_id >= total_ctx or layer_id >= n_layers:
+        return
+    bid = ctx_id // block_size
+    row = ctx_id % block_size
+    commit_len = tl.load(commit_len_ptr + bid)
+    if row >= commit_len:
+        return
+
+    loc = tl.load(loc_ptr + ctx_id).to(tl.int64)
+    k_cache = tl.load(kv_cache_ptrs + layer_id * 2).to(
+        tl.pointer_type(kv_ptr.dtype.element_ty)
+    )
+    v_cache = tl.load(kv_cache_ptrs + layer_id * 2 + 1).to(
+        tl.pointer_type(kv_ptr.dtype.element_ty)
+    )
+    k_write = k_cache + loc * cache_row_stride + head_id * head_dim
+    v_write = v_cache + loc * cache_row_stride + head_id * head_dim
+
+    position = tl.load(positions_ptr + ctx_id)
+    eps = tl.load(eps_ptr + layer_id).to(tl.float32)
+    kv_base = kv_ptr + ctx_id * kv_stride_ctx + layer_id * kv_stride_layer
+    k_base = kv_base + head_id * head_dim
+    v_base = kv_base + kv_size + head_id * head_dim
+
+    offs = tl.arange(0, BLOCK_HD)
+    mask_hd = offs < head_dim
+    mask_half = offs < half_rotary_dim
+
+    k_raw = tl.load(k_base + offs, mask=mask_hd, other=0.0).to(tl.float32)
+    v_raw = tl.load(v_base + offs, mask=mask_hd, other=0.0)
+
+    inv_rms = tl.rsqrt(tl.sum(k_raw * k_raw) / head_dim + eps)
+    norm_w = tl.load(
+        k_norm_weight_ptr + layer_id * k_norm_weight_stride_layer + offs,
+        mask=mask_hd,
+        other=1.0,
+    ).to(tl.float32)
+    k_normed = k_raw * inv_rms * norm_w
+
+    cos_sin_base = cos_sin_cache_ptr + position * cos_sin_stride_pos
+    cos_v = tl.load(cos_sin_base + offs, mask=mask_half, other=1.0).to(tl.float32)
+    sin_v = tl.load(
+        cos_sin_base + half_rotary_dim + offs, mask=mask_half, other=0.0
+    ).to(tl.float32)
+
+    k_first = tl.where(mask_half, k_normed, 0.0)
+    k_second_raw = tl.load(
+        k_base + half_rotary_dim + offs, mask=mask_half, other=0.0
+    ).to(tl.float32)
+    norm_w_second = tl.load(
+        k_norm_weight_ptr
+        + layer_id * k_norm_weight_stride_layer
+        + half_rotary_dim
+        + offs,
+        mask=mask_half,
+        other=1.0,
+    ).to(tl.float32)
+    k_second = k_second_raw * inv_rms * norm_w_second
+
+    k_rot_first = k_first * cos_v - k_second * sin_v
+    k_rot_second = k_second * cos_v + k_first * sin_v
+
+    tl.store(v_write + offs, v_raw, mask=mask_hd)
+    tl.store(k_write + offs, k_rot_first.to(v_raw.dtype), mask=mask_half)
+    tl.store(
+        k_write + half_rotary_dim + offs, k_rot_second.to(v_raw.dtype), mask=mask_half
+    )
+    mask_pass = (offs >= rotary_dim) & (offs < head_dim)
+    tl.store(k_write + offs, k_normed.to(v_raw.dtype), mask=mask_pass)
+
+
 def _fused_norm_rope_stacked(
     kv: torch.Tensor,  # [total_ctx, n_layers, kv_size*2]
     k_norm_weight: torch.Tensor,  # [n_layers, head_dim]
@@ -455,3 +558,90 @@ class FusedKVMaterializeHelper:
         )
         for layer_idx in range(self.n_layers):
             write_layer_kv(layer_idx, cache_k[layer_idx], cache_v[layer_idx])
+
+    def materialize_into_cache(
+        self,
+        ctx_hidden: torch.Tensor,
+        positions: torch.Tensor,
+        kv_cache_ptrs: torch.Tensor,  # [n_layers, 2] int64 (k_cache, v_cache) element ptrs
+        cache_row_stride: int,  # elements per KV-cache row
+        loc_2d: torch.Tensor,  # [bs, block_size] int64
+        commit_lens: torch.Tensor,  # [bs] int32
+    ) -> None:
+        """Batched KV projection + one fused norm/RoPE kernel that commits the
+        prefix-valid rows of every layer straight into the paged KV cache
+        (no per-layer workspace + set_kv_buffer_prefix_valid launches)."""
+        total_ctx = ctx_hidden.shape[0]
+        if total_ctx == 0:
+            return
+        bs, block_size = int(loc_2d.shape[0]), int(loc_2d.shape[1])
+        if bs * block_size != total_ctx:
+            raise ValueError(
+                "loc_2d must cover ctx_hidden rows for fused KV materialization: "
+                f"loc_2d={tuple(loc_2d.shape)}, total_ctx={total_ctx}."
+            )
+        positions = positions.reshape(-1)
+        if positions.numel() != total_ctx:
+            raise ValueError(
+                "positions must match ctx_hidden token count for fused KV materialization: "
+                f"positions={positions.numel()}, total_ctx={total_ctx}."
+            )
+        if ctx_hidden.dtype != self.flat_kv_weight_t.dtype:
+            ctx_hidden = ctx_hidden.to(self.flat_kv_weight_t.dtype)
+        if positions.dtype != torch.int64:
+            positions = positions.to(torch.int64)
+        if not loc_2d.is_contiguous():
+            loc_2d = loc_2d.contiguous()
+        if loc_2d.dtype != torch.int64:
+            loc_2d = loc_2d.to(torch.int64)
+        if not commit_lens.is_contiguous():
+            commit_lens = commit_lens.contiguous()
+        if commit_lens.dtype != torch.int32:
+            commit_lens = commit_lens.to(torch.int32)
+
+        max_position = (
+            self.max_position_hint
+            if self.max_position_hint is not None
+            else int(positions.max().item())
+        )
+        cos_sin_cache = self._ensure_rope_cache(max_position)
+
+        self._ensure_workspace(total_ctx, ctx_hidden.dtype)
+        assert self._proj_workspace is not None
+        proj_out_2d = self._proj_workspace[:total_ctx]
+        if self._mm_out_supported:
+            try:
+                torch.mm(ctx_hidden, self.flat_kv_weight_t, out=proj_out_2d)
+            except Exception:
+                self._mm_out_supported = False
+                proj_out_2d = torch.mm(ctx_hidden, self.flat_kv_weight_t)
+        else:
+            proj_out_2d = torch.mm(ctx_hidden, self.flat_kv_weight_t)
+        proj_out = proj_out_2d.view(total_ctx, self.n_layers, self.layer_out_dim)
+
+        half_rotary_dim = self.rotary_dim // 2
+        BLOCK_HD = triton.next_power_of_2(self.head_dim)
+        _fused_norm_rope_kv_store_kernel[(total_ctx, self.num_kv_heads, self.n_layers)](
+            proj_out,
+            self.k_norm_weights,
+            self.eps_values,
+            cos_sin_cache,
+            positions,
+            kv_cache_ptrs,
+            loc_2d.view(-1),
+            commit_lens,
+            proj_out.stride(0),
+            proj_out.stride(1),
+            self.k_norm_weights.stride(0),
+            cos_sin_cache.stride(0),
+            int(cache_row_stride),
+            total_ctx,
+            block_size,
+            self.n_layers,
+            self.num_kv_heads,
+            self.head_dim,
+            self.kv_size,
+            self.rotary_dim,
+            half_rotary_dim,
+            BLOCK_HD,
+        )

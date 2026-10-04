@@ -278,6 +278,7 @@ class DFlashAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        skip_all_reduce: bool = False,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         if _is_npu:
@@ -308,7 +309,9 @@ class DFlashAttention(nn.Module):
                 q, k, v, forward_batch, sinks=self.attention_sink_bias
             )
         attn_output = self.apply_attention_output(attn_output, hidden_states)
-        output, _ = self.o_proj(attn_output)
+        # skip_all_reduce: the caller fuses the TP all-reduce into the following
+        # residual-add + RMSNorm (DFlashFusedARNorm), so return the local partial.
+        output, _ = self.o_proj(attn_output, skip_all_reduce=skip_all_reduce)
         return output
 
     def apply_attention_output(
@@ -384,10 +387,10 @@ class DFlashMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, skip_all_reduce: bool = False) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.down_proj(x, skip_all_reduce=skip_all_reduce)
         return x
 
 
@@ -497,6 +500,17 @@ class DFlashDecoderLayer(nn.Module):
 
         self.attention_conv = attention_conv
         self.mlp_conv = mlp_conv
+        # Set by DFlashDraftModel.init_fused_ar_norm: fused TP all-reduce +
+        # residual + RMSNorm. When active, the o_proj / down_proj all-reduces
+        # are skipped and this layer RETURNS its un-reduced MLP partial; the
+        # next layer's (or the final) fused norm reduces it.
+        self.fused_ar_norm = None
+
+    def _fused_ar_norm_for(self, hidden_states: torch.Tensor):
+        fused = self.fused_ar_norm
+        if fused is None or self.attention_conv is not None or self.mlp_conv is not None:
+            return None
+        return fused if fused.can_fuse(hidden_states) else None
 
     def forward(
         self,
@@ -511,10 +525,20 @@ class DFlashDecoderLayer(nn.Module):
                 residual = hidden_states
             return hidden_states, residual
 
+        fused = self._fused_ar_norm_for(hidden_states)
+
         # Pre-norm attention with fused residual+norm when possible (Qwen3-style).
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        elif fused is not None:
+            # hidden_states is the previous layer's un-reduced MLP partial.
+            hidden_states, residual = fused(
+                hidden_states,
+                residual,
+                self.input_layernorm.weight,
+                self.input_layernorm.variance_epsilon,
+            )
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
@@ -526,16 +550,25 @@ class DFlashDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
+            skip_all_reduce=fused is not None,
         )
         if attention_kernel is not None:
             attn_out = self.attention_conv.finish(attn_out, attention_kernel)
 
-        hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
+        if fused is not None:
+            hidden_states, residual = fused(
+                attn_out,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
+            )
+        else:
+            hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
 
         mlp_kernel = None
         if self.mlp_conv is not None:
             hidden_states, mlp_kernel = self.mlp_conv.prepare(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, skip_all_reduce=fused is not None)
         if mlp_kernel is not None:
             hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
         return hidden_states, residual
@@ -630,16 +663,27 @@ class DFlashDraftModel(nn.Module):
                 prefix=fc_prefix,
             )
         else:
-            # Split the output columns across ranks and all-gather the result,
-            # so each rank reads only its own slice of the weight.
-            self.fc = ColumnParallelLinear(
+            # Split the input features (the concatenated target-layer hiddens)
+            # across ranks and all-reduce the partial products: each rank still
+            # reads only its own slice of the weight, but the 8-way partial-sum
+            # all-reduce (custom kernel, ~6-8 us at bs 4 x 8 tokens) replaces the
+            # NCCL all-gather + re-layout copy (~23 us) of the column-parallel
+            # layout. Draft-only numerics (bf16 partials summed by the AR).
+            self.fc = RowParallelLinear(
                 self.num_context_features * hidden_size,
                 hidden_size,
                 bias=False,
-                gather_output=True,
+                input_is_parallel=True,
+                reduce_results=True,
                 prefix=fc_prefix,
             )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        # Fused TP all-reduce + RMSNorm (set by init_fused_ar_norm; see
+        # sglang.srt.speculative.dflash_ar_norm), shared by the decoder layers
+        # and by project_target_hidden.
+        self.fused_ar_norm = None
+        self._zero_residual_buf: Optional[torch.Tensor] = None
+        self._zero_residual_rows: int = 0
 
         # The model loader calls load_weights() before set_block_size(). Build
         # Domino projector modules here so their parameters are present while
@@ -683,6 +727,32 @@ class DFlashDraftModel(nn.Module):
                 if conv is not None:
                     conv.block_size = self.block_size
 
+    def init_fused_ar_norm(self, max_token_num: int) -> bool:
+        """Enable the fused TP all-reduce + residual + RMSNorm for the draft layers
+        (flashinfer TRT-LLM one-shot). Collective: every TP rank must call it."""
+        from sglang.srt.speculative.dflash_ar_norm import DFlashFusedARNorm
+
+        weight = self.norm.weight
+        fused = DFlashFusedARNorm(
+            hidden_size=int(self.config.hidden_size),
+            max_token_num=int(max_token_num),
+            dtype=weight.dtype,
+            device=weight.device,
+        )
+        if not fused.enabled:
+            return False
+        import os
+
+        # SGLANG_DFLASH_FUSED_AR_LAYERS=0 keeps the fc (prologue) fusion but
+        # leaves the decoder layers on the stock AR + fused_add_rmsnorm path.
+        if os.environ.get("SGLANG_DFLASH_FUSED_AR_LAYERS", "1") not in ("0", "false"):
+            for layer in self.layers:
+                layer.fused_ar_norm = fused
+        # Also used by project_target_hidden (fc all-reduce + hidden_norm).
+        self.fused_ar_norm = fused
+        self._zero_residual_rows = int(max_token_num)
+        return True
+
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return get_dflash_attention_sliding_window_size(self.config)
 
@@ -706,8 +776,38 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
+        if isinstance(self.fc, RowParallelLinear) and self.fc.tp_size > 1:
+            # This rank's K-slice of the replicated target hidden (a column view;
+            # cuBLAS takes the row stride as lda, no copy).
+            k = int(self.fc.input_size_per_partition)
+            start = int(self.fc.tp_rank) * k
+            target_hidden = target_hidden[:, start : start + k]
+            fused = self.fused_ar_norm
+            if fused is not None and fused.can_fuse(target_hidden[:, :1].expand(
+                -1, int(self.config.hidden_size)
+            )):
+                # One fused kernel: all-reduce of the fc partials + RMSNorm
+                # (zero residual), instead of AR + memcpys + rmsnorm.
+                partial, _ = self.fc(target_hidden, skip_all_reduce=True)
+                if not partial.is_contiguous():
+                    partial = partial.contiguous()
+                normed, _ = fused(
+                    partial,
+                    self._zero_residual(partial),
+                    self.hidden_norm.weight,
+                    self.hidden_norm.variance_epsilon,
+                )
+                return normed
         projected, _ = self.fc(target_hidden)
         return self.hidden_norm(projected)
+
+    def _zero_residual(self, like: torch.Tensor) -> torch.Tensor:
+        buf = self._zero_residual_buf
+        if buf is None or buf.shape[0] < like.shape[0] or buf.dtype != like.dtype:
+            rows = max(int(like.shape[0]), self._zero_residual_rows)
+            buf = torch.zeros((rows, like.shape[1]), dtype=like.dtype, device=like.device)
+            self._zero_residual_buf = buf
+        return buf[: like.shape[0]]
 
     @torch.no_grad()
     def forward(
@@ -732,6 +832,11 @@ class DFlashDraftModel(nn.Module):
         hidden_states = input_embeds
         residual: Optional[torch.Tensor] = None
 
+        fused = (
+            self.layers[0]._fused_ar_norm_for(hidden_states)
+            if len(self.layers) > 0 and hidden_states.numel() != 0
+            else None
+        )
         for layer in self.layers:
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
@@ -740,6 +845,11 @@ class DFlashDraftModel(nn.Module):
         if hidden_states.numel() != 0:
             if residual is None:
                 hidden_states = self.norm(hidden_states)
+            elif fused is not None:
+                # The last layer returned its un-reduced MLP partial.
+                hidden_states, _ = fused(
+                    hidden_states, residual, self.norm.weight, self.norm.variance_epsilon
+                )
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 

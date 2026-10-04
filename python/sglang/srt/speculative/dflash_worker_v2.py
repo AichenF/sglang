@@ -465,6 +465,37 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
         self.draft_model.set_block_size(self.block_size)
         self.speculative_num_draft_tokens = int(self.block_size)
+        self._fused_ar_norm_enabled = False
+        if (
+            is_cuda()
+            and get_tp_group().world_size > 1
+            and not self._is_domino
+            and hasattr(self.draft_model, "init_fused_ar_norm")
+        ):
+            # Fused TP all-reduce + residual + RMSNorm for the draft layers
+            # (flashinfer TRT-LLM one-shot). Workspace sized for the graph batch
+            # sizes up to 64 requests; larger blocks fall back per forward.
+            try:
+                max_bs = int(max(get_exec().graph.cuda_graph_config.decode.bs))
+            except Exception:
+                max_bs = 32
+            max_tokens = min(max_bs, 64) * int(self.block_size)
+            try:
+                self._fused_ar_norm_enabled = bool(
+                    self.draft_model.init_fused_ar_norm(max_tokens)
+                )
+            except Exception as e:
+                logger.warning("DFLASH fused AR+RMSNorm setup failed: %s", e)
+        # Replicated copy of the (vocab-sharded) target embedding for the draft
+        # block's noise embedding: one gather instead of shard lookup + TP
+        # all-reduce (+2 memcpys) per step. Costs vocab x hidden x 2 B per rank.
+        self._draft_embed_weight_full: Optional[torch.Tensor] = None
+        if is_cuda() and get_tp_group().world_size > 1:
+            try:
+                self._init_replicated_draft_embedding()
+            except Exception as e:
+                logger.warning("DFLASH replicated draft embedding disabled: %s", e)
+                self._draft_embed_weight_full = None
         if self._is_domino and self.block_size <= 1:
             raise ValueError(
                 "DFLASH Domino requires speculative_num_draft_tokens > 1, "
@@ -536,6 +567,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_greedy_index_cap: int = 0
         self._use_fused_kv_materialize = is_cuda() or is_hip() or is_xpu()
         self._fused_kv_helper: Optional[object] = None
+        # (ptr table, row stride, first k_buffer ptr) for the direct-to-cache path.
+        self._fused_kv_cache_table: Optional[Tuple[torch.Tensor, int, int]] = None
+        self._fused_kv_cache_table_disabled: bool = not is_cuda()
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
 
@@ -851,6 +885,68 @@ class DFlashWorkerV2(BaseSpecWorker):
             tp_group=tp_group if tp_group.world_size > 1 else None,
             use_vp_head=use_vp_head,
         )
+
+    def _init_replicated_draft_embedding(self) -> None:
+        import os
+
+        import torch.distributed as dist
+
+        from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+
+        if os.environ.get("SGLANG_DFLASH_REPLICATED_EMBED", "1") in ("0", "false"):
+            return
+        target_model = self._target_worker.model_runner.model
+        embed_module = unwrap_lora_layer(
+            _resolve_dflash_embedding_module(self.draft_model, target_model)
+        )
+        if not isinstance(embed_module, VocabParallelEmbedding):
+            return
+        weight = getattr(embed_module, "weight", None)
+        if (
+            weight is None
+            or weight.dim() != 2
+            or weight.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+            or type(embed_module.quant_method).__name__ != "UnquantizedEmbeddingMethod"
+            or getattr(embed_module, "output_dtype", None) is not None
+        ):
+            return
+        tp_group = get_tp_group()
+        tp_size, tp_rank = int(tp_group.world_size), int(tp_group.rank_in_group)
+        if int(embed_module.tp_size) != tp_size:
+            return
+        shard = embed_module.shard_indices
+        per_partition = int(embed_module.num_embeddings_per_partition)
+        # The gathered table indexes by global token id only when every shard is
+        # a contiguous, unpadded slice of the base vocab.
+        if (
+            int(shard.num_added_elements) != 0
+            or int(shard.num_org_vocab_padding) != 0
+            or int(shard.num_org_elements) != per_partition
+            or int(shard.org_vocab_start_index) != tp_rank * per_partition
+            or int(weight.shape[0]) != per_partition
+        ):
+            if self.ps.tp_rank == 0:
+                logger.info(
+                    "DFLASH replicated draft embedding skipped (non-contiguous vocab shards)."
+                )
+            return
+        full = torch.empty(
+            (tp_size * per_partition, int(weight.shape[1])),
+            dtype=weight.dtype,
+            device=weight.device,
+        )
+        dist.all_gather_into_tensor(
+            full, weight.detach().contiguous(), group=tp_group.device_group
+        )
+        self._draft_embed_weight_full = full
+        if self.ps.tp_rank == 0:
+            logger.info(
+                "DFLASH replicated draft embedding enabled: %d x %d %s (%.2f GB/rank).",
+                full.shape[0],
+                full.shape[1],
+                full.dtype,
+                full.numel() * full.element_size() / 1e9,
+            )
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
@@ -1816,11 +1912,86 @@ class DFlashWorkerV2(BaseSpecWorker):
                     attn.v_scale,
                 )
 
+        if ctx_cache_loc_2d is not None and commit_lens is not None:
+            table = self._get_fused_kv_cache_table(token_to_kv_pool)
+            if table is not None:
+                kv_cache_ptrs, cache_row_stride = table
+                self._fused_kv_helper.materialize_into_cache(
+                    ctx_hidden=ctx_hidden,
+                    positions=ctx_positions,
+                    kv_cache_ptrs=kv_cache_ptrs,
+                    cache_row_stride=cache_row_stride,
+                    loc_2d=ctx_cache_loc_2d,
+                    commit_lens=commit_lens,
+                )
+                return
+
         self._fused_kv_helper.materialize(
             ctx_hidden=ctx_hidden,
             positions=ctx_positions,
             write_layer_kv=_write_layer_kv,
         )
+
+    def _get_fused_kv_cache_table(self, token_to_kv_pool):
+        """(ptr table [n_layers, 2] int64, row stride) of the draft layers' K/V cache
+        buffers for the direct-to-cache fused materialization, or None when the pool
+        layout is not the plain contiguous bf16 MHA layout the kernel writes."""
+        if self._fused_kv_cache_table_disabled:
+            return None
+        layers = self.draft_model.layers
+        try:
+            k_bufs = token_to_kv_pool.k_buffer
+            v_bufs = token_to_kv_pool.v_buffer
+            start_layer = int(getattr(token_to_kv_pool, "start_layer", 0))
+            first_k = k_bufs[layers[0].self_attn.attn.layer_id - start_layer]
+            cached = self._fused_kv_cache_table
+            if cached is not None and cached[2] == first_k.data_ptr():
+                return cached[0], cached[1]
+            helper = self._fused_kv_helper
+            dtype = helper.flat_kv_weight_t.dtype
+            if (
+                getattr(token_to_kv_pool, "dtype", None) != dtype
+                or getattr(token_to_kv_pool, "store_dtype", None) != dtype
+                or getattr(token_to_kv_pool, "v_row_dim", None)
+                != getattr(token_to_kv_pool, "row_dim", None)
+                or int(getattr(token_to_kv_pool, "head_num", -1)) != helper.num_kv_heads
+                or int(getattr(token_to_kv_pool, "head_dim", -1)) != helper.head_dim
+            ):
+                raise RuntimeError("pool layout/dtype mismatch")
+            row_stride = helper.num_kv_heads * helper.head_dim
+            ptrs = []
+            for layer in layers:
+                attn = layer.self_attn.attn
+                idx = attn.layer_id - start_layer
+                k_buf, v_buf = k_bufs[idx], v_bufs[idx]
+                for buf in (k_buf, v_buf):
+                    if (
+                        buf.dtype != dtype
+                        or buf.dim() != 3
+                        or not buf.is_contiguous()
+                        or buf.stride(0) != row_stride
+                        or buf.data_ptr() % 16 != 0
+                    ):
+                        raise RuntimeError("kv buffer layout mismatch")
+                ptrs.append([k_buf.data_ptr(), v_buf.data_ptr()])
+            table = torch.tensor(ptrs, dtype=torch.int64, device=self.device)
+            self._fused_kv_cache_table = (table, row_stride, first_k.data_ptr())
+            if self.ps.tp_rank == 0 and cached is None:
+                logger.info(
+                    "DFLASH fused KV materialization writes straight into the KV cache "
+                    "(n_layers=%d, row_stride=%d).",
+                    len(layers),
+                    row_stride,
+                )
+            return table, row_stride
+        except Exception as e:
+            if self.ps.tp_rank == 0:
+                logger.info(
+                    "DFLASH direct-to-cache fused KV materialization disabled: %s", e
+                )
+            self._fused_kv_cache_table_disabled = True
+            self._fused_kv_cache_table = None
+            return None
 
     def _update_target_mamba_state_after_verify(
         self,
@@ -2515,7 +2686,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             # (captured into the draft graph); nothing to stage eagerly.
             input_embeds = None
         else:
-            noise_embedding = embed_module(block_ids)
+            if self._draft_embed_weight_full is not None:
+                # Replicated table: plain gather, no shard mask / TP all-reduce.
+                noise_embedding = torch.nn.functional.embedding(
+                    block_ids, self._draft_embed_weight_full
+                )
+            else:
+                noise_embedding = embed_module(block_ids)
             if self._noise_embed_scale != 1.0:
                 noise_embedding = noise_embedding * self._noise_embed_scale
             input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
