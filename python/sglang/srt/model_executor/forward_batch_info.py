@@ -577,6 +577,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     next_token_logits_buffer: torch.Tensor = None
     temperature: torch.Tensor = None
     top_p: torch.Tensor = None
+    # return this rank's bf16 [T, vocab/tp] logits shard from the
+    # LogitsProcessor instead of all-gathering + fp32-copying the full logits.
+    # The consumer (DFLASH greedy verify) reduces the shard vocab-parallel and
+    # gathers the full logits itself only when it really needs them (logprobs).
+    skip_tp_logits_gather: bool = False
 
     # For split prefill
     # intermediate values for split prefill

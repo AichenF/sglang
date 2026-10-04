@@ -307,6 +307,10 @@ class LogitsMetadata:
     # rows (see EagleDraftExtendInput.select_index).
     draft_extend_select_index: Optional[torch.Tensor] = None
 
+    # hand back this rank's bf16 logits shard (no TP all-gather, no
+    # fp32 copy); see ForwardBatch.skip_tp_logits_gather.
+    skip_tp_logits_gather: bool = False
+
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         if (
@@ -364,6 +368,7 @@ class LogitsMetadata:
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
             draft_extend_select_index=draft_extend_select_index,
+            skip_tp_logits_gather=forward_batch.skip_tp_logits_gather,
         )
 
     def compute_dp_attention_metadata(self):
@@ -837,6 +842,20 @@ class LogitsProcessor(nn.Module):
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
+
+        if (
+            logits_metadata.skip_tp_logits_gather
+            and self.do_tensor_parallel_all_gather
+            and not self.use_attn_tp_group
+            and not self.do_tensor_parallel_all_gather_dp_attn
+            and not self.final_logit_softcapping
+            and logits.shape[-1] * get_parallel().tp_size == self.vocab_size
+        ):
+            # the caller wants this rank's [T, vocab/tp] shard; it does
+            # the vocab-parallel argmax itself and gathers the full logits only
+            # when it needs them (see dflash_worker_v2). Saves the multimem
+            # all-gather + the fp32 copy of the full logits every verify step.
+            return logits
 
         used_tp_lm_head_all_to_all = False
         if self.do_tensor_parallel_all_gather:
