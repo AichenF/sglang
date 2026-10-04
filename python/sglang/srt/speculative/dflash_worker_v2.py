@@ -18,9 +18,13 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
-from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    should_apply_lm_head_quant_method,
+)
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -82,6 +86,7 @@ from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
 )
+from sglang.srt.speculative.vocab_parallel_argmax import VocabParallelGreedyHead
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_npu = is_npu()
@@ -116,7 +121,15 @@ class _DflashDraftSampler:
     """
 
     def __init__(
-        self, *, weight, block_size, num_org, org_vocab_start, max_bs, tp_group=None
+        self,
+        *,
+        weight,
+        block_size,
+        num_org,
+        org_vocab_start,
+        max_bs,
+        tp_group=None,
+        use_vp_head: bool = False,
     ):
         self.weight = weight
         self.block_size = int(block_size)
@@ -127,6 +140,20 @@ class _DflashDraftSampler:
         max_tokens = int(max_bs) * (self.block_size - 1)
         device = weight.device
         self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
+        # fused shard argmax + 16-B pair multimem all-gather + select
+        # (one Triton reduce, one symm-mem gather, one tiny select) instead of
+        # torch.max + two NCCL all-gathers + argmax + gather.
+        self.head = None
+        if self.tp_size > 1 and use_vp_head:
+            self.head = VocabParallelGreedyHead(
+                tp_group=tp_group,
+                max_tokens=max_tokens,
+                local_vocab=self.num_org,
+                vocab_start=self.org_vocab_start,
+                device=device,
+                out=self.out,
+                name="draft",
+            )
         if self.tp_size > 1:
             # Static buffers (fixed addresses) keep the in-graph select replay-safe.
             self.local_max = torch.empty(
@@ -163,6 +190,10 @@ class _DflashDraftSampler:
             if self.org_vocab_start:
                 tokens += self.org_vocab_start
             self.out[:n].copy_(tokens)
+            return
+        if self.head is not None:
+            # Writes the global argmax ids straight into self.out[:n].
+            self.head(logits)
             return
         local_max = self.local_max[:n]
         local_arg = self.local_arg[:n]
@@ -523,6 +554,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
 
+        # Fast paths (see _init_vocab_parallel_fast_paths).
+        self._target_greedy_head: Optional[VocabParallelGreedyHead] = None
+        self._fc_gatherer = None
+        self._vp_check_logged = 0
+        self._embed_in_graph = False
+        self._init_vocab_parallel_fast_paths()
+        self._init_embed_in_graph()
+
     @property
     def draft_worker(self):
         # DFLASH drives the draft model through a plain TpModelWorker: the
@@ -793,6 +832,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "DFLASH draft greedy head folded into the draft cuda graph (tp=%d).",
                 tp_group.world_size,
             )
+        use_vp_head = (
+            envs.SGLANG_DFLASH_VP_ARGMAX.get()
+            and not _is_npu
+            and int(lm_head.weight.shape[0]) == num_org
+        )
+        if self.ps.tp_rank == 0 and tp_group.world_size > 1:
+            logger.info(
+                "DFLASH draft greedy head: vocab-parallel argmax %s.",
+                "enabled" if use_vp_head else "disabled",
+            )
         return _DflashDraftSampler(
             weight=lm_head.weight,
             block_size=self.block_size,
@@ -800,6 +849,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             org_vocab_start=org_vocab_start,
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             tp_group=tp_group if tp_group.world_size > 1 else None,
+            use_vp_head=use_vp_head,
         )
 
     def _init_fused_kv_helper(self) -> None:
@@ -1626,7 +1676,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 commit_lens = commit_lens.to(torch.int32)
 
         with torch.inference_mode():
-            ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+            ctx_hidden = self._project_target_hidden(target_hidden)
 
             if cache_loc_2d is not None:
                 bs = int(commit_lens.shape[0])
@@ -1873,6 +1923,267 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._new_seq_lens_bufs[slot][:bs],
         )
 
+    # ------------------------------------------------------------------
+    # Fast paths: vocab-parallel greedy argmax + multimem fc gather
+    # ------------------------------------------------------------------
+    def _init_vocab_parallel_fast_paths(self) -> None:
+        tp_group = get_tp_group()
+        tp_size = int(tp_group.world_size)
+        if tp_size <= 1 or _is_npu or not is_cuda():
+            return
+        target_mr = self._target_worker.model_runner
+        target_model = target_mr.model
+        block_size = int(self.block_size)
+        try:
+            graph_bs = max(get_exec().graph.cuda_graph_config.decode.bs)
+        except Exception:
+            graph_bs = 0
+        max_tokens = int(
+            max(
+                triton_symm_mem_ag.recommended_max_tokens(
+                    include_prefill=False, floor=128
+                ),
+                graph_bs * block_size,
+                block_size,
+            )
+        )
+
+        if envs.SGLANG_DFLASH_VP_ARGMAX.get():
+            lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
+            reason = None
+            if self.selector is not None or self._is_domino:
+                # Those verify paths consume the full logits every step.
+                reason = "selector/domino draft"
+            elif lm_head is None or not hasattr(lm_head, "shard_indices"):
+                reason = "no sharded lm_head"
+            elif not is_dense_head_weight(getattr(lm_head, "weight", None)):
+                reason = "quantized lm_head"
+            elif getattr(target_model, "logits_processor", None) is None:
+                reason = "no logits_processor"
+            else:
+                shard = lm_head.shard_indices
+                num_org = int(shard.num_org_elements)
+                vocab = int(self.model_runner.model_config.vocab_size)
+                if int(shard.num_added_elements) != 0:
+                    reason = "added vocab"
+                elif num_org * tp_size != vocab:
+                    reason = f"vocab {vocab} not evenly sharded ({num_org}x{tp_size})"
+                elif int(lm_head.weight.shape[0]) != num_org:
+                    reason = "padded lm_head shard"
+            if reason is None:
+                self._target_greedy_head = VocabParallelGreedyHead(
+                    tp_group=tp_group,
+                    max_tokens=max_tokens,
+                    local_vocab=num_org,
+                    vocab_start=int(shard.org_vocab_start_index),
+                    device=self.device,
+                    name="target",
+                )
+                # The target verify graph then emits the bf16 logits shard and the
+                # tail hook folds the shard argmax + pair gather + select into it.
+                target_mr.capture_skip_tp_logits_gather = True
+                target_mr.capture_tail_hooks.append(
+                    self._target_greedy_head_capture_hook
+                )
+            if self.ps.tp_rank == 0:
+                logger.info(
+                    "DFLASH target greedy verify: vocab-parallel argmax %s (mode=%s, max_tokens=%d).",
+                    "enabled" if reason is None else f"disabled ({reason})",
+                    getattr(self._target_greedy_head, "mode", None),
+                    max_tokens,
+                )
+
+        if envs.SGLANG_DFLASH_FC_MULTIMEM.get():
+            from sglang.srt.models.dflash import DFlashDraftModel
+
+            fc = getattr(self.draft_model, "fc", None)
+            ok = (
+                fc is not None
+                and getattr(fc, "gather_output", False)
+                and int(getattr(fc, "tp_size", 1)) == tp_size
+                and getattr(fc, "bias", None) is None
+                and getattr(fc, "quant_method", None) is not None
+                and type(self.draft_model).project_target_hidden
+                is DFlashDraftModel.project_target_hidden
+            )
+            if ok:
+                self._fc_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
+                    max_tokens=min(max_tokens, 2048),
+                    enabled=True,
+                    skip_entry_sync=True,
+                )
+            if self.ps.tp_rank == 0:
+                logger.info(
+                    "DFLASH draft fc gather: multimem %s.",
+                    "enabled" if ok else "disabled",
+                )
+
+    def _init_embed_in_graph(self) -> None:
+        """Fold the draft-block noise embedding into the draft cuda graph.
+
+        The block embedding (bonus token + mask tokens) is computed eagerly per
+        step today (vocab-parallel lookup + TP all-reduce + copy into the graph's
+        input_embeds buffer). With ``draft_model.forward_embed`` set, the decode
+        graph runner passes input_ids only and the model embeds in-graph; the
+        eager runner path takes the same branch (input_embeds=None)."""
+        if not envs.SGLANG_DFLASH_EMBED_IN_GRAPH.get() or self._is_domino or _is_npu:
+            return
+        draft_model = self.draft_model
+        if getattr(draft_model, "embed_tokens", None) is not None or hasattr(
+            draft_model, "forward_embed"
+        ):
+            return
+        target_model = self._target_worker.model_runner.model
+        embed_module = unwrap_lora_layer(
+            _resolve_dflash_embedding_module(draft_model, target_model)
+        )
+        if embed_module is None:
+            return
+        scale = float(self._noise_embed_scale)
+
+        def forward_embed(input_ids: torch.Tensor) -> torch.Tensor:
+            emb = embed_module(input_ids)
+            if scale != 1.0:
+                emb = emb * scale
+            return emb
+
+        draft_model.forward_embed = forward_embed
+        self._embed_in_graph = True
+        if self.ps.tp_rank == 0:
+            logger.info("DFLASH draft block embedding folded into the draft graph.")
+
+    def _target_greedy_head_capture_hook(self, runner, out, forward_batch, num_tokens):
+        """Capture tail hook on the target runner: in-graph shard argmax."""
+        del runner, forward_batch, num_tokens
+        head = self._target_greedy_head
+        if (
+            head is None
+            or not isinstance(out, LogitsProcessorOutput)
+            or out.next_token_logits is None
+        ):
+            return
+        logits = out.next_token_logits
+        if (
+            logits.ndim != 2
+            or int(logits.shape[-1]) != head.local_vocab
+            or logits.dtype == torch.float32
+            or int(logits.shape[0]) > head.max_tokens
+        ):
+            return
+        head(logits)
+
+    @staticmethod
+    def _sampling_allows_greedy_fast_path(sampling_info) -> bool:
+        if sampling_info is None:
+            return True
+        if not sampling_info.is_all_greedy:
+            return False
+        if getattr(sampling_info, "has_custom_logit_processor", False):
+            return False
+        if getattr(sampling_info, "acc_linear_penalties", None) is not None:
+            return False
+        penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+        if penalizer is not None and getattr(penalizer, "is_required", False):
+            return False
+        if getattr(sampling_info, "grammar_mask", None) is not None:
+            return False
+        if getattr(sampling_info, "logit_bias", None) is not None:
+            return False
+        return True
+
+    def _materialize_full_logits(self, shard: torch.Tensor) -> torch.Tensor:
+        """Eager TP all-gather of the bf16 shard + fp32 copy (old full path)."""
+        lp = getattr(self._target_worker.model_runner.model, "logits_processor", None)
+        gatherer = getattr(lp, "_logits_gatherer", None)
+        shard = shard.contiguous()
+        if gatherer is not None:
+            full = gatherer(shard)
+        else:
+            full = get_tp_group().all_gather(shard, dim=-1)
+        vocab = int(self.model_runner.model_config.vocab_size)
+        if full.shape[-1] > vocab:
+            full = full[:, :vocab]
+        return full.float()
+
+    def _resolve_target_greedy_fast_path(
+        self,
+        *,
+        batch: ScheduleBatch,
+        logits_output,
+        sampling_info,
+        bs: int,
+        in_graph_head: bool,
+    ) -> Optional[torch.Tensor]:
+        """Returns target_predict [bs, block] from the vocab-parallel argmax, or
+        None (after restoring full fp32 logits in logits_output) for the old path.
+
+        ``in_graph_head``: the decode graph (with the tail hook) produced head.out
+        for this batch; otherwise the shard argmax runs eagerly here."""
+        head = self._target_greedy_head
+        if head is None or logits_output is None:
+            return None
+        logits = logits_output.next_token_logits
+        if logits is None:
+            return None
+        block_size = int(self.block_size)
+        n = bs * block_size
+        is_shard = (
+            logits.ndim == 2
+            and int(logits.shape[-1]) == head.local_vocab
+            and logits.dtype != torch.float32
+            and int(logits.shape[0]) == n
+        )
+        if not is_shard:
+            return None
+        fast = (
+            self.selector is None
+            and self._selector_sample is None
+            and not batch.return_logprob
+            and not batch.has_grammar
+            and SIMULATE_ACC_LEN <= 0
+            and n <= head.max_tokens
+            and self._sampling_allows_greedy_fast_path(sampling_info)
+        )
+        check = envs.SGLANG_DFLASH_VP_ARGMAX_CHECK.get()
+        full = None
+        if not fast or check:
+            full = self._materialize_full_logits(logits)
+            logits_output.next_token_logits = full
+            if not fast:
+                return None
+        if in_graph_head:
+            predict = head.out[:n]  # produced in-graph by the tail hook
+        else:
+            predict = head(logits)
+        if check:
+            ref = torch.argmax(full, dim=-1)
+            same = bool(torch.equal(ref, predict))
+            if not same or self._vp_check_logged < 3:
+                self._vp_check_logged += 1
+                logger.log(
+                    logging.INFO if same else logging.ERROR,
+                    "DFLASH VP_ARGMAX_CHECK rank%d: %s (n=%d, mismatches=%d)",
+                    self.ps.tp_rank,
+                    "OK" if same else "MISMATCH",
+                    n,
+                    int((ref != predict).sum().item()),
+                )
+        return predict.view(bs, block_size)
+
+    def _project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
+        """draft_model.project_target_hidden with the fc output all-gather done by
+        the multimem symm-mem kernel (NCCL fallback inside the gatherer)."""
+        gatherer = self._fc_gatherer
+        if gatherer is None:
+            return self.draft_model.project_target_hidden(target_hidden)
+        fc = self.draft_model.fc
+        expected = int(fc.input_size)
+        if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
+            return self.draft_model.project_target_hidden(target_hidden)
+        shard = fc.quant_method.apply(fc, target_hidden, None)
+        full = gatherer(shard)
+        return self.draft_model.hidden_norm(full)
+
     def _accept_block(
         self,
         *,
@@ -1882,9 +2193,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_input,
         prefix_lens: torch.Tensor,
         bs: int,
+        target_predict: Optional[torch.Tensor] = None,
     ):
         new_seq_lens = None
-        target_predict = None
         if self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
             accept_len, bonus = self._selector_sampling_accept(
@@ -1912,10 +2223,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, bonus)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         else:
-            target_predict = torch.argmax(next_token_logits, dim=-1).view(
-                bs, int(self.block_size)
-            )
-            self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
+            if target_predict is None:
+                target_predict = torch.argmax(next_token_logits, dim=-1).view(
+                    bs, int(self.block_size)
+                )
+                self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
+            # else: vocab-parallel result -- every rank selected from the same
+            # gathered pairs with the same deterministic kernel, so the ranks
+            # agree by construction and the rank-0 broadcast is not needed.
             if self._use_triton_accept_bonus:
                 try:
                     (
@@ -2195,10 +2510,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
-        noise_embedding = embed_module(block_ids)
-        if self._noise_embed_scale != 1.0:
-            noise_embedding = noise_embedding * self._noise_embed_scale
-        input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
+        if self._embed_in_graph:
+            # draft_model.forward_embed embeds block_ids inside the draft forward
+            # (captured into the draft graph); nothing to stage eagerly.
+            input_embeds = None
+        else:
+            noise_embedding = embed_module(block_ids)
+            if self._noise_embed_scale != 1.0:
+                noise_embedding = noise_embedding * self._noise_embed_scale
+            input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
@@ -2369,11 +2689,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
             batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
 
-        verify_forward_batch, _ = verify_input.prepare_for_verify(
+        verify_forward_batch, verify_decode_graph = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
+        if self._target_greedy_head is not None:
+            # Eager (non-graph) verify forwards emit the logits shard as well.
+            verify_forward_batch.skip_tp_logits_gather = True
 
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
@@ -2383,6 +2706,20 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
+
+        # greedy + no logprobs/grammar/penalties -> the target argmax
+        # comes from the vocab-parallel head (in-graph) and the full logits are
+        # never materialized. Otherwise this restores the full fp32 logits.
+        target_predict_fast = self._resolve_target_greedy_fast_path(
+            batch=batch,
+            logits_output=logits_output,
+            sampling_info=sampling_info,
+            bs=bs,
+            # Only the DECODE graph runner captured the tail hook; the piecewise
+            # prefill graph / eager runner also report can_run_cuda_graph but the
+            # shard argmax must then run eagerly.
+            in_graph_head=bool(verify_decode_graph and can_run_cuda_graph),
+        )
 
         grammar_mask = None
         if batch.has_grammar:
@@ -2394,7 +2731,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 barrier=grammar_barrier,
             )
 
-        if sampling_info is not None:
+        if sampling_info is not None and target_predict_fast is None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -2420,6 +2757,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_input=draft_input,
             prefix_lens=prefix_lens,
             bs=bs,
+            target_predict=target_predict_fast,
         )
 
         if SIMULATE_ACC_LEN > 0:

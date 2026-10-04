@@ -1292,6 +1292,19 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # vocab-parallel greedy argmax for DFLASH target verify + draft
+    # sampling (per-rank shard max + 16-B pair all-gather instead of gathering
+    # the full [T, vocab] logits). Bit-exact with torch.argmax on full logits.
+    SGLANG_DFLASH_VP_ARGMAX = EnvBool(True)
+    # Debug: also run the full-logits reference path and compare tokens.
+    SGLANG_DFLASH_VP_ARGMAX_CHECK = EnvBool(False)
+    # gather the draft fc (target-hidden projection) output with the
+    # multimem symm-mem all-gather instead of the NCCL ring.
+    SGLANG_DFLASH_FC_MULTIMEM = EnvBool(True)
+    # unmeasured, default off: embed the DFLASH draft block inside the
+    # draft cuda graph (model.forward_embed = target embedding * noise scale)
+    # instead of the eager embedding + all-reduce + copy into the graph buffer.
+    SGLANG_DFLASH_EMBED_IN_GRAPH = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).

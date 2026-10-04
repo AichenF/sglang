@@ -1010,6 +1010,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             lora_ids=lora_ids,
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
+            # set by the DFLASH worker before target capture so the
+            # graph produces the bf16 logits shard (vocab-parallel argmax).
+            skip_tp_logits_gather=bool(
+                getattr(self.model_runner, "capture_skip_tp_logits_gather", False)
+            ),
         )
 
         # Trip the coordinator so the hisparse code path is captured into the
