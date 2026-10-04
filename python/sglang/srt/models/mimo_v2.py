@@ -53,6 +53,10 @@ from sglang.srt.layers.moe import (
     should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
+from sglang.srt.layers.moe.mimo_fused_moe.layer import (
+    MiMoFusedMoE,
+    mimo_fused_moe_enabled,
+)
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -923,6 +927,32 @@ class MiMoV2DecoderLayer(nn.Module):
             allow_reduce_scatter=True,
             is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
         )
+        # Fused decode MoE (SGLANG_MIMO_FUSED_MOE=1): post-attention RMSNorm + router + top-8 + experts + TP all-reduce
+        # in one kernel over the Humming layer's weights. Created at the first forward (needs the transformed weights).
+        self._fused_moe: Optional[MiMoFusedMoE] = None
+        self._fused_moe_checked = False
+
+    def _maybe_fused_moe(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        if not self._fused_moe_checked:
+            self._fused_moe_checked = True
+            if torch.cuda.is_current_stream_capturing():
+                logger.warning(
+                    "MiMo fused MoE: the first forward runs under CUDA graph capture, "
+                    "cannot exchange the IPC buffers; the fused path stays disabled."
+                )
+            else:
+                # collective over the TP group
+                self._fused_moe = MiMoFusedMoE.try_create(self)
+        if self._fused_moe is None or not self._fused_moe.applicable(
+            hidden_states, residual, forward_batch
+        ):
+            return None
+        return self._fused_moe.forward(hidden_states, residual)
 
     def forward(
         self,
@@ -931,17 +961,34 @@ class MiMoV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
-        )
-
-        if hidden_states.shape[0] != 0:
+        # the previous layer's fused MoE kernel already ran THIS layer's input_layernorm + fp8 activation quant in its TP
+        # tail (bitwise the flashinfer fused_add_rmsnorm + SGLang per_token_group_quant pair): take residual_new and feed qkv_proj
+        # the pre-quantized (x_fp8, scales) -- Fp8LinearMethod.apply passes a tuple straight to the DeepGEMM path.
+        handoff = getattr(hidden_states, "_fmoe_norm_next", None)
+        if handoff is not None and handoff.layer_id == self.layer_id and residual is not None:
+            residual = handoff.residual_new
             hidden_states = self.self_attn(
                 positions=positions,
-                hidden_states=hidden_states,
+                hidden_states=(handoff.x_fp8, handoff.x_scale),
                 forward_batch=forward_batch,
             )
+        else:
+            # Self Attention
+            hidden_states, residual = self.layer_communicator.prepare_attn(
+                hidden_states, residual, forward_batch
+            )
+
+            if hidden_states.shape[0] != 0:
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
+
+        if self.is_layer_sparse and mimo_fused_moe_enabled():
+            fused = self._maybe_fused_moe(hidden_states, residual, forward_batch)
+            if fused is not None:
+                return fused
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -1081,10 +1128,22 @@ class MiMoV2Model(nn.Module):
             pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
+        # every decoder layer gets a plain (non-registered: no state_dict / parameter duplication) reference to its
+        # successor, so the fused MoE kernel of layer L can L2-prefetch layer L+1's attention weights in its TP tail
+        # (mimo_fused_moe/layer.py, SGLANG_MIMO_FUSED_MOE_PREFETCH).
+        for i in range(self.start_layer, self.end_layer - 1):
+            if isinstance(self.layers[i], MiMoV2DecoderLayer) and isinstance(self.layers[i + 1], MiMoV2DecoderLayer):
+                object.__setattr__(self.layers[i], "_mimo_next_layer", self.layers[i + 1])
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
         else:
             self.norm = PPMissingLayer(return_tuple=True)
+        # a fused MoE layer may run its successor's input_layernorm + activation quant (see MiMoFusedMoE / _norm_next_check).
+        # object.__setattr__: a plain reference, NOT a registered child module (that would alias the successor's parameters under
+        # this layer's name and break load_weights' params_dict).
+        for i in range(self.start_layer, self.end_layer - 1):
+            if isinstance(self.layers[i], MiMoV2DecoderLayer) and isinstance(self.layers[i + 1], MiMoV2DecoderLayer):
+                object.__setattr__(self.layers[i], "_fmoe_next_layer", self.layers[i + 1])
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         if hasattr(self.config, "scale_emb"):
@@ -1153,11 +1212,20 @@ class MiMoV2Model(nn.Module):
                     residual,
                 )
                 if i in self.layers_to_capture:
-                    aux_hidden_states.append(
-                        hidden_states + residual
-                        if residual is not None
-                        else hidden_states
-                    )
+                    # the fused MoE kernel already wrote hidden_states + residual (residual_new for layer i + 1)
+                    handoff = getattr(hidden_states, "_fmoe_norm_next", None)
+                    if (
+                        handoff is not None
+                        and handoff.layer_id == i + 1
+                        and residual is not None
+                    ):
+                        aux_hidden_states.append(handoff.residual_new)
+                    else:
+                        aux_hidden_states.append(
+                            hidden_states + residual
+                            if residual is not None
+                            else hidden_states
+                        )
 
         hidden_states_before_norm = None
         if not self.pp_group.is_last_rank:
