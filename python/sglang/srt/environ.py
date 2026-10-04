@@ -1266,8 +1266,8 @@ class Envs:
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
 
-    # MiMo attention optimizations (opt-in; unsupported layouts fall back).
-    SGLANG_OPT_MIMO_ROPE_KV = EnvBool(False)
+    # MiMo attention optimizations (enabled by default; unsupported layouts fall back).
+    SGLANG_OPT_MIMO_ROPE_KV = EnvBool(True)
 
     # ===================================================================
     # RoPE cache

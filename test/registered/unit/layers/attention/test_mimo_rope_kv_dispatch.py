@@ -1,4 +1,4 @@
-"""CPU-only contract tests for the opt-in MiMo RoPE/KV path."""
+"""CPU-only contract tests for the guarded MiMo RoPE/KV path."""
 
 import sys
 import types
@@ -194,13 +194,15 @@ class TestMiMoRoPEKVDispatch(CustomTestCase):
             )
             select.assert_not_called()
 
-    def test_supported_path_launches_once(self):
+    def test_default_enabled_path_launches_once(self):
         module = types.ModuleType("sglang.kernels.ops.attention.mimo_rope_kv")
         module.run = Mock()
         with (
             envs.SGLANG_OPT_MIMO_ROPE_KV.override(True),
             patch.dict(sys.modules, {module.__name__: module}),
         ):
+            envs.SGLANG_OPT_MIMO_ROPE_KV.clear()
+            self.assertFalse(envs.SGLANG_OPT_MIMO_ROPE_KV.is_set())
             self.assertTrue(
                 adapter.try_fused_mimo_rope_kv(
                     self.attention, self.qkv, self.positions, self.batch

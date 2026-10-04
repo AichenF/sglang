@@ -44,7 +44,7 @@ def select_mimo_rope_kv(attention, qkv, positions, forward_batch):
     ):
         return None
 
-    # Keep backend imports lazy: the feature is opt-in and CUDA-specific.
+    # Keep CUDA-specific backend imports lazy.
     from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
     from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
