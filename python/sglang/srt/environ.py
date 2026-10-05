@@ -1114,6 +1114,10 @@ class Envs:
     # One preserves the default single-call path; values above one are useful
     # for batches whose KV sequence lengths have a large spread.
     SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS = EnvInt(1)
+    # Run multi-token (speculative verify) TRT-LLM MHA decode through FlashInfer's
+    # Cake FMHA small-M head-dim-256 kernel when it serves the shape and the
+    # installed FlashInfer has the CUDA-graph fixes; others keep trtllm-gen.
+    SGLANG_USE_CAKE_FMHA_VERIFY = EnvBool(True)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
