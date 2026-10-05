@@ -10,12 +10,14 @@ Requires flashinfer >= 0.6.14.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -164,6 +166,19 @@ def _get_flashinfer_gdn_kernels():
     )
 
 
+def _get_cake_gdn_unsupported_error() -> Optional[type]:
+    """Return FlashInfer's Cake GDN fail-closed error type, or None if absent.
+
+    Cake GDN verify rows (e.g. Qwen3.5 TP2 T=7) ship in FlashInfer >= 0.7.1;
+    older releases have no ``backend="cake_gdn"`` path.
+    """
+    try:
+        from flashinfer.jit.cake_gdn import CakeGDNUnsupportedError
+    except ImportError:
+        return None
+    return CakeGDNUnsupportedError
+
+
 def is_flashinfer_gdn_prefill_available() -> bool:
     """Return whether the kernel loader can construct the prefill path."""
     available, prefill_fn, *_ = _get_flashinfer_gdn_kernels()
@@ -262,7 +277,23 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
             self._mtp_fn = _mtp_bf16_adapted
 
-        logger.info("Using FlashInfer GDN kernels")
+        # Cake GDN verify rows (SM100/SM103, BF16 state pool). FlashInfer fails
+        # closed on shapes it has no row for; those shapes are remembered and
+        # keep the bf16-state MTP kernel.
+        self._cake_gdn_unsupported_error = (
+            _get_cake_gdn_unsupported_error()
+            if envs.SGLANG_USE_CAKE_GDN_VERIFY.get()
+            and sm_major == 10
+            and self.use_state_pool
+            and "backend" in inspect.signature(self._decode_fn).parameters
+            else None
+        )
+        self._cake_gdn_unsupported_shapes: set[tuple] = set()
+
+        logger.info(
+            "Using FlashInfer GDN kernels (Cake GDN verify: %s)",
+            self._cake_gdn_unsupported_error is not None,
+        )
 
     def _prepare_dynamic_input(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
         # Reuse per-stream aligned scratch for uncommon read-only views; stable
@@ -326,10 +357,11 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         dt_bias: torch.Tensor,
         *,
         A_log_dtype: Optional[torch.dtype] = None,
+        dt_bias_dtype: Optional[torch.dtype] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return (
             self._prepare_parameter("A_log", A_log, dtype=A_log_dtype),
-            self._prepare_parameter("dt_bias", dt_bias),
+            self._prepare_parameter("dt_bias", dt_bias, dtype=dt_bias_dtype),
         )
 
     def _mutable_inputs_are_aligned(
@@ -349,6 +381,73 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 self._alignment_fallback_warned = True
             return False
         return True
+
+    def _cake_gdn_target_verify(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        intermediate_states_buffer: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Run the verify recurrence through FlashInfer Cake GDN if it has a row.
+
+        Returns None when Cake GDN is off or has no row for this shape. Row
+        selection happens on the host before any launch, so probing an
+        unsupported shape is safe during CUDA graph capture.
+        """
+        if (
+            self._cake_gdn_unsupported_error is None
+            or intermediate_states_buffer is None
+        ):
+            return None
+        shape_key = (
+            tuple(q.shape),
+            tuple(v.shape),
+            tuple(intermediate_states_buffer.shape),
+            ssm_states.dtype,
+        )
+        if shape_key in self._cake_gdn_unsupported_shapes:
+            return None
+        # Cake GDN takes FP32 gate parameters and int32 state slots.
+        A_log_fi, dt_bias_fi = self._prepare_gate_parameters(
+            A_log, dt_bias, A_log_dtype=torch.float32, dt_bias_dtype=torch.float32
+        )
+        try:
+            output, _ = self._decode_fn(
+                q=q,
+                k=k,
+                v=v,
+                state=None,
+                A_log=A_log_fi,
+                a=a,
+                dt_bias=dt_bias_fi,
+                b=b,
+                scale=None,
+                output=None,
+                use_qk_l2norm=True,
+                initial_state=ssm_states,
+                initial_state_indices=cache_indices.to(torch.int32),
+                intermediate_states_buffer=intermediate_states_buffer,
+                disable_state_update=True,
+                backend="cake_gdn",
+            )
+        except self._cake_gdn_unsupported_error as e:
+            self._cake_gdn_unsupported_shapes.add(shape_key)
+            logger.info(
+                "Cake GDN has no verify row for %s (%s); using the bf16-state "
+                "MTP kernel for this shape.",
+                shape_key,
+                e,
+            )
+            return None
+        return output
 
     def _prepare_verify_intermediate_buffer(
         self,
@@ -693,27 +792,40 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         b_mtp = self._prepare_dynamic_input(
             "verify_b", b.view(batch_size, draft_token_num, num_v_heads)
         )
-        A_log_fi, dt_bias_fi = self._prepare_gate_parameters(A_log, dt_bias)
         cache_indices_fi = self._prepare_dynamic_input(
             "verify_cache_indices", cache_indices
         )
 
-        output_fi, _ = self._mtp_fn(
-            q=query_mtp,
-            k=key_mtp,
-            v=value_mtp,
-            initial_state=ssm_states,
-            initial_state_indices=cache_indices_fi,
-            A_log=A_log_fi,
-            a=a_mtp,
-            dt_bias=dt_bias_fi,
-            b=b_mtp,
-            scale=None,
-            output=None,
+        output_fi = self._cake_gdn_target_verify(
+            query_mtp,
+            key_mtp,
+            value_mtp,
+            a_mtp,
+            b_mtp,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices_fi,
             intermediate_states_buffer=intermediate_states_buffer_mtp,
-            disable_state_update=True,
-            use_qk_l2norm=True,
         )
+        if output_fi is None:
+            A_log_fi, dt_bias_fi = self._prepare_gate_parameters(A_log, dt_bias)
+            output_fi, _ = self._mtp_fn(
+                q=query_mtp,
+                k=key_mtp,
+                v=value_mtp,
+                initial_state=ssm_states,
+                initial_state_indices=cache_indices_fi,
+                A_log=A_log_fi,
+                a=a_mtp,
+                dt_bias=dt_bias_fi,
+                b=b_mtp,
+                scale=None,
+                output=None,
+                intermediate_states_buffer=intermediate_states_buffer_mtp,
+                disable_state_update=True,
+                use_qk_l2norm=True,
+            )
 
         if stable_rows and intermediate_states_buffer is not None:
             # Persist positional output under PP-stable request rows.

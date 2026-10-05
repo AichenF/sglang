@@ -1834,6 +1834,9 @@ class Envs:
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
+    # Run FlashInfer GDN target_verify through Cake GDN rows (SM100/SM103, BF16
+    # state) when FlashInfer has one for the shape; others keep the MTP kernel.
+    SGLANG_USE_CAKE_GDN_VERIFY = EnvBool(True)
 
     # ===================================================================
     # Plugin system
