@@ -197,6 +197,9 @@ constexpr int NSTAGE1 = 6;
                                          //    and (b) publishes each item's h-ready chunk bit (ld.acquire + atom.cas round trips, ~2 us per item on
                                          //    thread 0 of the consumers, which the next item's setup barrier waited for); the consumers hand the item
                                          //    over through an smem queue (release.cta / acquire.cta) and start the next item immediately.
+                                         //    Not with FMOE_FC2_PREFILL (its producer barrier 3 at the FC1 sentinel needs warp 18, which would still wait for
+                                         //    the consumers' sentinel: deadlock) -- FC1_PUB_OFFLOAD below is the effective switch.
+constexpr bool FC1_PUB_OFFLOAD = FMOE_FC1_PUB_OFFLOAD && !FMOE_FC2_PREFILL;
 #ifndef FMOE_GP2_BW
 #define FMOE_GP2_BW 4                    // FMOE_GP2 helper h-copy walk: ready words polled per round trip (8 spilled in the 64-register producer warp)
 #endif
@@ -562,9 +565,9 @@ constexpr int TAB_TKW = TAB_SLOT + MAXM * TOPK * 4;      // float s_tkw[MAXM][8]
 constexpr int TAB_BYTES = TAB_TKW + MAXM * TOPK * 4;     // 8704
 constexpr int OFF_BAR2 = OFF_TAB + TAB_BYTES;            // FMOE_FC2_PREFILL: the FC2 ring's own full[8] | empty[8] mbarriers (live from kernel start)
 static_assert(OFF_BAR2 % 8 == 0, "fc2 barriers aligned");
-constexpr int OFF_PUB = OFF_BAR2 + (FMOE_FC2_PREFILL ? 128 : 0);   // FMOE_FC1_PUB_OFFLOAD: [0] items queued (int), [4] s2 table ready (epoch), [16..48) queue[8]
+constexpr int OFF_PUB = OFF_BAR2 + (FMOE_FC2_PREFILL ? 128 : 0);   // FC1_PUB_OFFLOAD: [0] items queued (int), [4] s2 table ready (epoch), [16..48) queue[8]
 constexpr int SMEM_TOTAL = OFF_PUB + 64;
-constexpr int OFF_S2TAB = OFF_XS + XS_BYTES;              // FMOE_FC1_PUB_OFFLOAD: float2 [MAXU] (fc1_s2 * 64, fc2_s2 * 64) during FC1 (out_s in FC2)
+constexpr int OFF_S2TAB = OFF_XS + XS_BYTES;              // FC1_PUB_OFFLOAD: float2 [MAXU] (fc1_s2 * 64, fc2_s2 * 64) during FC1 (out_s in FC2)
 static_assert(OFF_S2TAB + MAXU * 8 <= OFF_TOK, "s2 table fits between the FC1 scale table and the token lists");
 constexpr int SMEM_ALLOC = SMEM_TOTAL + 1024;   // slack for manual 1024-B alignment
 static_assert(SMEM_ALLOC <= 232448, "smem budget");
@@ -3767,7 +3770,7 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
                 const int s = it % NSTAGE1, ph = (it / NSTAGE1) & 1;
                 mbar_wait(&full[s], ph);
                 if (n == 0 && tid == 0) STAMP(P, 10);
-                if constexpr (TOKEN_ONLY && FMOE_FC1_PUB_OFFLOAD) {   // sentinel for producer warp 18's publish loop
+                if constexpr (TOKEN_ONLY && FC1_PUB_OFFLOAD) {   // sentinel for producer warp 18's publish loop
                     if (tid == 0) { int* pub_ = reinterpret_cast<int*>(smem + OFF_PUB); pub_[4 + (n & 7)] = -1; st_release_cta_s(pub_, n + 1); }
                 }
                 break;
@@ -4020,7 +4023,7 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
             base_item = reinterpret_cast<volatile int*>(s_misc)[36];
             if constexpr (!TASK_ONLY) split_piece = reinterpret_cast<volatile int*>(s_misc)[37];
             u = base_item / 2; hf = base_item & 1; e = s_union[u];
-            if constexpr (TOKEN_ONLY && FMOE_FC1_PUB_OFFLOAD) {   // factor table staged by producer warp 18 (fc1_pub_worker)
+            if constexpr (TOKEN_ONLY && FC1_PUB_OFFLOAD) {   // factor table staged by producer warp 18 (fc1_pub_worker)
                 const int* pub_ = reinterpret_cast<const int*>(smem + OFF_PUB);
                 while (ld_acquire_cta_s(pub_ + 1) != (int)epoch) {}
                 rs_e = reinterpret_cast<const float2*>(smem + OFF_S2TAB)[u].x;
@@ -4176,7 +4179,7 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
                         // Prescaled plane in the true upper half of cs_buf (room for all MAXU experts, so the FC2 retire has one
                         // path), permuted per expert as [hf][tig 4][j 4][e 2]: FC2 lane (tig) reads its 8 scales of k-block hf
                         // as two float4.
-                        const float rs2 = (TOKEN_ONLY && FMOE_FC1_PUB_OFFLOAD) ? reinterpret_cast<const float2*>(smem + OFF_S2TAB)[u].y
+                        const float rs2 = (TOKEN_ONLY && FC1_PUB_OFFLOAD) ? reinterpret_cast<const float2*>(smem + OFF_S2TAB)[u].y
                                                                                 : __fmul_rn(__ldg(P.fc2_s2 + e), 64.0f);
                         const int perm = hf * 32 + ((tok >> 1) & 3) * 8 + (tok >> 3) * 2 + (tok & 1);
                         P.cs_buf[(size_t)MAXU * M_pad * 2 + (size_t)u * 64 + perm] = __fmul_rn(cs, rs2);
@@ -4200,7 +4203,7 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
         if (tid == 0) { const unsigned long long t_ = gtimer(); d_e[3] += t_ - tE; tE = t_; }   // epi part 3: proxy fence + barrier
 #endif
         if (tid == 0) {
-            if constexpr (TOKEN_ONLY && FMOE_FC1_PUB_OFFLOAD) {   // hand the publish to producer warp 18 (item n of this CTA)
+            if constexpr (TOKEN_ONLY && FC1_PUB_OFFLOAD) {   // hand the publish to producer warp 18 (item n of this CTA)
                 int* pub_ = reinterpret_cast<int*>(smem + OFF_PUB);
                 pub_[4 + (n & 7)] = (u << 8) | (hf << 4) | (token_base / NT);
                 st_release_cta_s(pub_, n + 1);
@@ -5517,7 +5520,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) fused_moe_kernel(const __grid_con
     uint64_t* pbar = reinterpret_cast<uint64_t*>(smem + OFF_TAB + TABX_PBAR);   // FMOE_ROUTER_TMA prologue barriers: [0] slices + norm-w, [1] W tile
     if constexpr (FMOE_ROUTER_TMA) { if (tid == 0 && !P.pre_routed) { mbar_init(&pbar[0], 1u); mbar_init(&pbar[1], 1u); } }
     if constexpr (INPUT_TP) { if (tid >= 32 && tid < 32 + TP_NDEV) reinterpret_cast<uint4**>(smem + OFF_TAB + TABX_PEER)[tid - 32] = tp_pro<true>(P, tid - 32); }   // published by the barrier below
-    if constexpr (FMOE_FC1_PUB_OFFLOAD && EXACT_M == 32 && PARTS == 2) { if (tid == 40) { reinterpret_cast<int*>(smem + OFF_PUB)[0] = 0; reinterpret_cast<int*>(smem + OFF_PUB)[1] = 0; } }   // FC1 publish queue (scheduling slice)
+    if constexpr (FC1_PUB_OFFLOAD && EXACT_M == 32 && PARTS == 2) { if (tid == 40) { reinterpret_cast<int*>(smem + OFF_PUB)[0] = 0; reinterpret_cast<int*>(smem + OFF_PUB)[1] = 0; } }   // FC1 publish queue (scheduling slice)
     if (PREFILL_FC2 ? tid < 32 : tid == 0) asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     __syncthreads();
     if (tid == 0) STAMP(P, 0);   // CTA start
@@ -5764,7 +5767,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) fused_moe_kernel(const __grid_con
         if constexpr (PREFILL_FC2) {   // idle warp 19 builds the joint FC2 plan during FC1; fc1_producer's barrier 3 publishes it
             if (warp == PROD_WARP + 3 && (tid & 31) == 0) build_m32_joint_plan<EXACT_M, PARTS, true>(s_misc);
         }
-        if constexpr (EXACT_M == 32 && PARTS == 2 && FMOE_FC1_PUB_OFFLOAD) {   // idle warp 18: FC1 factor table + h-ready publishes of the N8 token path
+        if constexpr (EXACT_M == 32 && PARTS == 2 && FC1_PUB_OFFLOAD) {   // idle warp 18: FC1 factor table + h-ready publishes of the N8 token path
             if (warp == PROD_WARP + 2 && !wide_m32_fc1 && m32_token_tasks<EXACT_M, PARTS>(P, s_misc))
                 fc1_pub_worker(P, epoch, smem, s_union, s_misc, tid & 31);
         }
