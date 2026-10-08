@@ -2195,6 +2195,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             if self.selector is not None or self._is_domino:
                 # Those verify paths consume the full logits every step.
                 reason = "selector/domino draft"
+            elif self.lilicorr is not None:
+                # LiLiCorr's verify has not been validated on the logits shard.
+                reason = "lilicorr draft"
             elif lm_head is None or not hasattr(lm_head, "shard_indices"):
                 reason = "no sharded lm_head"
             elif not is_dense_head_weight(getattr(lm_head, "weight", None)):
