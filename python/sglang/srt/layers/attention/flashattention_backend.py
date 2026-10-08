@@ -1597,8 +1597,11 @@ class FlashAttentionBackend(AttentionBackend):
                     out=_fa_out,
                 )
             else:
+                # reshape(), not contiguous(): q is the row-strided Q slice of the fused QKV output and
+                # FA3 takes explicit row/head strides, so the per-layer copy kernel is avoidable (reshape still
+                # copies when the layout cannot be viewed). Bitwise: the kernel math does not depend on the strides.
                 result = flash_attn_with_kvcache(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q=q.reshape(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
                     page_table=page_table,
