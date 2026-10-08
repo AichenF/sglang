@@ -200,6 +200,9 @@ constexpr int NSTAGE1 = 6;
                                          //    Not with FMOE_FC2_PREFILL (its producer barrier 3 at the FC1 sentinel needs warp 18, which would still wait for
                                          //    the consumers' sentinel: deadlock) -- FC1_PUB_OFFLOAD below is the effective switch.
 constexpr bool FC1_PUB_OFFLOAD = FMOE_FC1_PUB_OFFLOAD && !FMOE_FC2_PREFILL;
+#ifndef FMOE_FC1_PUB_FAST
+#define FMOE_FC1_PUB_FAST 1              // 1: the offloaded publish reads the flag word relaxed and sets the bit with one atom.or when the epoch is current
+#endif
 #ifndef FMOE_GP2_BW
 #define FMOE_GP2_BW 4                    // FMOE_GP2 helper h-copy walk: ready words polled per round trip (8 spilled in the 64-register producer warp)
 #endif
@@ -872,6 +875,27 @@ __device__ __forceinline__ void fc1_pub_worker(const Params& P, unsigned epoch, 
             while (ld_acquire_cta_s(pub) <= k) __nanosleep(64);
             const int w = pub[4 + (k & 7)];
             if (w < 0) break;
+            if constexpr (FMOE_FC1_PUB_FAST) {
+                // relaxed read of the flag word, then ONE atom.or (acq_rel) when it already carries this launch's epoch, else the CAS loop
+                // from that value: same final word and release of the h stores as publish_m32_chunk, one dependent round trip fewer
+                // (and no retry when the two halves / chunks of an expert publish together). Same idea as the consumer agent's
+                // FMOE_C_EPI bit 1 (publish_m32_chunk_pre), here on the offloaded publish.
+                const int u = w >> 8, hf = (w >> 4) & 1, chunk = w & 15;
+                auto* fp = reinterpret_cast<uint64_t*>(P.h_flags + MAXU * 2 + u * 8);
+                const uint64_t tag = uint64_t(epoch) << 32, bit = 1ull << (hf * 4 + chunk);
+                uint64_t old = ld_relaxed_gpu_u64(fp);
+                if (unsigned(old >> 32) == epoch) {
+                    asm volatile("atom.acq_rel.gpu.global.or.b64 %0, [%1], %2;" : "=l"(old) : "l"(fp), "l"(bit) : "memory");
+                } else {
+                    while (true) {
+                        const uint64_t desired = (unsigned(old >> 32) == epoch ? old : tag) | bit;
+                        uint64_t observed;
+                        asm volatile("atom.acq_rel.gpu.global.cas.b64 %0, [%1], %2, %3;" : "=l"(observed) : "l"(fp), "l"(old), "l"(desired) : "memory");
+                        if (observed == old) break;
+                        old = observed;
+                    }
+                }
+            } else
             publish_m32_chunk(P.h_flags, w >> 8, (w >> 4) & 1, w & 15, epoch);
         }
     }
