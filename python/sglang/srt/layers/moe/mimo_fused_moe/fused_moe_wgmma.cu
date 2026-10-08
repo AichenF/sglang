@@ -112,7 +112,7 @@ constexpr int NSTAGE1 = 6;
                                          //    fp32-router reference near ranking ties (measured per case by real_bench --router-ref bf16).
                                          // 0: fp32 weight, exact fp32 logits via 3 bf16 planes (hi + mid + lo == fp32), 3 wgmmas per step.
 #ifndef FMOE_FC2_PREFILL
-#define FMOE_FC2_PREFILL 0               // 1 (exact M32, split producer): the three FC2 producer warps fill the FC2 ring on its OWN mbarrier objects
+#define FMOE_FC2_PREFILL 1               // 1 (exact M32, split producer): the three FC2 producer warps fill the FC2 ring on its OWN mbarrier objects
 #endif                                   //    (OFF_BAR2, initialised at kernel start) as soon as the 16 consumer warps have published this CTA's last
                                          //    h (named barrier FC2_START_BAR, bar.arrive by the consumers right after fc1_consumer), i.e. during the
                                          //    consumers' FC1->FC2 join / barrier re-init / plan chain instead of after it; the joint FC2 plan is built
@@ -128,6 +128,8 @@ constexpr int NSTAGE1 = 6;
                                          //    30 neutral / 22 slower: joint U81-108 -0.4..-0.5, U67-80 +0.3, all-light +1.2, low-U one-wave +0.9..+1.4)
                                          //    -- the same signature as the FMOE_FC2_EARLY experiment in six builds. Delaying only the early leavers
                                          //    (knob below) did not recover the losing cases. The off build is byte-identical to HEAD.
+                                         //    goal10 (real DFLASH routing, GP2 plans, FC1 publish offload; warp 18 now stays out of barrier 3): ON. Chat
+                                         //    suite (302, read flush, flag A/B): 8276.6 -> 8118.9 us/step, every regime -1.9..-3.0 us/layer, bitwise.
 #ifndef FMOE_FC2_PREFILL_NOTAIL_DELAY_NS
 #define FMOE_FC2_PREFILL_NOTAIL_DELAY_NS 0      // > 0: only CTAs that leave FC1 late (a second FC1 task; > 52 us after CTA start) keep the early
 #endif                                          //    FC2 start; early leavers of a two-wave load (A owners, tail-less helpers) idle this long first,
@@ -197,11 +199,18 @@ constexpr int NSTAGE1 = 6;
                                          //    and (b) publishes each item's h-ready chunk bit (ld.acquire + atom.cas round trips, ~2 us per item on
                                          //    thread 0 of the consumers, which the next item's setup barrier waited for); the consumers hand the item
                                          //    over through an smem queue (release.cta / acquire.cta) and start the next item immediately.
-                                         //    Not with FMOE_FC2_PREFILL (its producer barrier 3 at the FC1 sentinel needs warp 18, which would still wait for
-                                         //    the consumers' sentinel: deadlock) -- FC1_PUB_OFFLOAD below is the effective switch.
-constexpr bool FC1_PUB_OFFLOAD = FMOE_FC1_PUB_OFFLOAD && !FMOE_FC2_PREFILL;
+                                         //    With FMOE_FC2_PREFILL, warp 18 stays out of the producer barrier 3 (it would wait there for the FC1 sentinel
+                                         //    while still waiting for the consumers' sentinel: deadlock) and reaches the FC2 start barrier after its loop.
+constexpr bool FC1_PUB_OFFLOAD = FMOE_FC1_PUB_OFFLOAD;
+constexpr int PREFILL_B3 = FC1_PUB_OFFLOAD ? 96 : 128;   // FMOE_FC2_PREFILL's producer barrier 3: warps 16, 17, 19 (+18 without the offload)
 #ifndef FMOE_FC1_PUB_FAST
 #define FMOE_FC1_PUB_FAST 1              // 1: the offloaded publish reads the flag word relaxed and sets the bit with one atom.or when the epoch is current
+#endif
+#ifndef FMOE_GP2_B_MERGE_UNITS
+#define FMOE_GP2_B_MERGE_UNITS 0         // GP2 plan: owner B's FC1 end offset grows by this many stage units per helper partial it merges
+#endif
+#ifndef FMOE_GP2_TU3
+#define FMOE_GP2_TU3 36                  // GP2 plan: length of a CTA's THIRD FC1 task in stage units (round 2 is partial: less HBM contention; chat n>264 -0.8..-1.0 us vs 44, bench neutral; 28/32/40 worse)
 #endif
 #ifndef FMOE_GP2_BW
 #define FMOE_GP2_BW 4                    // FMOE_GP2 helper h-copy walk: ready words polled per round trip (8 spilled in the 64-register producer warp)
@@ -1368,14 +1377,15 @@ __device__ __forceinline__ void build_m32_joint_plan(int* misc) {
 // The group's FC1 end offsets take three values (1, 2 or 3 tasks): e[k] = m32_gp_offset of a k-task CTA; the 11 members' task counts
 // are packed 2 bits each (member m = 0..10: A of tiles g/12+g/24+g/36+g, B of the same, H of g/12+g/24+g). Few live registers: the
 // plan runs in the 64-register producer warp 19.
-struct M32Gp2Group { int e1, e2, e3; unsigned kbits; };
+struct M32Gp2Group { int e1, e2, e3, bm, hm; unsigned kbits; };
 __device__ __forceinline__ int m32_gp2_e(const M32Gp2Group& G, int m) {
     const int k = (G.kbits >> (2 * m)) & 3;
-    return k == 1 ? G.e1 : (k == 2 ? G.e2 : G.e3);
+    // owners B (members 4..7) merge the helper partial(s) after their own stages: tile 36+g's B (member 7) three, the others one
+    return (k == 1 ? G.e1 : (k == 2 ? G.e2 : G.e3)) + (m >= 4 && m < 8 ? G.bm * (m == 7 ? 3 : 1) : 0);
 }
 // Helper i's stages per pair, the stages it can give to tile 36+g, and its own tile's deficit at makespan T.
 __device__ __forceinline__ void m32_gp2_helper_at(const M32Gp2Group& G, int U, int T, int i, int& n0, int& avail, int& need) {
-    n0 = max(T - m32_gp2_e(G, 8 + i) - FMOE_GP_MERGE_UNITS, 0) >> 1;
+    n0 = max(T - m32_gp2_e(G, 8 + i) - G.hm, 0) >> 1;
     need = max(U - max(T - m32_gp2_e(G, i), 0) - max(T - m32_gp2_e(G, 4 + i), 0), 0);
     avail = min(n0, 2 * n0 - need);
 }
@@ -1391,15 +1401,22 @@ __device__ __forceinline__ bool m32_gp2_feasible(const M32Gp2Group& G, int U, in
     return give >= U - max(T - m32_gp2_e(G, 3), 0) - max(T - m32_gp2_e(G, 7), 0);   // tile 36+g's deficit
 }
 // Builds this CTA's FC2 plan into misc[GP2_MISC..+3] (one thread; warp 19 during FC1). Pure function of (U, n_tasks, blockIdx).
-__device__ __forceinline__ void m32_gp2_plan(int U, int n_tasks, int b, int* misc) {
+// knob (lab tuning through P.reserve = -1 - knob; production reserve -1 -> 0 = all defaults): bits 0-7 B merge units per partial
+// (FMOE_GP2_B_MERGE_UNITS), 8-15 the third task's length in units (FMOE_GP2_TU3), 16-23 FMOE_GP_EARLY_PCT, 24-30 helper lead + 1
+// (FMOE_GP_MERGE_UNITS).
+__device__ __forceinline__ void m32_gp2_plan(int U, int n_tasks, int b, int* misc, int knob = 0) {
     const int g = b >= 96 ? (b - 96) % 12 : (b % 48) % 12;
     M32Gp2Group G;
     {
         constexpr int TU = FMOE_GP_TASK_UNITS;
+        const int ep = (knob >> 16) & 0xff ? (knob >> 16) & 0xff : FMOE_GP_EARLY_PCT;
+        const int tu3 = (knob >> 8) & 0xff ? (knob >> 8) & 0xff : FMOE_GP2_TU3;
+        G.bm = knob & 0xff ? (knob & 0xff) - 1 : FMOE_GP2_B_MERGE_UNITS;   // (value + 1 so that 0 units can be requested)
+        G.hm = (knob >> 24) & 0x7f ? ((knob >> 24) & 0x7f) - 1 : FMOE_GP_MERGE_UNITS;   // helper ends this many units before B
         const int r1 = min(max(n_tasks - 132, 0), 132), r2 = min(max(n_tasks - 264, 0), 132);   // tasks of rounds 1 / 2
-        G.e1 = (FMOE_GP_EARLY_PCT * TU * (r1 + r2)) / (100 * 132);   // = m32_gp_offset of a 1 / 2 / 3-task CTA
-        G.e2 = TU + (FMOE_GP_EARLY_PCT * TU * r2) / (100 * 132);
-        G.e3 = 2 * TU;
+        G.e1 = (ep * TU * (r1 + r2)) / (100 * 132);   // = m32_gp_offset of a 1 / 2 / 3-task CTA (default knobs)
+        G.e2 = TU + (ep * TU * r2) / (100 * 132);
+        G.e3 = TU + tu3;
         G.kbits = 0;
 #pragma unroll 1
         for (int m = 0; m < 11; ++m) G.kbits |= (unsigned)m32_gp_ntasks_of(12 * m + g, n_tasks) << (2 * m);
@@ -3429,7 +3446,7 @@ __device__ __forceinline__ void fc1_producer(const Params& P, uint8_t* smem, uin
         if (warp != PROD_WARP && !(SPLIT_LOADS && warp <= PROD_WARP + NGATHER / 32)) {
             // FMOE_FC2_PREFILL: warps 18/19 have no FC1 role. Warp 19 lane 0 built the joint FC2 plan (misc[49..52]) right before this
             // call; the producer warpgroup's named barrier 3 publishes it to warps 16-18 once the FC1 sentinel is out (below).
-            if constexpr (PREFILL) named_bar_sync(3, 128);
+            if constexpr (PREFILL) { if (!(FC1_PUB_OFFLOAD && warp == PROD_WARP + 2)) named_bar_sync(3, PREFILL_B3); }
             return;
         }
         const bool weight_role = warp == PROD_WARP;
@@ -3551,7 +3568,7 @@ __device__ __forceinline__ void fc1_producer(const Params& P, uint8_t* smem, uin
                 const int s = EXACT_M ? 0 : it % NSTAGE1;
                 const int ph = EXACT_M ? 0 : (it / NSTAGE1) & 1;
                 mbar_wait(&empty[s], ph ^ 1);
-                if constexpr (PREFILL) named_bar_sync(3, 128);   // see the entry: joint plan (warp 19) visible to the FC2 producer warps
+                if constexpr (PREFILL) named_bar_sync(3, PREFILL_B3);   // see the entry: joint plan (warp 19) visible to the FC2 producer warps
                 if (weight_role && lane == 0) { s_item_q[n & 7] = -1; mbar_arrive(&full[s]); }
                 if (gather_role) cp_async_mbar_arrive_noinc(&full[s]);
 #ifdef FMOE_DIAG
@@ -5797,7 +5814,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) fused_moe_kernel(const __grid_con
         }
         if constexpr (EXACT_M == 32 && PARTS == 2 && FMOE_GP && FMOE_GP2) {   // FMOE_GP2: idle warp 19 builds this CTA's FC2 plan during FC1
             if (warp == PROD_WARP + 3 && (tid & 31) == 0 && m32_gp2_active<EXACT_M, PARTS>(P, s_misc[32], s_misc))   // (published by the join)
-                m32_gp2_plan(s_misc[32], s_misc[38], (int)blockIdx.x, s_misc);
+                m32_gp2_plan(s_misc[32], s_misc[38], (int)blockIdx.x, s_misc, P.reserve < -1 ? -1 - P.reserve : 0);
         }
         if constexpr (EXACT_M == 32 && PARTS == 2) {
             if (wide_m32_fc1) fc1_producer<NT, PARTS, EXACT_M, 16, false, PRE_SPLIT>(P, smem, full, empty, p_tok, s_misc);
