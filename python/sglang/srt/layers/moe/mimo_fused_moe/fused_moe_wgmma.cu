@@ -204,8 +204,8 @@ constexpr bool FC1_PUB_OFFLOAD = FMOE_FC1_PUB_OFFLOAD && !FMOE_FC2_PREFILL;
 #define FMOE_GP2_BW 4                    // FMOE_GP2 helper h-copy walk: ready words polled per round trip (8 spilled in the 64-register producer warp)
 #endif
 #ifndef FMOE_GP_MIN_TASKS
-#define FMOE_GP_MIN_TASKS 216            // FMOE_GP runs every exact-M32 token-task load with more tasks than this (216: the joint plan keeps 132 < n <= 216)
-#endif
+#define FMOE_GP_MIN_TASKS 132            // FMOE_GP runs every exact-M32 two-wave token-task load with more tasks than this (132: GP/GP2 also replace the joint plan
+#endif                                   //    for 132 < n_tasks <= 216 -- chat n<=216 layers -4.1 us with the publish offload; 216 restores the joint plan there)
 #ifndef FMOE_GP_ROUNDS
 #define FMOE_GP_ROUNDS 3                 // token-task loads admitted up to 132 * ROUNDS tasks (U ~ 195 at ~2 tasks per expert); beyond: legacy queue
 #endif
