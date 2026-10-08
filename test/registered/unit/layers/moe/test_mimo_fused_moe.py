@@ -214,7 +214,9 @@ class TestMiMoFusedMoE(CustomTestCase):
         owner = self.adapter.MiMoFusedMoE.__new__(self.adapter.MiMoFusedMoE)
         owner.max_tokens = 64
         owner.ffn_plan = SimpleNamespace(variant_for=lambda batch: BatchVariant.ORDINARY)
-        owner.shared = SimpleNamespace(state=object(), rank=0, ndev=8)
+        # input_tp=False: the separate all-reduce + run_fused_full path
+        owner.shared = SimpleNamespace(state=object(), rank=0, ndev=8, input_tp=False)
+        owner.dbg = None
         owner.norm_w = torch.ones(6144, dtype=torch.bfloat16)
         owner.router_w = torch.empty((384, 6144), dtype=dtype, device="meta")
         owner.bias = torch.zeros(384, dtype=torch.float32)
@@ -261,7 +263,8 @@ class TestMiMoFusedMoE(CustomTestCase):
                 self.all_reduce.return_value = reduced
                 self.all_reduce.side_effect = None
 
-                def launch(state, inp, weights, out, ro, rank, world, eps):
+                def launch(state, inp, weights, out, ro, rank, world, eps, dbg=None):
+                    self.assertIsNone(dbg)
                     self.assertIs(state, owner.shared.state)
                     self.assertEqual((rank, world, eps), (0, 8, 1e-5))
                     self.assertTrue(inp["hidden"].is_contiguous())
