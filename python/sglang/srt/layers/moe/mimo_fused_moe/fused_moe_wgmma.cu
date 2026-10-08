@@ -193,6 +193,10 @@ constexpr int NSTAGE1 = 6;
                                          //    (pair 1 flushes its accumulator into an arena slot between the two segments); tiles 36..47 receive quarter
                                          //    shares from three helpers (owner B merges 3 partials). Every tile has 2 + 0.75 streams: no structural
                                          //    pair/trio offset, and one extra FC1 task shifts a 4-tile group's makespan by TU/11 instead of TU/3.
+#ifndef FMOE_C_CSSPLIT
+#define FMOE_C_CSSPLIT 1                 // 1 (exact-M32, FC2 prefill + split producer): warp 19 issues the FC2 cs copies (see OFF_CSGO). FMOE_C_SKEW
+#endif                                   //    DIAG: every copy-issuing producer lane costs ITS SMSP's consumer warp ~100 cycles/expert per copy, and each
+                                         //    warpgroup waits for that warp at WARPGROUP.ARRIVE; warp 16 issued 2 copies (h + cs), warps 17/18 one, 19 none
 #ifndef FMOE_FC1_PUB_OFFLOAD
 #define FMOE_FC1_PUB_OFFLOAD 1           // 1 (exact-M32 N8 token-task FC1): the idle producer warp 18 (a) stages every union slot's per-expert factors
 #endif                                   //    fc1_s2 * 64 / fc2_s2 * 64 in smem at FC1 start (the item epilogue read them with two dependent global loads)
@@ -591,7 +595,11 @@ constexpr int TAB_BYTES = TAB_TKW + MAXM * TOPK * 4;     // 8704
 constexpr int OFF_BAR2 = OFF_TAB + TAB_BYTES;            // FMOE_FC2_PREFILL: the FC2 ring's own full[8] | empty[8] mbarriers (live from kernel start)
 static_assert(OFF_BAR2 % 8 == 0, "fc2 barriers aligned");
 constexpr int OFF_PUB = OFF_BAR2 + (FMOE_FC2_PREFILL ? 128 : 0);   // FC1_PUB_OFFLOAD: [0] items queued (int), [4] s2 table ready (epoch), [16..48) queue[8]
-constexpr int SMEM_TOTAL = OFF_PUB + 64;
+// FMOE_C_CSSPLIT (consumer slice, goal10): the FC2 cs bulk copy moves from warp 16 (SMSP 0, which also polls and copies h) to the otherwise
+// idle warp 19 (SMSP 3): one copy/TMA-issuing producer lane per SM sub-partition. Warp 16 hands each stage over through cs_go[8] (count-1
+// mbarriers, initialised at kernel start) + cs_u[8] (the scale row; -2 = merge pseudo-stage: plain arrive, -1 = end).
+constexpr int OFF_CSGO = OFF_PUB + 64;                   // u64 cs_go[8] | int cs_u[8]
+constexpr int SMEM_TOTAL = OFF_CSGO + 96;
 constexpr int OFF_S2TAB = OFF_XS + XS_BYTES;              // FC1_PUB_OFFLOAD: float2 [MAXU] (fc1_s2 * 64, fc2_s2 * 64) during FC1 (out_s in FC2)
 static_assert(OFF_S2TAB + MAXU * 8 <= OFF_TOK, "s2 table fits between the FC1 scale table and the token lists");
 constexpr int SMEM_ALLOC = SMEM_TOTAL + 1024;   // slack for manual 1024-B alignment
@@ -4404,6 +4412,10 @@ __device__ __forceinline__ void fc2_producer(const Params& P, unsigned epoch, ui
     }
     constexpr bool SPLIT_PROD = fc2_split_producer<EXACT_M, PARTS>();
     constexpr bool LOCKSTEP = fc2_lockstep<EXACT_M, PARTS>();
+    // FMOE_C_CSSPLIT: warp 19 issues the cs copies (handoff from warp 16 through cs_go / cs_u, see OFF_CSGO)
+    constexpr bool CSSPLIT = FMOE_C_CSSPLIT && fc2_prefill<EXACT_M, PARTS>() && !LOCKSTEP && FMOE_BATCH_FENCE;
+    uint64_t* cs_go = reinterpret_cast<uint64_t*>(smem + OFF_CSGO);
+    volatile int* cs_u = reinterpret_cast<volatile int*>(smem + OFF_CSGO + 64);
     if constexpr (SPLIT_PROD) {
         // Weight / offset producer warps. The cycle probe of the single-lane producer showed ~640 cycles
         // per stage in the four copy issues, ~285 in the batched poll and ~265 of walk overhead: ~1300 of the ~1440-cycle
@@ -4500,6 +4512,26 @@ __device__ __forceinline__ void fc2_producer(const Params& P, unsigned epoch, ui
             else if (warp == PROD_WARP + 2) walk(std::integral_constant<int, 2>{});
         }
     }
+    if constexpr (CSSPLIT) {
+        if (warp == PROD_WARP + 3 && lane == 0) {   // FMOE_C_CSSPLIT cs lane (SMSP 3): one cs row copy per stage handed over by warp 16
+            const uint64_t pol = FMOE_H_EVICT_LAST ? l2_policy_evict_last() : 0ull;
+#pragma unroll 1
+            for (int l = 0;; ++l) {
+                const int s = l % NST;
+                mbar_wait(&cs_go[s], (l / NST) & 1);
+                const int code = cs_u[s];
+                if (code == -1) break;
+                if (code == -2) { mbar_arrive(&full[s]); continue; }   // merge pseudo-stage: no cs
+                // warp 16 acquired the expert's h flag (fence.acquire.gpu) before the cs_go release; this lane's acquire of cs_go
+                // and its own proxy fence order the cs row (written by other CTAs' FC1 epilogues) before the bulk copy
+                fence_proxy_async_global();
+                mbar_arrive_expect_tx(&full[s], NT * 8);
+                uint8_t* cs_dst = reinterpret_cast<uint8_t*>(fc2_cs_ring(smem) + (l & (FC2_CS_RING - 1)) * 64);
+                if (FMOE_H_EVICT_LAST) bulk_g2s_hint(cs_dst, P.cs_buf + (size_t)code * NT * 2, NT * 8, &full[s], pol);
+                else bulk_g2s(cs_dst, P.cs_buf + (size_t)code * NT * 2, NT * 8, &full[s]);
+            }
+        }
+    }
     {
         if (warp == PROD_WARP && lane == 0) {
             // Acquire + prefetch of maps 2/3 by this lane: immediately before the first use (earlier schedule), or already done
@@ -4524,12 +4556,14 @@ __device__ __forceinline__ void fc2_producer(const Params& P, unsigned epoch, ui
             // path's 8 flag-pair addresses to the loop top (~45 instructions per expert on BOTH paths) and spill the
             // dual-helper shift amount -- one LDL per expert that misses L1 after every CCTL.IVALL.
             const uint64_t h_policy = FMOE_H_EVICT_LAST ? l2_policy_evict_last() : 0ull;
+            int n_issued = 0;   // FMOE_C_CSSPLIT: stages handed to warp 19 so far (its end sentinel goes to stage n_issued)
             auto issue = [&](int l, int u, int e, bool dummy) {
                 const int s = l % NST, ph = (l / NST) & 1;
                 mbar_wait(&empty[s], ph ^ 1);
                 uint8_t* stage = smem + OFF_RING + s * STAGE;
-                mbar_arrive_expect_tx(&full[s], ((EXACT_M == 24 || SPLIT_PROD) ? 0 : FC2_W_BYTES) + NT * 256 + (dummy ? 0 : NT * 8));
+                mbar_arrive_expect_tx(&full[s], ((EXACT_M == 24 || SPLIT_PROD) ? 0 : FC2_W_BYTES) + NT * 256 + ((dummy || CSSPLIT) ? 0 : NT * 8));
                 const int scale_u = (EXACT_M == 32 && FMOE_CS_PERM) ? MAXU + u : u + ((FC2_PRESCALE<EXACT_M> && U <= MAXU / 2) ? MAXU / 2 : 0);
+                if constexpr (CSSPLIT) { cs_u[s] = scale_u; mbar_arrive(&cs_go[s]); n_issued = l + 1; }   // warp 19 copies the cs row
                 uint8_t* cs_dst = (EXACT_M == 32 && FMOE_CS_PERM) ? reinterpret_cast<uint8_t*>(fc2_cs_ring(smem) + (l & (FC2_CS_RING - 1)) * 64) : stage + CS_OFF;
                 if (dummy) {   // lockstep padding stage: real h (finite fp8) but zero scales, so it adds nothing
                     uint4* z = reinterpret_cast<uint4*>(cs_dst);
@@ -4538,11 +4572,12 @@ __device__ __forceinline__ void fc2_producer(const Params& P, unsigned epoch, ui
                     bulk_g2s(stage + H_OFF, P.h_buf + (size_t)u * 2 * NT * 128, NT * 256, &full[s]);
                 } else if (FMOE_H_EVICT_LAST) {
                     bulk_g2s_hint(stage + H_OFF, P.h_buf + (size_t)u * 2 * NT * 128, NT * 256, &full[s], h_policy);
-                    bulk_g2s_hint(cs_dst, P.cs_buf + (size_t)scale_u * NT * 2, NT * 8, &full[s], h_policy);
+                    if constexpr (!CSSPLIT) bulk_g2s_hint(cs_dst, P.cs_buf + (size_t)scale_u * NT * 2, NT * 8, &full[s], h_policy);
                 } else {
                     bulk_g2s(stage + H_OFF, P.h_buf + (size_t)u * 2 * NT * 128, NT * 256, &full[s]);
-                    bulk_g2s(cs_dst, P.cs_buf + (size_t)scale_u * NT * 2, NT * 8, &full[s]);
+                    if constexpr (!CSSPLIT) bulk_g2s(cs_dst, P.cs_buf + (size_t)scale_u * NT * 2, NT * 8, &full[s]);
                 }
+                (void)cs_dst;
                 // the tile's 128 rows = blocks tile*2, tile*2+1 of the expert's 8 k32 slices: one 16-KB TMA box ([slice][rh][1 KB]) + one 1-KB offset box
                 if constexpr (EXACT_M != 24 && !SPLIT_PROD) {
                     const int weight_tile = tile + (dual_helper ? (l & 1) * 36 : 0);
@@ -4711,8 +4746,14 @@ __device__ __forceinline__ void fc2_producer(const Params& P, unsigned epoch, ui
                         const uint8_t* partial = P.h_buf + ((size_t)U + 64) * 2 * NT * 128 + (size_t)slot * NT * 128 * 4;
                         mbar_arrive_expect_tx(&full[s], NT * 128 * 4);
                         bulk_g2s(smem + OFF_RING + s * STAGE, partial, NT * 128 * 4, &full[s]);
+                        if constexpr (CSSPLIT) { cs_u[s] = -2; mbar_arrive(&cs_go[s]); n_issued = L + k + 1; }   // warp 19: plain arrive
                     }
                 }
+            }
+            if constexpr (CSSPLIT) {   // end sentinel for warp 19 (after the slot's empty phase, so cs_go[s] never runs two phases ahead)
+                const int s = n_issued % NST, ph = (n_issued / NST) & 1;
+                mbar_wait(&empty[s], ph ^ 1);
+                cs_u[s] = -1; mbar_arrive(&cs_go[s]);
             }
 #else
 #if FMOE_MIXED_WIDTH
@@ -5607,14 +5648,16 @@ __global__ void __launch_bounds__(NTHREADS, 1) fused_moe_kernel(const __grid_con
     if (tid < 8) mbar_init(&full[tid], 1u + FC1_GATHER_THREADS<EXACT_M>);  // one arrive from every activation-copy lane
     else if (tid < 16) mbar_init(&empty[tid - 8], (unsigned)(NCONS / 32));   // one arrive per consumer warp
     else if constexpr (PREFILL_FC2) {
-        if (tid < 24) mbar_init(&full2[tid - 16], 3u);          // h/cs lane + weight lane + offset lane (split producer)
+        constexpr bool CSSPLIT = FMOE_C_CSSPLIT && EXACT_M == 32 && PARTS == 2 && FMOE_CS_PERM && !fc2_lockstep<EXACT_M, PARTS>() && FMOE_BATCH_FENCE;
+        if (tid < 24) mbar_init(&full2[tid - 16], CSSPLIT ? 4u : 3u);   // h/cs lane + weight lane + offset lane (split producer) [+ cs lane]
         else if (tid < 32) mbar_init(&empty2[tid - 24], fc2_lockstep<EXACT_M, PARTS>() ? 16u : 8u);   // one WG pair per fc2 stage
+        else if (CSSPLIT && tid < 40) mbar_init(reinterpret_cast<uint64_t*>(smem + OFF_CSGO) + (tid - 32), 1u);   // FMOE_C_CSSPLIT handoff
     }
     uint64_t* pbar = reinterpret_cast<uint64_t*>(smem + OFF_TAB + TABX_PBAR);   // FMOE_ROUTER_TMA prologue barriers: [0] slices + norm-w, [1] W tile
     if constexpr (FMOE_ROUTER_TMA) { if (tid == 0 && !P.pre_routed) { mbar_init(&pbar[0], 1u); mbar_init(&pbar[1], 1u); } }
     if constexpr (INPUT_TP) { if (tid >= 32 && tid < 32 + TP_NDEV) reinterpret_cast<uint4**>(smem + OFF_TAB + TABX_PEER)[tid - 32] = tp_pro<true>(P, tid - 32); }   // published by the barrier below
     if constexpr (FC1_PUB_OFFLOAD && EXACT_M == 32 && PARTS == 2) { if (tid == 40) { reinterpret_cast<int*>(smem + OFF_PUB)[0] = 0; reinterpret_cast<int*>(smem + OFF_PUB)[1] = 0; } }   // FC1 publish queue (scheduling slice)
-    if (PREFILL_FC2 ? tid < 32 : tid == 0) asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    if (PREFILL_FC2 ? tid < 40 : tid == 0) asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     __syncthreads();
     if (tid == 0) STAMP(P, 0);   // CTA start
     // Epoch tag for this launch: device counter (work[2]) + 1, bumped by the last CTA out, so graph
