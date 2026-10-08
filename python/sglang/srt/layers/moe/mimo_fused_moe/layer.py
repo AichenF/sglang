@@ -9,7 +9,16 @@ the kernel dequantizes Humming's fused-e8m0 layout in registers -- so there is n
 prefill / large-batch path keeps running Humming unchanged.
 
 Enable with ``SGLANG_MIMO_FUSED_MOE=1`` (TP=8, EP=1, ``--moe-runner-backend humming`` with the W4A8 activation config,
-no DP attention).  Every TP rank is a separate process: the all-reduce buffers are allocated with cudaMalloc and
+no DP attention).
+
+Stage-boundary integration (``layers/layer_boundary``): the decoder layer hands the kernel the attention's o_proj partial
+BEFORE ``attn_boundary.finish`` records its declared attention-TP sum, plus the residual the attention prepare wrote into
+``forward_batch.residual_stream`` (``fused_moe_stream_residual``). The kernel completes that sum, the residual add and the
+post-attention norm itself; ``finish_fused_moe`` then writes its post-attention residual into the stream and records the
+complete (already all-reduced) MoE output as the FFN's contribution with a plain residual add, so the next layer's
+``attn_boundary.prepare`` runs only the add + input norm. With the norm-next handoff the next layer skips that prepare too:
+``take_norm_next_handoff`` writes the kernel's residual_new into the stream (and into the DFLASH aux capture) and returns
+the pre-quantized qkv_proj input.  Every TP rank is a separate process: the all-reduce buffers are allocated with cudaMalloc and
 exchanged through CUDA IPC handles once, at the first forward (a collective over the TP group; all ranks take the
 identical decision, so no rank can wait for a peer that fell back).  The kernel takes its all-reduce epoch tag from a
 device counter and resets its own work queues, so it is CUDA-graph replay safe.
@@ -30,6 +39,8 @@ import torch.distributed as dist
 from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.environ import envs
+from sglang.srt.layers.layer_boundary import PLAIN_ADD, BatchVariant, SumGroup
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.moe.mimo_fused_moe import fused_moe_wgmma as F
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import log_info_on_rank0
@@ -185,11 +196,45 @@ def _shared_state(device: torch.device) -> _SharedRankState:
     return _shared
 
 
+def fused_moe_stream_residual(forward_batch) -> Optional[torch.Tensor]:
+    """The residual the attention stage's prepare wrote into this forward's residual stream (borrowed, not modified by
+    the kernel), or None when the stream is not in that written state."""
+    stream = getattr(forward_batch, "residual_stream", None)
+    if stream is None or stream.pending is not None:
+        return None
+    return stream.residual
+
+
+def finish_fused_moe(out: torch.Tensor, residual_out: torch.Tensor, forward_batch) -> torch.Tensor:
+    """Hand the fused kernel's results to the next stage boundary: ``residual_out`` (attention output + residual) becomes
+    the written residual and ``out`` (the complete, all-reduced MoE output) the FFN contribution with a plain add. Returns
+    the layer output to pass on (``out`` itself, so a norm-next handoff attached to it reaches the next layer)."""
+    stream = residual_batch.stream_of(forward_batch)
+    if stream.pending is not None:
+        raise RuntimeError("fused MoE: the residual stream still holds an unconsumed contribution")
+    stream.write(residual_out)
+    return stream.record(out, PLAIN_ADD)
+
+
+def take_norm_next_handoff(handoff, hidden_states, forward_batch, capture_gathered=None):
+    """Consume the previous fused layer's norm-next handoff in place of ``attn_boundary.prepare``: the kernel already wrote
+    residual_new = out + residual_out (bitwise flashinfer fused_add_rmsnorm's residual) and this layer's normalized fp8
+    qkv_proj input. Returns that input as the (x_fp8, x_scale) pair."""
+    stream = residual_batch.stream_of(forward_batch)
+    stream.check(hidden_states)  # the pending contribution is the fused output carrying this handoff
+    stream.write(handoff.residual_new)
+    if capture_gathered is not None:
+        # the residual the skipped prepare would have written and captured (aux hidden state for DFLASH); the buffer is
+        # rewritten every step, so the accumulator copies it.
+        capture_gathered.capture(handoff.residual_new, owned=False)
+    return handoff.x_fp8, handoff.x_scale
+
+
 class NormNextHandoff:
     """Attached to the fused MoE's returned hidden_states (``hidden_states._fmoe_norm_next``) when the kernel's TP tail already
     ran the NEXT decoder layer's input_layernorm + fp8 per-128 activation quant (bitwise flashinfer fused_add_rmsnorm + SGLang
-    per_token_group_quant in the deep_gemm layout). Layer ``layer_id`` then skips prepare_attn (residual = residual_new) and calls
-    qkv_proj((x_fp8, x_scale)); the DFLASH aux capture takes residual_new instead of computing hidden_states + residual."""
+    per_token_group_quant in the deep_gemm layout). Layer ``layer_id`` then skips attn_boundary.prepare (the stream's residual =
+    residual_new, see take_norm_next_handoff) and calls qkv_proj((x_fp8, x_scale)); the DFLASH aux capture takes residual_new."""
 
     __slots__ = ("layer_id", "residual_new", "x_fp8", "x_scale")
 
@@ -259,6 +304,7 @@ def _norm_next_check(decoder_layer) -> Optional[str]:
         not isinstance(qm, Fp8LinearMethod)
         or not qm.block_quant
         or getattr(qm, "use_mxfp8", False)
+        or getattr(qm, "block_fp8_as_mxfp8", False)
         or qm.use_marlin
     ):
         return f"next qkv_proj quant method {type(qm).__name__} (need block-quant Fp8LinearMethod)"
@@ -300,7 +346,7 @@ class MiMoFusedMoE:
         self.bias = decoder_layer.mlp.gate.e_score_correction_bias.data.contiguous()
         self.eps = float(config.layernorm_epsilon)
         self.max_tokens = min(F.MAXM, int(envs.SGLANG_MIMO_FUSED_MOE_MAX_TOKENS.get()))
-        self.layer_communicator = decoder_layer.layer_communicator
+        self.ffn_plan = decoder_layer.ffn_boundary.plan
         # SGLANG_MIMO_FUSED_MOE_PREFETCH = comma list of {qkv, o}: the kernel (built with -DFMOE_TAIL_PREFETCH=1..3) L2-prefetches the
         # NEXT layer's qkv_proj weight (+ block scales) and/or o_proj weight in its TP tail. Cache hint only: no dependency, no bit change.
         # The weights are their final (post process_weights_after_loading) tensors here: try_create runs at the first forward.
@@ -411,6 +457,29 @@ class MiMoFusedMoE:
             return f"routed_scaling_factor={cfg.routed_scaling_factor}"
         if getattr(cfg, "hidden_act", "silu") != "silu":
             return f"hidden_act={cfg.hidden_act}"
+        # stage boundaries: the attention output owes exactly its attention-TP sum (no transform), and the FFN writes a plain
+        # residual add with no fused finalize -- the contract finish_fused_moe reproduces with a complete output.
+        attn_boundary = getattr(decoder_layer, "attn_boundary", None)
+        ffn_boundary = getattr(decoder_layer, "ffn_boundary", None)
+        if attn_boundary is None or ffn_boundary is None:
+            return "no stage boundaries"
+        attn_path = attn_boundary.plan.paths.get(BatchVariant.ORDINARY)
+        if (
+            attn_path is None
+            or attn_path.output.group is not SumGroup.ATTN_TP
+            or not attn_path.output.always_partial
+            or attn_path.output.transform is not None
+            or not attn_path.output.update.is_plain_add
+        ):
+            return "attention output is not a declared attention-TP partial sum with a plain add"
+        ffn_decl = ffn_boundary.declaration
+        if (
+            not ffn_decl.update.is_plain_add
+            or ffn_decl.output_transform is not None
+            or ffn_boundary.plan.fusions is not None
+            or ffn_boundary.norm is not decoder_layer.post_attention_layernorm
+        ):
+            return "FFN boundary is not a plain residual add + post_attention_layernorm"
         mlp = decoder_layer.mlp
         gate = getattr(mlp, "gate", None)
         experts = getattr(mlp, "experts", None)
@@ -527,9 +596,10 @@ class MiMoFusedMoE:
         mode = forward_batch.forward_mode
         if not (mode.is_decode() or mode.is_target_verify()):
             return False
-        if self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-            forward_batch
-        ):
+        # ordinary rows only: no sequence-parallel, input-scattered or context-parallel batch layout
+        if self.ffn_plan.variant_for(forward_batch) is not BatchVariant.ORDINARY:
+            return False
+        if getattr(forward_batch, "can_run_tbo", False):
             return False
         if torch.compiler.is_compiling():
             return False

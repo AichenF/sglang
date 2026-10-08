@@ -14,6 +14,11 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.environ import envs
+
+# Real stage-boundary types, imported before setUp stubs the distributed and
+# runtime modules: the adapter checks and drives the actual residual stream.
+from sglang.srt.layers.layer_boundary import PLAIN_ADD, BatchVariant, SumGroup
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -117,8 +122,27 @@ class TestMiMoFusedMoE(CustomTestCase):
             ("w2_weight_scale_2", torch.float32, (f.NEXP,)),
         ):
             setattr(experts, name, tensor(shape, dtype))
+        post_attention_layernorm = SimpleNamespace(
+            weight=tensor((f.DIM,), torch.bfloat16)
+        )
+        attn_output = SimpleNamespace(
+            group=SumGroup.ATTN_TP,
+            always_partial=True,
+            transform=None,
+            update=PLAIN_ADD,
+        )
         return SimpleNamespace(
             layer_id=1,
+            attn_boundary=SimpleNamespace(
+                plan=SimpleNamespace(
+                    paths={BatchVariant.ORDINARY: SimpleNamespace(output=attn_output)}
+                )
+            ),
+            ffn_boundary=SimpleNamespace(
+                declaration=SimpleNamespace(update=PLAIN_ADD, output_transform=None),
+                plan=SimpleNamespace(fusions=None),
+                norm=post_attention_layernorm,
+            ),
             config=SimpleNamespace(
                 hidden_size=f.DIM,
                 moe_intermediate_size=8 * f.INTER,
@@ -136,9 +160,7 @@ class TestMiMoFusedMoE(CustomTestCase):
                 ),
                 experts=experts,
             ),
-            post_attention_layernorm=SimpleNamespace(
-                weight=tensor((f.DIM,), torch.bfloat16)
-            ),
+            post_attention_layernorm=post_attention_layernorm,
         )
 
     def test_router_dtype_matches_compiled_kernel(self):
@@ -163,6 +185,14 @@ class TestMiMoFusedMoE(CustomTestCase):
         self.parallel.moe_ep_size = 1
         with patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)):
             self.assertIn("sm90", self.adapter.MiMoFusedMoE._check(self.decoder()))
+        decoder = self.decoder()
+        decoder.attn_boundary.plan.paths[BatchVariant.ORDINARY].output.always_partial = (
+            False
+        )
+        self.assertIn("attention output", self.adapter.MiMoFusedMoE._check(decoder))
+        decoder = self.decoder()
+        decoder.ffn_boundary.plan.fusions = object()
+        self.assertIn("FFN boundary", self.adapter.MiMoFusedMoE._check(decoder))
 
     def test_rank_disagreement_disables_adapter_without_allocating_ipc(self):
         with (
@@ -183,9 +213,7 @@ class TestMiMoFusedMoE(CustomTestCase):
     def owner(self, dtype=torch.bfloat16):
         owner = self.adapter.MiMoFusedMoE.__new__(self.adapter.MiMoFusedMoE)
         owner.max_tokens = 64
-        owner.layer_communicator = SimpleNamespace(
-            should_fuse_mlp_allreduce_with_next_layer=lambda batch: False
-        )
+        owner.ffn_plan = SimpleNamespace(variant_for=lambda batch: BatchVariant.ORDINARY)
         owner.shared = SimpleNamespace(state=object(), rank=0, ndev=8)
         owner.norm_w = torch.ones(6144, dtype=torch.bfloat16)
         owner.router_w = torch.empty((384, 6144), dtype=dtype, device="meta")
@@ -215,9 +243,11 @@ class TestMiMoFusedMoE(CustomTestCase):
         x = torch.empty((32, 6144), dtype=torch.bfloat16, device="meta")
         with patch.object(torch.compiler, "is_compiling", return_value=True):
             self.assertFalse(owner.applicable(x, x, batch))
-        owner.layer_communicator.should_fuse_mlp_allreduce_with_next_layer = lambda _: (
-            True
-        )
+        self.assertTrue(owner.applicable(x, x, batch))
+        batch.can_run_tbo = True
+        self.assertFalse(owner.applicable(x, x, batch))
+        batch.can_run_tbo = False
+        owner.ffn_plan.variant_for = lambda _: BatchVariant.INPUT_SCATTERED
         self.assertFalse(owner.applicable(x, x, batch))
 
     def test_forward_reduces_input_and_reuses_bf16_router(self):
@@ -248,6 +278,56 @@ class TestMiMoFusedMoE(CustomTestCase):
                     out, ro = owner.forward(hidden, residual)
                 torch.testing.assert_close(out, reduced * 2)
                 torch.testing.assert_close(ro, reduced + residual)
+
+    def test_residual_stream_handoffs(self):
+        """finish_fused_moe leaves the stream as an FFN exit with a complete
+        output would (written post-attention residual + plain-add contribution);
+        take_norm_next_handoff writes the kernel's residual_new in place of the
+        next attention prepare and captures it for DFLASH."""
+        adapter = self.adapter
+        residual = torch.full((4, 8), 2.0, dtype=torch.bfloat16)
+        batch = SimpleNamespace(residual_stream=ResidualStream(residual))
+        self.assertIs(adapter.fused_moe_stream_residual(batch), residual)
+
+        out = torch.full((4, 8), 3.0, dtype=torch.bfloat16)
+        residual_out = torch.full((4, 8), 5.0, dtype=torch.bfloat16)
+        handed = adapter.finish_fused_moe(out, residual_out, batch)
+        self.assertIs(handed, out)
+        stream = batch.residual_stream
+        self.assertIs(stream.residual, residual_out)
+        self.assertIs(stream.pending.value, out)
+        self.assertIs(stream.pending.update, PLAIN_ADD)
+        self.assertIsNone(stream.pending.owed)
+        # what the next attention prepare reads: the complete output + residual
+        value, written = stream.input(out)
+        self.assertIs(value, out)
+        self.assertIs(written, residual_out)
+        # a pending contribution is not a written residual
+        self.assertIsNone(adapter.fused_moe_stream_residual(batch))
+        with self.assertRaises(RuntimeError):
+            adapter.finish_fused_moe(out, residual_out, batch)
+
+        residual_new = out + residual_out
+        x_fp8 = torch.zeros((4, 8), dtype=torch.float8_e4m3fn)
+        x_scale = torch.ones((4, 1), dtype=torch.float32)
+        handoff = adapter.NormNextHandoff(2, residual_new, x_fp8, x_scale)
+        captured = []
+
+        class Capture:
+            def capture(self, hidden, *, owned=False):
+                captured.append((hidden, owned))
+
+        got = adapter.take_norm_next_handoff(
+            handoff, out, batch, capture_gathered=Capture()
+        )
+        self.assertEqual(got, (x_fp8, x_scale))
+        self.assertIsNone(stream.pending)
+        self.assertIs(stream.residual, residual_new)
+        self.assertEqual(captured, [(residual_new, False)])
+        self.assertIs(adapter.fused_moe_stream_residual(batch), residual_new)
+        # a handoff whose output is not this stream's contribution is rejected
+        with self.assertRaises(RuntimeError):
+            adapter.take_norm_next_handoff(handoff, out.clone(), batch)
 
     def test_wrapper_passes_preconverted_router_to_extension(self):
         f = self.kernel
