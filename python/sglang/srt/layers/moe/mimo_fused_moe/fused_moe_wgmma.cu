@@ -270,6 +270,13 @@ constexpr int PREFILL_B3 = FC1_PUB_OFFLOAD ? 96 : 128;   // FMOE_FC2_PREFILL's p
                                          //    goal10: on together with FMOE_C_UNI (alone it is neutral/+0.2; with uniform descriptors the wait after
                                          //    the 4 back-to-back QGMMAs is short): chat suite 123.48 -> 122.23 us/layer, 69/69 cases, bitwise equal.
 #endif
+#ifndef FMOE_C_EPI
+#define FMOE_C_EPI 3                     // exact-M32 N8 token-task FC1 epilogue (goal10, bitwise-neutral). bit 0: fc1_s2[e] / fc2_s2[e] are loaded at
+#endif                                   //    item setup (latency hidden by the mainloop) instead of two dependent __ldg in the epilogue; bit 1: the
+                                         //    h-flag publish starts from a flag word prefetched (relaxed) at the epilogue start -- atom.or.acq_rel when
+                                         //    it already carries this launch's epoch, else the CAS loop from that value -- instead of ld.acquire +
+                                         //    CAS (two dependent L2 round trips on warp 0, plus retries when the halves/chunks of an expert publish
+                                         //    together). Chat lab: -2.2 (bit 1) / -2.4 (both) us/layer, 17/17 cases, bitwise equal.
 #ifndef FMOE_C_UNI
 #define FMOE_C_UNI 1                     // 1: exact-M32 FC2 pair loop counter made warp-uniform through REDUX (__reduce_or_sync of par = wg >> 1): the
 #endif                                   //    expert counter, stage address and wgmma descriptors then live in uniform registers -- ptxas had
@@ -915,6 +922,26 @@ __device__ __forceinline__ void fc1_pub_worker(const Params& P, unsigned epoch, 
         }
     }
     __syncwarp();
+}
+// FMOE_C_EPI & 2: the same final flag word as publish_m32_chunk, but the expected value was read (relaxed) at the start of the
+// epilogue: if it already carries this launch's epoch the bit is set with one atom.or (acq_rel, cannot fail); otherwise the CAS
+// loop starts from the prefetched value (one round trip when no other chunk/half published in between). The ld.acquire round
+// trip in front of the CAS is gone; the atom is acq_rel exactly like the CAS, so the h stores are released the same way.
+__device__ __forceinline__ void publish_m32_chunk_pre(unsigned* flags, int u, int hf, int chunk, unsigned epoch, uint64_t old) {
+    auto* p = reinterpret_cast<uint64_t*>(flags + MAXU * 2 + u * 8);
+    const uint64_t tag = uint64_t(epoch) << 32, bit = 1ull << (hf * 4 + chunk);
+    if (unsigned(old >> 32) == epoch) {
+        asm volatile("atom.acq_rel.gpu.global.or.b64 %0, [%1], %2;" : "=l"(old) : "l"(p), "l"(bit) : "memory");
+        return;
+    }
+    while (true) {
+        const uint64_t desired = (unsigned(old >> 32) == epoch ? old : tag) | bit;
+        uint64_t observed;
+        asm volatile("atom.acq_rel.gpu.global.cas.b64 %0, [%1], %2, %3;"
+                     : "=l"(observed) : "l"(p), "l"(old), "l"(desired) : "memory");
+        if (observed == old) break;
+        old = observed;
+    }
 }
 __device__ __forceinline__ unsigned ld_relaxed_gpu(const unsigned* p) { unsigned v; asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory"); return v; }
 __device__ __forceinline__ void fence_acq_rel_gpu() { asm volatile("fence.acq_rel.gpu;" ::: "memory"); }
@@ -3846,6 +3873,10 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
             }
         }
         int u = base_item / (2 * KSPLIT), hf = (base_item / KSPLIT) & 1, e = s_union[u];
+        // FMOE_C_EPI & 1: the expert's two per-expert factors are loaded here, their latency hidden behind the 48-tile mainloop
+        constexpr bool EPI_PRE = (FMOE_C_EPI & 1) && TOKEN_ONLY && EXACT_M == 32 && !FC1_PUB_OFFLOAD;   // (offload: warp 18 stages the factors)
+        float pre_s1 = 0.f, pre_s2 = 0.f;
+        if constexpr (EPI_PRE) { pre_s1 = __ldg(P.fc1_s2 + e); pre_s2 = __ldg(P.fc2_s2 + e); }
         if constexpr (EXACT_M == 32 && PARTS == 2) {
             // Consumer-only context, outside producer ring/misc words. Every
             // path joins all512 after reading it, before next-item overwrite.
@@ -4064,6 +4095,15 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
         }
         if (lane == 0 && (TOKEN_ONLY || !(P.mode & 1))) mbar_arrive(&empty[(it - 1) % NSTAGE1]);
         DIAG_T(tC);
+        // FMOE_C_EPI & 2: thread 0 reads this expert's h flag word now (relaxed; latency hidden by the SiLU/requant below)
+        constexpr bool EPI_FLAG = (FMOE_C_EPI & 2) && TOKEN_ONLY && EXACT_M == 32 && !FC1_PUB_OFFLOAD;   // (offload: warp 18 publishes)
+        uint64_t flag_pre = 0;
+        if constexpr (EPI_FLAG) {
+            if (tid == 0) {
+                const int bi = reinterpret_cast<volatile int*>(s_misc)[36];
+                flag_pre = ld_relaxed_gpu_u64(reinterpret_cast<const uint64_t*>(P.h_flags + MAXU * 2 + (bi / 2) * 8));
+            }
+        }
 
         if constexpr (EXACT_M == 32 && PARTS == 2) {
             // Shorten setup metadata live ranges across the MMA mainloop.
@@ -4075,7 +4115,7 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
                 while (ld_acquire_cta_s(pub_ + 1) != (int)epoch) {}
                 rs_e = reinterpret_cast<const float2*>(smem + OFF_S2TAB)[u].x;
             } else
-            rs_e = __ldg(P.fc1_s2 + e) * 64.0f;
+            rs_e = (EPI_PRE ? pre_s1 : __ldg(P.fc1_s2 + e)) * 64.0f;
             static_assert(KSPLIT == 1, "M32 light tail uses one guarded N8 panel");
             if constexpr (ONE_WAVE && FMOE_ONEWAVE_KSPLIT) {
                 // One-wave K-split: a helper piece publishes its raw fp32 accumulator of task `item` and is done; the owner (k-tiles
@@ -4227,7 +4267,7 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
                         // path), permuted per expert as [hf][tig 4][j 4][e 2]: FC2 lane (tig) reads its 8 scales of k-block hf
                         // as two float4.
                         const float rs2 = (TOKEN_ONLY && FC1_PUB_OFFLOAD) ? reinterpret_cast<const float2*>(smem + OFF_S2TAB)[u].y
-                                                                                : __fmul_rn(__ldg(P.fc2_s2 + e), 64.0f);
+                                                                                : __fmul_rn(EPI_PRE ? pre_s2 : __ldg(P.fc2_s2 + e), 64.0f);
                         const int perm = hf * 32 + ((tok >> 1) & 3) * 8 + (tok >> 3) * 2 + (tok & 1);
                         P.cs_buf[(size_t)MAXU * M_pad * 2 + (size_t)u * 64 + perm] = __fmul_rn(cs, rs2);
                     } else if constexpr (FC2_PRESCALE<EXACT_M>) {
@@ -4256,7 +4296,10 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
                 st_release_cta_s(pub_, n + 1);
             } else
             if (token_tasks)
-                publish_m32_chunk(P.h_flags, u, hf, token_base / NT, epoch);
+            {
+                if constexpr (EPI_FLAG) publish_m32_chunk_pre(P.h_flags, u, hf, token_base / NT, epoch, flag_pre);
+                else publish_m32_chunk(P.h_flags, u, hf, token_base / NT, epoch);
+            }
             else if (!CHUNKED || token_base + NT >= T)
                 st_release_gpu(&P.h_flags[u * 2 + hf], epoch);
         }
