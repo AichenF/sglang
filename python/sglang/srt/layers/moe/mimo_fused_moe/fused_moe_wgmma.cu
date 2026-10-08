@@ -265,9 +265,15 @@ constexpr int PREFILL_B3 = FC1_PUB_OFFLOAD ? 96 : 128;   // FMOE_FC2_PREFILL's p
 #define FMOE_CS_PERM 1                   // 1: exact-M32 prescaled FC2 scales live in the upper half of cs_buf in a per-lane permuted layout and are
 #endif                                   //    copied into an 8-entry smem ring outside the stage: the retire arrives first, then reads float2 pairs
 #ifndef FMOE_FC2_EARLY_RELEASE
-#define FMOE_FC2_EARLY_RELEASE 0         // 1: exact-M32 CS_PERM FC2 pair waits for its k-block-1 group right after issuing it and releases the stage there
+#define FMOE_FC2_EARLY_RELEASE 1         // 1: exact-M32 CS_PERM FC2 pair waits for its k-block-1 group right after issuing it and releases the stage there
                                          //    (the ring slot frees one dequant earlier; the next expert's k-block-0 dequant no longer overlaps that group).
+                                         //    goal10: on together with FMOE_C_UNI (alone it is neutral/+0.2; with uniform descriptors the wait after
+                                         //    the 4 back-to-back QGMMAs is short): chat suite 123.48 -> 122.23 us/layer, 69/69 cases, bitwise equal.
 #endif
+#ifndef FMOE_C_UNI
+#define FMOE_C_UNI 1                     // 1: exact-M32 FC2 pair loop counter made warp-uniform through REDUX (__reduce_or_sync of par = wg >> 1): the
+#endif                                   //    expert counter, stage address and wgmma descriptors then live in uniform registers -- ptxas had
+                                         //    rebuilt every QGMMA descriptor with an R2UR pair (16 per expert, serializing the 4-wgmma issue)
 #ifndef FMOE_FC2_L2_PREFETCH
 #define FMOE_FC2_L2_PREFETCH 0           // N > 0: exact-M32 FC2 weight/offset producer warps L2-prefetch the boxes of the expert N stages ahead
 #endif                                   //    into L2 (cp.async.bulk.prefetch.tensor) while they wait for a free ring slot
@@ -5034,8 +5040,11 @@ __device__ __forceinline__ void fc2_consumer(const Params& P, unsigned epoch, ui
         // This pair's stages l = par, par + 2, ... < L. FMOE_GP2 helper pair 1 first runs a peeled segment, stages 1..2nq-1 for tile
         // 36 + h%12, flushes that accumulator to arena slot 36 + h, and then joins the common walk at 2nq+1 for tile h. (Peeled rather
         // than a two-iteration segment loop: no extra loop-carried state across the common walk -- the loop form spilled.)
-        int l0 = par;
-        if (gp2 && (int)blockIdx.x >= 96 && par == 1) {
+        // FMOE_C_UNI: par through REDUX (warp-uniform result in a uniform register) so ptxas keeps l, the stage address and the
+        // wgmma descriptors in the uniform datapath (no R2UR pair in front of every QGMMA)
+        const int par_u = (FMOE_C_UNI && EXACT_M == 32) ? (int)__reduce_or_sync(0xffffffffu, (unsigned)par) : par;
+        int l0 = par_u;
+        if (gp2 && (int)blockIdx.x >= 96 && par_u == 1) {
             const int l1 = 2 * misc[GP2_MISC + 2];
             if (l0 < l1) {
                 expert(BF{}, l0);
