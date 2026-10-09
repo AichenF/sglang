@@ -17,6 +17,10 @@ from sglang.kernels.ops.speculative.dflash import (
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     accept_sampling,
 )
+from sglang.kernels.ops.speculative.topk1 import (
+    _DFLASH_SHARD_BLOCK,
+    dflash_shard_max_argmax,
+)
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
@@ -166,6 +170,16 @@ class _DflashDraftSampler:
             self.selected_ids = torch.empty(
                 (1, max_tokens), dtype=torch.int64, device=device
             )
+            # Split-reduction scratch for the shard-local (max, argmax). Sized
+            # for the whole capture so the addresses are fixed like the rest.
+            self.shard_block = int(_DFLASH_SHARD_BLOCK)
+            num_splits = -(-self.num_org // self.shard_block)
+            self.partial_vals = torch.empty(
+                (max_tokens * num_splits,), dtype=torch.float32, device=device
+            )
+            self.partial_indices = torch.empty(
+                (max_tokens * num_splits,), dtype=torch.int32, device=device
+            )
 
     def __call__(self, hidden_states, input_ids=None):
         # draft tokens are block positions 1: (pos 0 is the seeded bonus token)
@@ -185,9 +199,19 @@ class _DflashDraftSampler:
             return
         local_max = self.local_max[:n]
         local_arg = self.local_arg[:n]
-        torch.max(logits, dim=-1, out=(local_max, local_arg))
-        if self.org_vocab_start:
-            local_arg.add_(self.org_vocab_start)
+        # torch.max over dim=-1 gives one CTA per row, and there are only
+        # block_size - 1 rows, so the vocab shard is reduced on 6 CTAs of 148.
+        # Split the vocab dimension across CTAs instead; the offset folds into
+        # the finalize store rather than costing a second pass.
+        dflash_shard_max_argmax(
+            logits,
+            local_max,
+            local_arg,
+            self.partial_vals,
+            self.partial_indices,
+            org_vocab_start=self.org_vocab_start,
+            block=self.shard_block,
+        )
         gathered_max = self.gathered_max[: self.tp_size * n]
         gathered_ids = self.gathered_ids[: self.tp_size * n]
         self.tp_group.all_gather_into_tensor(gathered_max, local_max)
