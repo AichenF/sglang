@@ -71,6 +71,30 @@ def _stamp_watcher(rank: int) -> None:
         time.sleep(0.2)
 
 
+# Diagnostics only (off unless set): capture the M = 32 input-TP kernel inputs (this rank's o_proj partial, the residual)
+# and the kernel's published top-8 ids of every layer into a per-layer ring of the last _CAP_RING replays. CUDA-graph
+# safe: the ring slot comes from a device counter. Creating <dir>/dump.<n> makes every rank write
+# <dir>/capture_rank<r>_<n>.pt = {layer_id: dict(partial [R,32,DIM] bf16, residual [R,32,DIM] bf16, topk [R,32,8] int64,
+# count int64 [1])}; ring slot s holds replay number s + R*k, so order the slots by count when count > R.
+_CAP_DIR = os.environ.get("SGLANG_MIMO_FUSED_MOE_CAPTURE_DIR", "")
+_CAP_RING = int(os.environ.get("SGLANG_MIMO_FUSED_MOE_CAPTURE_RING", "16"))
+_cap_layers: List[Any] = []
+_cap_thread: Optional[threading.Thread] = None
+
+
+def _cap_watcher(rank: int) -> None:
+    n = 0
+    while True:
+        if os.path.exists(os.path.join(_CAP_DIR, f"dump.{n}")):
+            try:
+                out = {lid: {k: t.cpu() for k, t in bufs.items()} for lid, bufs in _cap_layers}
+                torch.save(out, os.path.join(_CAP_DIR, f"capture_rank{rank}_{n}.pt"))
+            except Exception as e:  # diagnostics must never kill the server
+                logger.warning(f"MiMo fused MoE capture dump failed: {e}")
+            n += 1
+        time.sleep(0.2)
+
+
 def mimo_fused_moe_enabled() -> bool:
     return bool(envs.SGLANG_MIMO_FUSED_MOE.get())
 
@@ -418,6 +442,22 @@ class MiMoFusedMoE:
                     target=_stamp_watcher, args=(shared.rank,), daemon=True
                 )
                 _stamp_thread.start()
+        self.cap = None
+        if _CAP_DIR and shared.input_tp:
+            global _cap_thread
+            dev = self.router_w.device
+            self.cap = dict(
+                partial=torch.zeros(_CAP_RING, 32, F.DIM, dtype=torch.bfloat16, device=dev),
+                residual=torch.zeros(_CAP_RING, 32, F.DIM, dtype=torch.bfloat16, device=dev),
+                topk=torch.full((_CAP_RING, 32, F.TOPK), -1, dtype=torch.int64, device=dev),
+                count=torch.zeros(1, dtype=torch.int64, device=dev),
+            )
+            _cap_layers.append((decoder_layer.layer_id, self.cap))
+            if _cap_thread is None:
+                _cap_thread = threading.Thread(
+                    target=_cap_watcher, args=(shared.rank,), daemon=True
+                )
+                _cap_thread.start()
 
     # ------------------------------------------------------------------ validation
     @staticmethod
@@ -623,6 +663,11 @@ class MiMoFusedMoE:
                 residual = residual.contiguous()
             out = torch.empty_like(partial)
             residual_out = torch.empty_like(residual)
+            if self.cap is not None:
+                # inputs before the launch (the kernel may stage through them); top-8 ids after it
+                slot = self.cap["count"] % _CAP_RING
+                self.cap["partial"].index_copy_(0, slot, partial.unsqueeze(0))
+                self.cap["residual"].index_copy_(0, slot, residual.unsqueeze(0))
             inp = dict(
                 partial=partial,
                 residual=residual,
@@ -644,6 +689,10 @@ class MiMoFusedMoE:
                 norm_next=self.norm_next,
                 pf=self.pf,
             )
+            if self.cap is not None:
+                ids, _ = self.shared.state.kernel_topk(32)
+                self.cap["topk"].index_copy_(0, slot, ids.unsqueeze(0))
+                self.cap["count"] += 1
             if self.norm_next is not None:
                 # the kernel also produced the next layer's residual_new / x_fp8 / scales (fixed per-layer buffers, CUDA-graph safe);
                 # MiMoV2DecoderLayer.forward of layer_id + 1 consumes them and skips its input_layernorm + activation quant.
