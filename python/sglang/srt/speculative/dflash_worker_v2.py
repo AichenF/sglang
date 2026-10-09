@@ -1036,14 +1036,20 @@ class DFlashWorkerV2(BaseSpecWorker):
                 device=self.device,
                 max_position_hint=self.target_worker.model_runner.model_config.context_len
                 + int(self.block_size),
+                apply_v_scale=envs.SGLANG_DFLASH_FUSED_KV_VSCALE.get(),
             )
             if get_parallel().tp_rank == 0:
                 logger.info(
                     "DFLASH fused KV materialization enabled. "
-                    "n_layers=%d, num_kv_heads=%d, head_dim=%d",
+                    "n_layers=%d, num_kv_heads=%d, head_dim=%d, v_scale=%s",
                     len(layers),
                     first_attn.num_kv_heads,
                     first_attn.head_dim,
+                    (
+                        None
+                        if self._fused_kv_helper.v_scale_values is None
+                        else self._fused_kv_helper.v_scale_values.tolist()
+                    ),
                 )
         except Exception as e:
             logger.warning(

@@ -28,6 +28,7 @@ def _fused_norm_rope_kernel_stacked(
     kv_ptr,  # [total_ctx, n_layers, kv_size * 2]
     k_norm_weight_ptr,  # [n_layers, head_dim]
     eps_ptr,  # [n_layers]
+    v_scale_ptr,  # [n_layers] fp32 (read only when HAS_VSCALE)
     cos_sin_cache_ptr,  # [max_pos, rotary_dim]
     positions_ptr,  # [total_ctx]
     k_out_ptr,  # [n_layers, total_ctx, num_kv_heads, head_dim]
@@ -50,8 +51,11 @@ def _fused_norm_rope_kernel_stacked(
     rotary_dim: tl.constexpr,
     half_rotary_dim: tl.constexpr,
     BLOCK_HD: tl.constexpr,
+    HAS_VSCALE: tl.constexpr = False,
 ):
-    """Fused RMSNorm(K) + RoPE(K) materialization. Grid: (total_ctx, num_kv_heads, n_layers)."""
+    """Fused RMSNorm(K) + RoPE(K) materialization. Grid: (total_ctx, num_kv_heads, n_layers).
+    HAS_VSCALE: V is multiplied by the layer's attention value scale (fp32 product rounded to the
+    cache dtype, i.e. ``v * v_scale`` of DFlashAttention.kv_proj_only / forward)."""
     ctx_id = tl.program_id(0)
     head_id = tl.program_id(1)
     layer_id = tl.program_id(2)
@@ -114,7 +118,13 @@ def _fused_norm_rope_kernel_stacked(
     k_rot_first = k_first * cos_v - k_second * sin_v
     k_rot_second = k_second * cos_v + k_first * sin_v
 
-    tl.store(v_write + offs, v_raw, mask=mask_hd)
+    if HAS_VSCALE:
+        v_scale = tl.load(v_scale_ptr + layer_id)
+        tl.store(
+            v_write + offs, (v_raw.to(tl.float32) * v_scale).to(v_raw.dtype), mask=mask_hd
+        )
+    else:
+        tl.store(v_write + offs, v_raw, mask=mask_hd)
     tl.store(k_write + offs, k_rot_first.to(v_raw.dtype), mask=mask_half)
     tl.store(
         k_write + half_rotary_dim + offs, k_rot_second.to(v_raw.dtype), mask=mask_half
@@ -134,6 +144,7 @@ def _fused_norm_rope_stacked(
     rotary_dim: int,
     k_out: Optional[torch.Tensor] = None,
     v_out: Optional[torch.Tensor] = None,
+    v_scale: Optional[torch.Tensor] = None,  # [n_layers] fp32
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused RMSNorm + RoPE materialization for all layers."""
     if kv.ndim != 3:
@@ -213,6 +224,7 @@ def _fused_norm_rope_stacked(
         kv,
         k_norm_weight,
         eps,
+        v_scale if v_scale is not None else eps,
         cos_sin_cache,
         positions,
         k_out,
@@ -235,6 +247,7 @@ def _fused_norm_rope_stacked(
         rotary_dim,
         half_rotary_dim,
         BLOCK_HD,
+        HAS_VSCALE=v_scale is not None,
     )
     return k_out, v_out
 
@@ -254,6 +267,7 @@ class FusedKVMaterializeHelper:
         head_dim: int,
         device: torch.device,
         max_position_hint: Optional[int] = None,
+        apply_v_scale: bool = True,
     ):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -292,6 +306,7 @@ class FusedKVMaterializeHelper:
         kv_weights = []
         k_norm_weights = []
         eps_values = []
+        v_scales = []
 
         for layer_id, layer in enumerate(layers):
             attn = layer.self_attn
@@ -324,6 +339,11 @@ class FusedKVMaterializeHelper:
             kv_weights.append(kv_weight)
             k_norm_weights.append(attn.k_norm.weight)
             eps_values.append(float(attn.k_norm.variance_epsilon))
+            # Attention value scale (e.g. MiMo-V2.6 draft attention_value_scale):
+            # forward() and kv_proj_only() scale V before the cache write, so the
+            # context rows materialized here must carry the same scale.
+            v_scale = getattr(attn, "v_scale", None)
+            v_scales.append(None if v_scale is None else float(v_scale))
 
         flat_kv_weight = torch.stack(kv_weights).reshape(
             self.n_layers * self.layer_out_dim, -1
@@ -333,6 +353,13 @@ class FusedKVMaterializeHelper:
         self.eps_values = torch.tensor(
             eps_values, dtype=torch.float32, device=self.device
         )
+        self.v_scale_values: Optional[torch.Tensor] = None
+        if apply_v_scale and any(v is not None and v != 1.0 for v in v_scales):
+            self.v_scale_values = torch.tensor(
+                [1.0 if v is None else v for v in v_scales],
+                dtype=torch.float32,
+                device=self.device,
+            )
 
         if self.max_position_hint is not None:
             self._ensure_rope_cache(self.max_position_hint)
@@ -452,6 +479,7 @@ class FusedKVMaterializeHelper:
             self.rotary_dim,
             k_out=tmp_k,
             v_out=tmp_v,
+            v_scale=self.v_scale_values,
         )
         for layer_idx in range(self.n_layers):
             write_layer_kv(layer_idx, cache_k[layer_idx], cache_v[layer_idx])

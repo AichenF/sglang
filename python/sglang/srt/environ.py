@@ -1424,6 +1424,10 @@ class Envs:
     # draft cuda graph (model.forward_embed = target embedding * noise scale)
     # instead of the eager embedding + all-reduce + copy into the graph buffer.
     SGLANG_DFLASH_EMBED_IN_GRAPH = EnvBool(False)
+    # goal10-p2: the fused draft-KV materialization applies the draft attention
+    # value scale (MiMo-V2.6 attention_value_scale) to the context V rows, like
+    # DFlashAttention.forward / kv_proj_only do (0 = previous behavior: unscaled).
+    SGLANG_DFLASH_FUSED_KV_VSCALE = EnvBool(True)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
