@@ -1428,6 +1428,12 @@ class Envs:
     # value scale (MiMo-V2.6 attention_value_scale) to the context V rows, like
     # DFlashAttention.forward / kv_proj_only do (0 = previous behavior: unscaled).
     SGLANG_DFLASH_FUSED_KV_VSCALE = EnvBool(True)
+    # goal10-p2: fp8 copy of the borrowed LM head for the DFlash draft greedy
+    # head only (draft-only numerics; the target verify keeps bf16).
+    SGLANG_DFLASH_DRAFT_HEAD_FP8 = EnvBool(False)
+    # goal10-p2: fp8 draft (--speculative-draft-model-quantization fp8): keep the
+    # fused context-KV materialization on a dequantized bf16 K/V weight slice.
+    SGLANG_DFLASH_FUSED_KV_DEQUANT = EnvBool(True)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

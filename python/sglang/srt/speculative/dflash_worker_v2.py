@@ -160,6 +160,32 @@ class _DflashDraftSampler:
         max_tokens = int(max_bs) * (self.block_size - 1)
         device = weight.device
         self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
+        # goal10-p2: optional fp8 (per-output-channel, dynamic activation scale) copy
+        # of the borrowed target LM head for the DRAFT greedy head only (halves its
+        # weight traffic; the target verify keeps the bf16 head). Draft-only numerics.
+        self._fp8_head = None
+        if envs.SGLANG_DFLASH_DRAFT_HEAD_FP8.get() and is_cuda():
+            try:
+                from sglang.srt.layers.quantization.fp8 import (
+                    Fp8Config,
+                    Fp8LinearMethod,
+                )
+
+                method = Fp8LinearMethod(Fp8Config(is_checkpoint_fp8_serialized=False))
+                holder = torch.nn.Module()
+                holder.weight = torch.nn.Parameter(
+                    weight.data[: self.num_org], requires_grad=False
+                )
+                method.process_weights_after_loading(holder)
+                self._fp8_head = (method, holder)
+                logger.info(
+                    "DFLASH draft greedy head: fp8 LM-head copy %s (scale %s).",
+                    tuple(holder.weight.shape),
+                    tuple(holder.weight_scale.shape),
+                )
+            except Exception as e:
+                logger.warning("DFLASH draft fp8 LM head disabled: %s", e)
+                self._fp8_head = None
         # fused shard argmax + 16-B pair multimem all-gather + select
         # (one Triton reduce, one symm-mem gather, one tiny select) instead of
         # torch.max + two NCCL all-gathers + argmax + gather.
@@ -195,6 +221,12 @@ class _DflashDraftSampler:
                 (1, max_tokens), dtype=torch.int64, device=device
             )
 
+    def _logits(self, hs):
+        if self._fp8_head is not None:
+            method, holder = self._fp8_head
+            return method.apply(holder, hs)
+        return torch.matmul(hs, self.weight[: self.num_org].T)
+
     def __call__(self, hidden_states, input_ids=None):
         # draft tokens are block positions 1: (pos 0 is the seeded bonus token)
         bs = hidden_states.shape[0] // self.block_size
@@ -204,7 +236,7 @@ class _DflashDraftSampler:
         if hs.dtype != self.weight.dtype:
             hs = hs.to(self.weight.dtype)
         n = hs.shape[0]
-        logits = torch.matmul(hs, self.weight[: self.num_org].T)
+        logits = self._logits(hs)
         if self.tp_size == 1:
             tokens = torch.argmax(logits, dim=-1).to(torch.long)
             if self.org_vocab_start:
@@ -985,6 +1017,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 attn = layer.self_attn
                 eligible, reason = can_dflash_use_fused_qkv_proj(attn.qkv_proj)
                 if not eligible:
+                    dequant = self._dequant_fp8_kv_weight(attn)
+                    if dequant is not None:
+                        # goal10-p2: fp8 draft (online per-channel quant): the fused
+                        # context-KV path runs on a dequantized bf16 copy of the K/V
+                        # slice (draft-only numerics) instead of falling back to the
+                        # per-layer sequential path.
+                        attn._fused_kv_weight_override = dequant
+                        eligible = True
+                if not eligible:
                     fused_disable_reason = f"{reason}: layer={layer_idx}"
                     break
 
@@ -1058,6 +1099,38 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             self._use_fused_kv_materialize = False
             self._fused_kv_helper = None
+
+    @staticmethod
+    def _dequant_fp8_kv_weight(attn) -> Optional[torch.Tensor]:
+        """bf16 [2 * kv_size, hidden] K/V rows of an online-fp8 (per-channel or
+        per-tensor scale, no block quant) fused qkv_proj, else None."""
+        if not envs.SGLANG_DFLASH_FUSED_KV_DEQUANT.get():
+            return None
+        try:
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+            qkv = attn.qkv_proj
+            method = getattr(qkv, "quant_method", None)
+            if type(method) is not Fp8LinearMethod or method.block_quant:
+                return None
+            if getattr(method, "use_marlin", False) or getattr(qkv, "bias", None) is not None:
+                return None
+            w = qkv.weight  # [K, N] fp8 (transposed view of [N, K])
+            scale = qkv.weight_scale
+            if w.dtype != torch.float8_e4m3fn or w.dim() != 2:
+                return None
+            n_out = int(w.shape[1])
+            scale = scale.reshape(-1).float()
+            if scale.numel() == 1:
+                scale = scale.expand(n_out)
+            if scale.numel() != n_out:
+                return None
+            rows = slice(attn.q_size, attn.q_size + 2 * attn.kv_size)
+            w_rows = w.t()[rows].float() * scale[rows, None]
+            return w_rows.to(torch.bfloat16).contiguous()
+        except Exception as e:
+            logger.warning("DFLASH fp8 K/V weight dequant for the fused path failed: %s", e)
+            return None
 
     def _ensure_draft_block_buffers(self, bs: int) -> None:
         cap = (
