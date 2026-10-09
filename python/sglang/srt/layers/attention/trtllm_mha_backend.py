@@ -12,6 +12,8 @@ Decode: uses XQA on SM90 and SM120, TRTLLM-GEN on SM100.
 Sliding window and attention sink features are supported.
 """
 
+import functools
+import inspect
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -63,6 +65,50 @@ from sglang.srt.speculative.ragged_verify import (
 from sglang.srt.utils import is_flashinfer_available
 
 logger = logging.getLogger(__name__)
+
+
+@functools.cache
+def _cake_fmha_smallm_graph_safe() -> bool:
+    """Whether FlashInfer's Cake FMHA small-M hd256 decode is CUDA-graph safe.
+
+    Earlier builds can deadlock under graph replay (softmax publishes the
+    corr_scale rescale factor before waiting on p_empty) and need an eager
+    prewarm of every tensor binding (device-resident TMA descriptors). No
+    release carries the fixes yet, so check the installed kernel source.
+    TODO: replace with a FlashInfer version check once a release includes them.
+    """
+    try:
+        from flashinfer.jit.cake_fmha import get_cake_fmha_csrc_dir
+    except ImportError:
+        return False
+    csrc = get_cake_fmha_csrc_dir()
+    variant = csrc / "cuda/decode_native_bf16_hd256_smallm_n64_p64"
+    try:
+        # Newer FlashInfer ships one arch-neutral body per variant; older, per arch.
+        kernel = next(
+            path
+            for path in (variant / "default.cu", variant / "sm_100a" / "default.cu")
+            if path.is_file()
+        ).read_text()
+        binding = (
+            csrc / "jit/cake_fmha_decode_native_bf16_hd256_smallm_jit_binding.cu"
+        ).read_text()
+    except (OSError, StopIteration):
+        return False
+    p_empty = kernel.find("mbarrier_wait(p_empty_addr")
+    corr_scale = kernel.find("mbarrier_arrive(corr_scale_addr)")
+    safe = (
+        0 <= p_empty < corr_scale
+        and "__grid_constant__" in kernel
+        and "TmaDeviceSlot(" not in binding
+    )
+    if not safe:
+        logger.info(
+            "FlashInfer Cake FMHA small-M decode lacks the CUDA-graph fixes; "
+            "speculative verify keeps trtllm-gen."
+        )
+    return safe
+
 
 if is_flashinfer_available():
     import flashinfer
@@ -409,6 +455,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self._xqa_spec_dec_mask = (
                 mask.unsqueeze(0).expand(max_bs, -1, -1).contiguous().to(self.device)
             )
+        self.use_cake_fmha_verify = (
+            envs.SGLANG_USE_CAKE_FMHA_VERIFY.get() and _cake_fmha_smallm_graph_safe()
+        )
+        # Per verify shape: whether Cake FMHA has an optimized small-M route.
+        self._cake_fmha_verify_routes: dict[tuple, bool] = {}
 
     def _check_decode_kv_access(self) -> None:
         supported_kinds = {
@@ -1331,6 +1382,102 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         assert self.is_nvfp4_kvcache
         return self.kv_cache_quant_method.get_bmm_scales(layer.layer_id)
 
+    def _cake_fmha_serves_verify(
+        self,
+        query: torch.Tensor,
+        kv_cache,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        q_len_per_req: int,
+        bmm1_scale,
+        bmm2_scale,
+        window_left: int,
+        sinks: Optional[torch.Tensor],
+        kv_cache_sf,
+        out: Optional[torch.Tensor],
+        out_dtype: torch.dtype,
+    ) -> bool:
+        """Whether Cake FMHA has an optimized small-M route for this verify shape.
+
+        Selection is host-side and cached per shape, so it runs once during
+        warmup/capture. Unoptimized Cake routes fall back to a slow compat kernel,
+        hence only the optimized small-M route is accepted.
+        """
+        if not self.use_cake_fmha_verify or kv_cache_sf is not None:
+            return False
+        k_cache, v_cache = kv_cache
+        key = (
+            tuple(query.shape),
+            query.dtype,
+            tuple(k_cache.shape),
+            k_cache.dtype,
+            q_len_per_req,
+            window_left,
+            sinks is None,
+            out_dtype,
+            None if out is None else (tuple(out.shape), out.is_contiguous()),
+        )
+        served = self._cake_fmha_verify_routes.get(key)
+        if served is None:
+            from flashinfer.cake_fmha import (
+                cake_fmha_route_is_optimized,
+                select_cake_fmha_decode_route,
+            )
+
+            optional = {}
+            if (
+                "multi_ctas_kv_counter_buffer"
+                in inspect.signature(select_cake_fmha_decode_route).parameters
+            ):
+                optional["multi_ctas_kv_counter_buffer"] = (
+                    self._multi_ctas_kv_counter_buffer
+                )
+            route = select_cake_fmha_decode_route(
+                query.device,
+                query=query,
+                key_cache=k_cache,
+                value_cache=v_cache,
+                # Select against the tensor FlashInfer will write; a stand-in only
+                # when it allocates the output itself.
+                out=(
+                    out
+                    if out is not None
+                    else torch.empty(query.shape, dtype=out_dtype, device=query.device)
+                ),
+                workspace_buffer=self.workspace_buffer,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                batch_size=seq_lens.shape[0],
+                q_len=q_len_per_req,
+                max_seq_len=self.max_context_len,
+                window_left=window_left,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                o_scale=None,
+                sinks=sinks,
+                kv_layout="HND",
+                uses_shared_paged_kv_idx=True,
+                cum_seq_lens_q=None,
+                key_block_scales=None,
+                value_block_scales=None,
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                enable_block_sparse_attention=False,
+                **optional,
+            )
+            served = (
+                route is not None
+                and route.component == "decode_native_bf16_hd256_smallm"
+                and cake_fmha_route_is_optimized(route)
+            )
+            self._cake_fmha_verify_routes[key] = served
+            logger.info(
+                "Cake FMHA small-M verify decode for %s: %s",
+                key,
+                "enabled" if served else "not served, using trtllm-gen",
+            )
+        return served
+
     def _run_fixed_q_len_decode(
         self,
         query: torch.Tensor,
@@ -1360,6 +1507,22 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             kwargs = {}
             if q_len_per_req != 1:
                 kwargs["q_len_per_req"] = q_len_per_req
+                # The XQA speculative-decode mask path is not a Cake route.
+                if mask is None and self._cake_fmha_serves_verify(
+                    group_query,
+                    kv_cache,
+                    group_block_tables,
+                    group_seq_lens,
+                    q_len_per_req=q_len_per_req,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    window_left=window_left,
+                    sinks=sinks,
+                    kv_cache_sf=kv_cache_sf,
+                    out=group_out,
+                    out_dtype=resolved_out_dtype,
+                ):
+                    kwargs["backend"] = "cake"
             if mask is not None:
                 kwargs["mask"] = mask[: group_seq_lens.shape[0]]
             return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
