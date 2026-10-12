@@ -141,6 +141,102 @@ def _compute_dflash_accept_bonus_triton_unchecked(
 
 
 @triton.jit
+def _dflash_accept_bonus_publish_kernel(
+    candidates_ptr,
+    target_top1_ptr,
+    accept_lens_out_ptr,
+    commit_lens_out_ptr,
+    bonus_ids_out_ptr,
+    out_tokens_ptr,
+    prefix_lens_ptr,
+    new_seq_lens_out_ptr,
+    future_idx_ptr,
+    future_seq_lens_ptr,
+    future_tokens_ptr,
+    block_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """goal11-glue: _dflash_accept_bonus_contig_kernel (contiguous rows) + the overlap scheduler's FutureMap relay in
+    the same launch: new_seq_lens_buf[future_idx[row]] = new_seq_len (FutureMap.publish) and
+    output_tokens_buf[future_idx[row]] = bonus (FutureMap.stash's bonus_tokens write)."""
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE)
+    row_mask = cols < block_size
+    draft_mask = cols < (block_size - 1)
+    candidate_row_ptr = candidates_ptr + row * block_size
+    target_row_ptr = target_top1_ptr + row * block_size
+    candidate_tail = tl.load(candidate_row_ptr + cols + 1, mask=draft_mask, other=0)
+    accept_len = tl.full((), 0, tl.int32)
+    prefix_live = tl.full((), 1, tl.int32)
+    for col in range(BLOCK_SIZE - 1):
+        in_range = col < (block_size - 1)
+        candidate_id = tl.load(candidate_row_ptr + (col + 1), mask=in_range, other=0)
+        target_id = tl.load(target_row_ptr + col, mask=in_range, other=0)
+        match_i32 = (candidate_id == target_id).to(tl.int32)
+        keep = in_range & (prefix_live != 0) & (match_i32 != 0)
+        accept_len += keep.to(tl.int32)
+        prefix_live = tl.where(in_range, prefix_live & match_i32, prefix_live)
+    commit_len = accept_len + 1
+    bonus_id = tl.load(target_row_ptr + accept_len.to(tl.int64))
+    new_seq_len = tl.load(prefix_lens_ptr + row) + commit_len
+    tl.store(accept_lens_out_ptr + row, accept_len)
+    tl.store(commit_lens_out_ptr + row, commit_len)
+    tl.store(bonus_ids_out_ptr + row, bonus_id)
+    tl.store(new_seq_lens_out_ptr + row, new_seq_len)
+    fidx = tl.load(future_idx_ptr + row).to(tl.int64)
+    tl.store(future_seq_lens_ptr + fidx, new_seq_len.to(tl.int64))
+    tl.store(future_tokens_ptr + fidx, bonus_id.to(tl.int64))
+    out_val = tl.where(draft_mask, candidate_tail, 0)
+    out_val = tl.where(cols == accept_len, bonus_id, out_val)
+    tl.store(out_tokens_ptr + row * block_size + cols, out_val, mask=row_mask)
+
+
+def compute_dflash_accept_bonus_publish(
+    candidates: torch.Tensor,
+    target_top1: torch.Tensor,
+    accept_lens_out: torch.Tensor,
+    commit_lens_out: torch.Tensor,
+    bonus_ids_out: torch.Tensor,
+    out_tokens_out: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    new_seq_lens_out: torch.Tensor,
+    future_idx: torch.Tensor,
+    future_seq_lens: torch.Tensor,
+    future_tokens: torch.Tensor,
+) -> bool:
+    """Returns False (nothing launched) when the layouts do not match the fused kernel's assumptions."""
+    batch_size, block_size = candidates.shape
+    if batch_size == 0:
+        return False
+    for t in (candidates, target_top1, out_tokens_out):
+        if not _is_row_major_contiguous_2d(t) or t.shape != (batch_size, block_size):
+            return False
+    for t in (accept_lens_out, commit_lens_out, bonus_ids_out, new_seq_lens_out, prefix_lens, future_idx):
+        if t.ndim != 1 or not t.is_contiguous() or t.shape[0] != batch_size:
+            return False
+    if future_seq_lens.dtype != torch.int64 or future_tokens.dtype != torch.int64:
+        return False
+    block = triton.next_power_of_2(block_size)
+    _dflash_accept_bonus_publish_kernel[(batch_size,)](
+        candidates,
+        target_top1,
+        accept_lens_out,
+        commit_lens_out,
+        bonus_ids_out,
+        out_tokens_out,
+        prefix_lens,
+        new_seq_lens_out,
+        future_idx,
+        future_seq_lens,
+        future_tokens,
+        block_size,
+        BLOCK_SIZE=block,
+        num_warps=_pick_num_warps(block),
+    )
+    return True
+
+
+@triton.jit
 def _prepare_dflash_draft_block_contig_kernel(
     bonus_tokens_ptr,
     prefix_lens_ptr,
@@ -203,6 +299,15 @@ def _prepare_dflash_draft_block_unchecked(
 ) -> None:
     batch_size = int(bonus_tokens.numel())
     if batch_size == 0:
+        return
+    from sglang.kernels.ops.speculative import step_prep
+
+    if step_prep.is_recording():  # goal11-post: deferred into the draft runner's fused replay prep
+        step_prep.record(
+            "prepare", bonus_tokens=bonus_tokens, prefix_lens=prefix_lens, req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token, block_ids_out=block_ids_out, positions_out=positions_out,
+            cache_loc_out=cache_loc_out, mask_token_id=mask_token_id,
+        )
         return
 
     if req_to_token.ndim != 2 or req_to_token.stride(1) != 1:

@@ -346,6 +346,18 @@ class DFlashAttention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
+        attn_output = self.attend(qkv, positions, hidden_states, forward_batch)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def attend(
+        self,
+        qkv: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Everything between qkv_proj and o_proj: q/k norm, RoPE, value scale, attention (the o_proj input)."""
         if _is_npu:
             q, k, v = self.forward_prepare_npu(positions, hidden_states)
         elif self.use_table_qk_norm_rope and qkv.dtype == torch.bfloat16:
@@ -375,9 +387,7 @@ class DFlashAttention(nn.Module):
             attn_output = self.attn(
                 q, k, v, forward_batch, sinks=self.attention_sink_bias
             )
-        attn_output = self.apply_attention_output(attn_output, hidden_states)
-        output, _ = self.o_proj(attn_output)
-        return output
+        return self.apply_attention_output(attn_output, hidden_states)
 
     def apply_attention_output(
         self, attn_output: torch.Tensor, hidden_states: torch.Tensor
@@ -783,8 +793,53 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
+        fused = self._fc_ag_norm(target_hidden)
+        if fused is not None:
+            return fused
         projected, _ = self.fc(target_hidden)
         return self.hidden_norm(projected)
+
+    def _fc_ag_norm(self, target_hidden: torch.Tensor) -> Optional[torch.Tensor]:
+        """goal11-dense: TP8, <= 32 context tokens: the column-parallel fc's local slice, then its all-gather +
+        hidden_norm in one kernel (dflash_tp_fused.ag_norm) instead of the multimem all-gather + RMSNorm."""
+        st = getattr(self, "_fc_ag_state", None)
+        if st is False:
+            return None
+        if st is None:
+            st = False
+            try:
+                from sglang.srt.environ import envs
+
+                if (
+                    envs.SGLANG_DFLASH_TP_FUSED.get()
+                    and isinstance(self.fc, ColumnParallelLinear)
+                    and self.fc.gather_output
+                    and getattr(self.fc, "bias", None) is None
+                    and type(self.hidden_norm) is RMSNorm
+                    and int(self.config.hidden_size) == 6144
+                    and get_parallel().tp_size == 8
+                ):
+                    from sglang.kernels.ops.communication.dflash_tp_fused import get_state
+
+                    st = get_state() or False
+            except Exception:
+                st = False
+            self._fc_ag_state = st
+        if (
+            st is False
+            or target_hidden.shape[0] == 0
+            or target_hidden.shape[0] > 32
+            or target_hidden.dtype != torch.bfloat16
+        ):
+            return None
+        local = self.fc.quant_method.apply(self.fc, target_hidden)
+        if local.dim() != 2 or local.shape[1] != 768 or not local.is_contiguous():
+            return None
+        out = torch.empty(
+            local.shape[0], 6144, dtype=torch.bfloat16, device=local.device
+        )
+        st.ag_norm(local, self.hidden_norm.weight, self.hidden_norm.variance_epsilon, out)
+        return out
 
     @torch.no_grad()
     def forward(
@@ -808,6 +863,18 @@ class DFlashDraftModel(nn.Module):
                 )
         hidden_states = input_embeds
         residual: Optional[torch.Tensor] = None
+
+        # goal11-dense: fused TP8 decode path (projection -> all-reduce -> add+RMSNorm -> fp8 quant in one kernel)
+        if not getattr(self, "_tp_fast_checked", False):
+            self._tp_fast_checked = True
+            from sglang.srt.models.dflash_tp_fast import DFlashTPFast
+
+            self._tp_fast = DFlashTPFast.try_create(self)
+        if getattr(self, "_tp_fast", None) is not None and self._tp_fast.applicable(hidden_states):
+            return LogitsProcessorOutput(
+                next_token_logits=None,
+                hidden_states=self._tp_fast.forward(positions, hidden_states, forward_batch),
+            )
 
         for layer in self.layers:
             hidden_states, residual = layer(

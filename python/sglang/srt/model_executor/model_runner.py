@@ -1911,6 +1911,13 @@ class ModelRunner:
                 self.hisparse_coordinator.wait_for_pending_backup()
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
+            if not can_run_graph:
+                # goal11-post: recorded (deferred) replay-prep ops must run before an eager forward reads them
+                from sglang.kernels.ops.speculative import step_prep
+
+                if step_prep.pending() or step_prep.is_recording():
+                    step_prep.flush("eager forward")
+
             # Replay cuda graph if applicable
             if can_run_graph:
                 ret = self.decode_cuda_graph_runner.execute(

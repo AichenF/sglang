@@ -24,15 +24,21 @@ from torch import nn
 
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
+from sglang.srt.environ import envs
 from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.mimo_rope_kv import try_fused_mimo_rope_kv
+from sglang.srt.layers.attention.mimo_rope_kv import (
+    try_defer_mimo_rope_kv_to_fa_verify,
+    try_fused_mimo_rope_kv,
+)
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStatePacker,
+    aux_has_pending,
+    flush_aux_pending,
 )
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -803,12 +809,42 @@ class MiMoV2Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        blk=None,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        if blk is not None and blk.kind == "swa" and blk.qwmap is not None:
+            # goal11 mega: qkv_proj (the norm-next fp8 input) as phase 0 of the fused SWA block (attn_block_mega)
+            out = blk.run_mega(self, hidden_states, positions, forward_batch)
+            if out is not None:
+                return out
+        mq = None
+        if (blk is None or blk.kind == "fa2") and isinstance(hidden_states, tuple):
+            # goal11 mega: FA layers' qkv_proj through the megakernel's GEMM phase (qkv-only launch) instead of DeepGEMM
+            from sglang.srt.layers.moe.mimo_fused_moe.attn_block import MegaQkv
+
+            mq = MegaQkv.ready(self, hidden_states, forward_batch)
+        if mq is not None:
+            qkv = mq.run(hidden_states)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+        if blk is not None and blk.kind == "swa":
+            # goal11 blk: rope + KV store + SWA attention + o_proj + the fused MoE's entry reduce-scatter push in one kernel
+            # (mimo_fused_moe/attn_block.cu); the returned partial carries _blk_prepushed for the MoE launch.
+            out = blk.run(self, qkv, positions, forward_batch)
+            if out is not None:
+                return out
+        if blk is not None and blk.kind == "fa2":
+            # goal11 fa2: RoPE + KV store + split-KV attention + combine + o_proj + the fused MoE's entry reduce-scatter push in one kernel
+            # (mimo_fused_moe/fa_block.cu); the returned partial carries _blk_prepushed for the MoE launch.
+            out = blk.run(self, qkv, positions, forward_batch)
+            if out is not None:
+                return out
         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
 
         # [t, h, dr]
-        fused_rope_kv = try_fused_mimo_rope_kv(self, qkv, positions, forward_batch)
+        # Full-attention layers: RoPE + KV store run inside the fa_verify attention kernel when possible.
+        fused_rope_kv = try_defer_mimo_rope_kv_to_fa_verify(
+            self, qkv, positions, forward_batch
+        ) or try_fused_mimo_rope_kv(self, qkv, positions, forward_batch)
         if not fused_rope_kv:
             q, k = self.rotary_emb(positions, q, k)
         # [t, h, d]
@@ -821,6 +857,11 @@ class MiMoV2Attention(nn.Module):
             save_kv_cache=not fused_rope_kv,
             sinks=self.attention_sink_bias,
         )
+        if blk is not None and blk.kind == "fa":
+            # goal11 blk: o_proj + the fused MoE's entry reduce-scatter push in one kernel after fa3 (attn_block.cu, external attention)
+            out = blk.run_fa(attn_output)
+            if out is not None:
+                return out
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -938,8 +979,22 @@ class MiMoV2DecoderLayer(nn.Module):
         # in one kernel over the Humming layer's weights. Created at the first forward (needs the transformed weights).
         self._fused_moe: Optional[MiMoFusedMoE] = None
         self._fused_moe_checked = False
+        # goal11-dense: fused TP8 decode path of a dense-MLP layer (models/mimo_v2_dense_tp.py), created at the first forward
+        self._dense_tp = None
+        self._dense_tp_checked = False
 
     def _maybe_fused_moe(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Optional[torch.Tensor]:
+        out = self._maybe_fused_moe_run(hidden_states, forward_batch)
+        if out is None and getattr(hidden_states, "_blk_prepushed", False):
+            # goal11 blk: the attention block already pushed this partial into the MoE kernel's entry buffers
+            raise RuntimeError("MiMo blk: the attention block pushed its partial but the fused MoE path did not run")
+        return out
+
+    def _maybe_fused_moe_run(
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
@@ -968,6 +1023,26 @@ class MiMoV2DecoderLayer(nn.Module):
         out, residual_out = self._fused_moe.forward(hidden_states, residual)
         return finish_fused_moe(out, residual_out, forward_batch)
 
+    def _maybe_dense_tp(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Optional[torch.Tensor]:
+        """Dense-MLP layer (layer 0) decode at M <= 32 on TP8: attention all-reduce + add + norm + quant, the MLP and the
+        MLP all-reduce + NEXT layer's input norm + quant as 4 fused kernels + 2 GEMMs (models/mimo_v2_dense_tp.py);
+        ``hidden_states`` is this rank's o_proj partial. None -> the stage-boundary path."""
+        if not self._dense_tp_checked:
+            self._dense_tp_checked = True
+            from sglang.srt.models.mimo_v2_dense_tp import MiMoDenseTP
+
+            self._dense_tp = MiMoDenseTP.try_create(self)
+        if self._dense_tp is None:
+            return None
+        residual = fused_moe_stream_residual(forward_batch)
+        if not self._dense_tp.applicable(hidden_states, residual, forward_batch):
+            return None
+        return self._dense_tp.forward(hidden_states, residual, forward_batch)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -993,6 +1068,7 @@ class MiMoV2DecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                blk=self._blk_ready(forward_batch, positions.shape[0]),
             )
         else:
             # Self Attention
@@ -1007,12 +1083,17 @@ class MiMoV2DecoderLayer(nn.Module):
                     positions=positions,
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
+                    blk=self._blk_ready(forward_batch, hidden_states.shape[0]),
                 )
 
         if self.is_layer_sparse and mimo_fused_moe_enabled():
             fused = self._maybe_fused_moe(hidden_states, forward_batch)
             if fused is not None:
                 return fused
+        elif not self.is_layer_sparse and mimo_fused_moe_enabled():
+            dense = self._maybe_dense_tp(hidden_states, forward_batch)
+            if dense is not None:
+                return dense
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
@@ -1021,6 +1102,26 @@ class MiMoV2DecoderLayer(nn.Module):
         hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
         return hidden_states
+
+    def _blk_ready(self, forward_batch: ForwardBatch, m: int):
+        """goal11 blk: the fused SWA attention-block path of this layer for this forward (None = unfused attention)."""
+        if not self.is_layer_sparse and mimo_fused_moe_enabled() and not self.is_swa_layer():
+            # goal11 fa2: the dense-MLP full-attention layer (layer 0): fused tail with a local partial (the dense TP path reduces it)
+            from sglang.srt.layers.moe.mimo_fused_moe.fa_block import FaBlock
+
+            return FaBlock.ready(self, forward_batch, m)
+        if not (self.is_layer_sparse and mimo_fused_moe_enabled()) or self._fused_moe is None:
+            return None
+        if not self.is_swa_layer():
+            # goal11 fa2: full-attention layers -> the fused attention tail (SGLANG_MIMO_FA2=1), else blk's FA mode / unfused
+            from sglang.srt.layers.moe.mimo_fused_moe.fa_block import FaBlock
+
+            fb = FaBlock.ready(self, forward_batch, m)
+            if fb is not None:
+                return fb
+        from sglang.srt.layers.moe.mimo_fused_moe.attn_block import BlkLayer
+
+        return BlkLayer.ready(self, forward_batch, m)
 
     def is_moe_layer(self, layer_idx: int) -> bool:
         return (
@@ -1157,7 +1258,14 @@ class MiMoV2Model(nn.Module):
     ) -> Union[torch.Tensor, PPProxyTensors]:
         if self.pp_group.is_first_rank:
             if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
+                hidden_states = None
+                if mimo_fused_moe_enabled() and input_ids.dim() == 1 and input_ids.shape[0] <= 32:
+                    # goal11-dense: embedding + layer 0's input norm + fp8 quant in one kernel (norm-next handoff)
+                    from sglang.srt.models.mimo_v2_dense_tp import embed_norm_next
+
+                    hidden_states = embed_norm_next(self, input_ids, forward_batch)
+                if hidden_states is None:
+                    hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
             residual_batch.start(forward_batch)
@@ -1167,7 +1275,13 @@ class MiMoV2Model(nn.Module):
                 pp_proxy_tensors, forward_batch
             )
 
-        aux_hidden_states = AuxHiddenStatePacker(len(self.layers_to_capture))
+        aux_hidden_states = AuxHiddenStatePacker(
+            len(self.layers_to_capture),
+            # goal11-glue: verify-time captures of fixed buffers are packed in one launch (flush_aux_pending)
+            defer_stable=bool(self.layers_to_capture)
+            and forward_batch.forward_mode.is_target_verify()
+            and envs.SGLANG_DFLASH_AUX_DEFER.get(),
+        )
         if forward_batch.can_run_tbo and not self.layers_to_capture:
             tbo_start_layer = self.start_layer
             tbo_end_layer = self.end_layer
@@ -1202,10 +1316,19 @@ class MiMoV2Model(nn.Module):
         # A draft targeting the final layer ("after layer
         # num_hidden_layers-1") maps to capture index num_hidden_layers,
         # past the layer loop; capture the pre-norm output here instead.
-        if (
+        capture_final = (
             self.pp_group.is_last_rank
             and self.config.num_hidden_layers in self.layers_to_capture
-        ):
+        )
+        # goal11-dense: capture the updated residual from the fused add+norm of the final norm (bitwise the same
+        # bf16(out + residual) as the snapshot) instead of a separate add kernel
+        capture_in_norm = (
+            capture_final
+            and hidden_states.shape[0] > 0
+            and not forward_batch.return_hidden_states_before_norm
+            and envs.SGLANG_MIMO_FINAL_CAPTURE_IN_NORM.get()
+        )
+        if capture_final and not capture_in_norm:
             aux_hidden_states.append(
                 residual_batch.snapshot(hidden_states, forward_batch)
             )
@@ -1220,7 +1343,10 @@ class MiMoV2Model(nn.Module):
                         hidden_states, forward_batch
                     )
                 hidden_states = residual_batch.final_norm(
-                    hidden_states, forward_batch, self.norm
+                    hidden_states,
+                    forward_batch,
+                    self.norm,
+                    capture=aux_hidden_states.capture_stable if capture_in_norm else None,
                 )
 
         if len(aux_hidden_states) == 0:
@@ -1470,10 +1596,20 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         )
 
         aux_hidden_states = None
+        # goal11-dense: in decode / target verify the multimodal routine is a plain token embedding (multimodal features
+        # are only placed during extend); let the language model embed itself so the fused embedding + layer-0 input
+        # norm/quant (mimo_v2_dense_tp.embed_norm_next) can run.
+        mm_plain_decode = (
+            self._is_multimodal
+            and input_embeds is None
+            and (forward_batch.forward_mode.is_decode() or forward_batch.forward_mode.is_target_verify())
+            and getattr(forward_batch, "input_embeds", None) is None
+            and envs.SGLANG_MIMO_EMBED_NQ.get()
+        )
         # Multimodal embedding must run even when aux hidden states are captured
         # (DFLASH/MTP). Taking the capture branch first skipped image/audio
         # feature placement and left placeholder tokens as plain text embeddings.
-        if self._is_multimodal:
+        if self._is_multimodal and not mm_plain_decode:
             model_out = general_mm_embed_routine(
                 input_ids=input_ids,
                 forward_batch=forward_batch,
@@ -1496,7 +1632,16 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
             hidden_states, hidden_states_before_norm = model_out
 
         if self.pp_group.is_last_rank:
-            return self.logits_processor(
+            # goal11-glue: speculative workers may fork side-stream work on the finished aux captures here (it overlaps
+            # the LM head) and join it after the logits (dflash_worker_v2 SGLANG_DFLASH_MAT_IN_VERIFY)
+            pre_hooks = getattr(self, "dflash_pre_logits_hooks", None)
+            if pre_hooks and aux_hidden_states is not None:
+                for hook in pre_hooks:
+                    hook(aux_hidden_states, forward_batch)
+            if aux_hidden_states is not None and aux_has_pending(aux_hidden_states):
+                # deferred captures not consumed by a hook: pack them here (one launch)
+                flush_aux_pending(aux_hidden_states)
+            out = self.logits_processor(
                 input_ids,
                 hidden_states,
                 self.lm_head,
@@ -1504,6 +1649,11 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 hidden_states_before_norm=hidden_states_before_norm,
                 aux_hidden_states=aux_hidden_states,
             )
+            post_hooks = getattr(self, "dflash_post_logits_hooks", None)
+            if post_hooks:
+                for hook in post_hooks:
+                    hook(forward_batch)
+            return out
         else:
             return hidden_states
 

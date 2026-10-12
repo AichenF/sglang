@@ -501,6 +501,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._metadata_glue = (
             MetadataGlueGraph(self.device) if enable_metadata_glue else None
         )
+        # goal11-post (SGLANG_STEP_PREP_FUSED): DFlash-family replays record their padding-free full-path prep and run
+        # it as one launch (kernels/ops/speculative/step_prep.py); _sp_plan_sig marks a pre-planned replay whose
+        # input_ids / positions copies are still current (no other load_batch / replay since)
+        self._sp_ok = bool(model_runner.spec_algorithm.is_dflash_family())
+        self._sp_plan_sig = None
 
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
@@ -1358,8 +1363,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"{ragged_layout.graph_num_tokens}"
                 )
                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
-            self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            sp_sig, self._sp_plan_sig = self._sp_plan_sig, None
+            if sp_sig is None or sp_sig != self._sp_sig(forward_batch):
+                self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
+                self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
                 pp_proxy_tensors is not None
                 and self.buffers.pp_proxy_tensors is not None
@@ -1425,6 +1432,27 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             graph_size_key = self._capture_graph_size(
                 bs=bs, num_tokens=padded_num_tokens
             )
+
+        # goal11-post: open (or continue -- the DFlash worker may have deferred its prepare_block into it) the fused
+        # replay-prep window; anything recorded but not eligible here runs eagerly first
+        from sglang.kernels.ops.speculative import step_prep
+
+        step_prep.bump()
+        self._sp_plan_sig = None
+        sp_own = (
+            self._sp_ok
+            and step_prep.enabled()
+            and raw_bs == bs
+            and not is_ragged
+            and not self.enable_two_batch_overlap
+            and not self.enable_pdmux
+            and self._metadata_glue is None
+            and self.model_runner.lora_manager is None
+        )
+        if (step_prep.pending() or step_prep.is_recording()) and not sp_own:
+            step_prep.flush("load_batch (not eligible)")
+        if sp_own and not step_prep.is_recording():
+            step_prep.begin()
 
         self.buffer_registry.fill_from(
             forward_batch,
@@ -1510,10 +1538,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         else:
             attn_backend.init_forward_metadata_out_graph(fb_view)
+        if sp_own:
+            step_prep.flush("draft" if self.model_runner.is_draft_worker else "target")
 
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
         self.bs = bs
+        if sp_own:
+            self._sp_plan_sig = self._sp_sig(forward_batch)
         if is_ragged:
             self._ragged_graph_size = graph_size_key
 
@@ -1525,6 +1557,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
             graph_size_key, stream_idx, variant_label, attention_variant
+        )
+
+    def _sp_sig(self, forward_batch):
+        from sglang.kernels.ops.speculative import step_prep
+
+        ids, pos = forward_batch.input_ids, forward_batch.positions
+        if ids is None or pos is None:
+            return None
+        return (
+            ids.data_ptr(), ids.numel(), ids.dtype, pos.data_ptr(), pos.numel(), pos.dtype, self.raw_num_token,
+            step_prep.generation(),
         )
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:
@@ -1562,7 +1605,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)
 
+            from sglang.kernels.ops.speculative import step_prep
+
+            if step_prep.pending() or step_prep.is_recording():
+                step_prep.flush("execute")
+            self._sp_plan_sig = None
             output = self.backend.replay(self._replay_graph_key, forward_batch)
+            step_prep.bump()
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)

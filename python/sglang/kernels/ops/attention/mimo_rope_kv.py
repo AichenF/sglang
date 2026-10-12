@@ -51,6 +51,9 @@ def _rope_kv(
     HEADS: tl.constexpr,
     ROWS: tl.constexpr,
 ):
+    # Let a PDL-launched successor (the full-attention verify kernel) start its prologue now: it waits
+    # (griddepcontrol.wait) before touching anything this kernel writes. No-op for non-PDL successors.
+    tl.extra.cuda.gdc_launch_dependents()
     token = tl.program_id(0)
     group = tl.program_id(1)
     pos = tl.load(POS + token)

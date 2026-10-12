@@ -512,12 +512,78 @@ class VocabParallelEmbedding(torch.nn.Module):
         output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         return output_parallel
 
+    def _fused_embed_state(self, input_):
+        """goal11-dense: TP8 decode (<= 32 ids) -> one kernel where the owner rank of each row pushes it to every
+        peer over CUDA IPC (dflash_tp_fused.embed) instead of the zero-padded local gather + all-reduce."""
+        st = getattr(self, "_fused_embed", None)
+        if st is False:
+            return None
+        if st is None:
+            st = False
+            try:
+                from sglang.srt.environ import envs
+
+                if (
+                    envs.SGLANG_DFLASH_TP_EMBED.get()
+                    and self.tp_size == 8
+                    and not self.use_attn_tp_group
+                    and self.embedding_dim == 6144
+                    and self.weight.dtype == torch.bfloat16
+                    and self.weight.dim() == 2
+                    and self.weight.is_contiguous()
+                    and self.output_dtype is None
+                    and self.shard_indices.added_vocab_start_index
+                    == self.shard_indices.added_vocab_end_index
+                    and type(self.quant_method).__name__ == "UnquantizedEmbeddingMethod"
+                ):
+                    from sglang.kernels.ops.communication.dflash_tp_fused import get_state
+
+                    state = get_state()
+                    if state is not None:
+                        starts, ends = [], []
+                        for r in range(self.tp_size):
+                            si = self._get_indices(
+                                self.num_embeddings_padded,
+                                self.org_vocab_size_padded,
+                                self.num_embeddings,
+                                self.org_vocab_size,
+                                r,
+                                self.tp_size,
+                            )
+                            starts.append(si.org_vocab_start_index)
+                            ends.append(si.org_vocab_end_index)
+                        self._fused_embed_ranges = torch.tensor(starts + ends, dtype=torch.int64)
+                        st = state
+            except Exception:
+                st = False
+            self._fused_embed = st
+        if st is False:
+            return None
+        if (
+            input_.dim() not in (1, 2)
+            or not (1 <= input_.numel() <= 32)
+            or input_.dtype not in (torch.int32, torch.int64)
+            or not input_.is_contiguous()
+            or get_attn_tp_context().input_scattered
+        ):
+            return None
+        return st
+
     def forward(self, input_):
         # Surface a bad token id (>= vocab_size, or a negative / unmasked sentinel) as a
         # located async assert instead of a silent OOB embedding gather (tp=1 does not mask).
         maybe_detect_oob(
             input_, 0, self.num_embeddings, "VocabParallelEmbedding input id"
         )
+        if self.tp_size > 1:
+            st = self._fused_embed_state(input_)
+            if st is not None:
+                ids = input_.reshape(-1)
+                out = torch.empty(
+                    ids.shape[0], self.embedding_dim, dtype=self.weight.dtype, device=input_.device
+                )
+                st.embed(ids, self.weight, out, self._fused_embed_ranges)
+                return out.view(*input_.shape, self.embedding_dim)
         output_parallel = self._embed_local_shard(input_)
         if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
             if self.use_attn_tp_group:

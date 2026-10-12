@@ -109,6 +109,12 @@ class DFlashVerifyInput(SpecInput):
                 verify_forward_batch
             )
         )
+        if not can_run_cuda_graph or _is_npu:
+            # goal11-post: a recorded (deferred) replay-prep op must run before any eager path reads it
+            from sglang.kernels.ops.speculative import step_prep
+
+            if step_prep.pending() or step_prep.is_recording():
+                step_prep.flush("verify (eager prep)")
         if _is_npu:
             # Do not pre-plan target verify on NPU. DP/EP padding can change
             # the compressor's logical batch without changing ForwardBatch's

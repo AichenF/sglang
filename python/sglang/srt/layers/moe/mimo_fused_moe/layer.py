@@ -53,6 +53,18 @@ _shared: Optional[_SharedRankState] = None
 # FMOE_NVCC_FLAGS=-DFMOE_PHASE_STAMPS. Creating <dir>/dump.<n> makes every rank write
 # <dir>/stamps_rank<r>_<n>.pt = {layer_id: int64 [MAXM, grid * NSTAMP]} (last replay per layer and token count M, row M-1).
 _STAMP_DIR = os.environ.get("SGLANG_MIMO_FUSED_MOE_STAMP_DIR", "")
+# goal11 layer (FMOE_PDL_ENTRY builds): a prepushed launch (the attention kernel already pushed the reduce-scatter messages) is PDL-launched
+# (mode bit 29): the MoE CTAs land as the attention kernel's CTAs exit and run their entry code while that grid drains, then
+# griddepcontrol.wait. SGLANG_MIMO_MOE_PDL=0 disables it.
+_PDL_ENTRY = [None]
+
+
+def _pdl_entry_bit() -> int:
+    if _PDL_ENTRY[0] is None:
+        _PDL_ENTRY[0] = (1 << 29) if (os.environ.get("SGLANG_MIMO_MOE_PDL", "1") == "1" and bool(getattr(F.ext(), "PDL_ENTRY", 0))) else 0
+        if _PDL_ENTRY[0]:
+            logger.info("MiMo fused MoE: prepushed launches are PDL-launched (FMOE_PDL_ENTRY)")
+    return _PDL_ENTRY[0]
 _STAMP_GRID = 132
 _stamp_layers: List[Any] = []
 _stamp_thread: Optional[threading.Thread] = None
@@ -250,7 +262,13 @@ def take_norm_next_handoff(handoff, hidden_states, forward_batch, capture_gather
     if capture_gathered is not None:
         # the residual the skipped prepare would have written and captured (aux hidden state for DFLASH); the buffer is
         # rewritten every step, so the accumulator copies it.
-        capture_gathered.capture(handoff.residual_new, owned=False)
+        # goal11-glue: residual_new is a fixed buffer only this handoff's producer rewrites (next forward) -> the packer
+        # may defer the copy (capture_stable) and pack every deferred capture in one launch
+        cap = getattr(capture_gathered, "capture_stable", None)
+        if cap is not None:
+            cap(handoff.residual_new)
+        else:
+            capture_gathered.capture(handoff.residual_new, owned=False)
     return handoff.x_fp8, handoff.x_scale
 
 
@@ -377,9 +395,26 @@ class MiMoFusedMoE:
         # SGLANG_MIMO_FUSED_MOE_PREFETCH_HINT = comma list of {qkv, o}: those ranges are prefetched with an L2::evict_last hint (the o_proj
         # weight is read ~30 us later, after the qkv weight stream and attention have passed through L2).
         self.pf = None
-        pf_mode = os.environ.get("SGLANG_MIMO_FUSED_MOE_PREFETCH", "o")
-        pf_hint = os.environ.get("SGLANG_MIMO_FUSED_MOE_PREFETCH_HINT", "o")
         nxt = getattr(decoder_layer, "_mimo_next_layer", None)
+        # goal11 mega: when the next layer runs the attention megakernel (SWA layer), its CTAs preload the qkv weights into smem under this
+        # kernel's tail instead (SGLANG_MIMO_MEGA_QPRE) and stream o_proj from HBM later -> no o_proj tail prefetch there by default
+        # (E2E g11m_m7_spnopf: 10.626 vs 10.884 ms with both in the tail). Same before full-attention layers when their qkv_proj runs
+        # through the megakernel's GEMM (SGLANG_MIMO_MEGA_FA, also preloaded): FA period 190.7 vs 192.6 us with the o_proj prefetch kept.
+        pf_default = "o"
+        try:
+            from sglang.srt.layers.moe.mimo_fused_moe.attn_block import mega_enabled, mega_fa_enabled
+
+            if (
+                mega_enabled()
+                and nxt is not None
+                and int(os.environ.get("SGLANG_MIMO_MEGA_QPRE", "16")) > 0
+                and (nxt.is_swa_layer() or mega_fa_enabled())
+            ):
+                pf_default = ""
+        except Exception:
+            pass
+        pf_mode = os.environ.get("SGLANG_MIMO_FUSED_MOE_PREFETCH", pf_default)
+        pf_hint = os.environ.get("SGLANG_MIMO_FUSED_MOE_PREFETCH_HINT", "o")
         if pf_mode and nxt is not None and getattr(F.ext(), "TAIL_PREFETCH", 0):
             attn = getattr(nxt, "self_attn", None)
             ranges: List[Any] = []
@@ -676,6 +711,8 @@ class MiMoFusedMoE:
                 router_w_bf16=self.router_w,
                 bias=self.bias,
             )
+            # goal11 blk: the attention-block kernel already pushed the reduce-scatter messages of this launch (mode bit 30)
+            prepushed = getattr(hidden_states, "_blk_prepushed", False)
             F.run_fused_full_tp(
                 self.shared.state,
                 inp,
@@ -688,6 +725,8 @@ class MiMoFusedMoE:
                 dbg=None if self.dbg is None else self.dbg[31],
                 norm_next=self.norm_next,
                 pf=self.pf,
+                # mode bit 30: prepushed entry; bit 29: PDL launch of a prepushed launch (FMOE_PDL_ENTRY)
+                mode=((1 << 30) | _pdl_entry_bit()) if prepushed else 0,
             )
             if self.cap is not None:
                 ids, _ = self.shared.state.kernel_topk(32)
