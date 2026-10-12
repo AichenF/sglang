@@ -112,6 +112,14 @@ def build_trtllm_mha_page_table(
     cuda-graph path can reuse its pre-allocated tensors. SWA is enabled iff
     ``full_to_swa`` is provided, which then also requires ``swa_page_table``.
     """
+    from sglang.kernels.ops.speculative import step_prep
+
+    if step_prep.is_recording():  # goal11-post: fused replay prep (step_prep.py)
+        step_prep.record(
+            "pt", req_to_token=req_to_token, req_pool_indices=req_pool_indices, cache_seqlens=cache_seqlens,
+            page_table=page_table, page_size=page_size, swa_page_table=swa_page_table, full_to_swa=full_to_swa,
+        )
+        return
     has_swa = full_to_swa is not None
     assert has_swa == (swa_page_table is not None), (
         "full_to_swa and swa_page_table must be provided together"

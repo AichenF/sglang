@@ -144,6 +144,8 @@ class RelayPayload:
     # ngram delays the draft extend (ngram update)
     accept_tokens: Optional[torch.Tensor] = None
     accept_lens: Optional[torch.Tensor] = None
+    # goal11-glue: bonus_tokens were already written to output_tokens_buf[indices] by the producing kernel
+    bonus_prestashed: bool = False
 
     @classmethod
     def from_ngram(cls, draft_input: NgramVerifyInput) -> RelayPayload:
@@ -164,6 +166,7 @@ class RelayPayload:
             hidden_states=draft_input.hidden_states,
             draft_probs=getattr(draft_input, "draft_probs", None),
             dsa_topk_indices=draft_input.dsa_topk_indices,
+            bonus_prestashed=bool(getattr(draft_input, "bonus_prestashed", False)),
         )
 
 
@@ -445,6 +448,11 @@ class FutureMap:
                 draft_input.hidden_states = hidden_states
             if self.draft_probs_buf is not None and draft_input.draft_probs is not None:
                 draft_input.draft_probs = self.draft_probs_buf[indices]
+        elif getattr(draft_input, "defer_bonus_gather", False) and not _DEBUG_ASSERT:
+            # goal11-post: the DFlash worker folds this gather into its fused draft prep (step_prep); it reads
+            # draft_input.bonus_gather instead (and gathers itself on any other path)
+            draft_input.bonus_tokens = None
+            draft_input.bonus_gather = (self.output_tokens_buf, indices)
         else:
             draft_input.bonus_tokens = self.output_tokens_buf[indices]
         if self.need_hidden_states and not self.need_topk:
@@ -573,11 +581,15 @@ class FutureMap:
         future_indices: torch.Tensor,
         new_seq_lens: torch.Tensor,
         confidence: Optional[torch.Tensor] = None,
+        prewritten: bool = False,
     ) -> None:
         indices = future_indices
         if indices.shape[0] == 0:
             return  # DP idle
-        self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
+        if not prewritten:
+            # goal11-glue: prewritten = the worker's accept kernel already scattered new_seq_lens into
+            # new_seq_lens_buf[indices] on this stream (dflash compute_dflash_accept_bonus_publish)
+            self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
         publish_confidence = self.needs_confidence_relay and confidence is not None
         if publish_confidence:
             self.confidence_relay.scatter(indices, confidence)
@@ -605,9 +617,10 @@ class FutureMap:
             return
         self._maybe_init_forward_bufs(payload)
         self._maybe_init_dsa_topk_indices_buf(payload)
-        self.output_tokens_buf[indices] = payload.bonus_tokens.to(
-            self.output_tokens_buf.dtype
-        )
+        if not payload.bonus_prestashed:
+            self.output_tokens_buf[indices] = payload.bonus_tokens.to(
+                self.output_tokens_buf.dtype
+            )
         if self.need_topk:
             self.topk_p_buf[indices] = payload.topk_p.to(self.topk_p_buf.dtype)
             self.topk_index_buf[indices] = payload.topk_index.to(

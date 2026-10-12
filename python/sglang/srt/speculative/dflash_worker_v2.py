@@ -4,13 +4,16 @@ import os
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+import triton
 import torch.distributed as dist
 
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func,
     rebuild_compact_draft_req_to_token_func,
 )
+from sglang.kernels.ops.speculative import step_prep
 from sglang.kernels.ops.speculative.dflash import (
+    compute_dflash_accept_bonus_publish,
     _compute_dflash_accept_bonus_triton_unchecked,
     _prepare_dflash_draft_block_unchecked,
 )
@@ -230,6 +233,22 @@ class _DflashDraftSampler:
     def __call__(self, hidden_states, input_ids=None):
         # draft tokens are block positions 1: (pos 0 is the seeded bonus token)
         bs = hidden_states.shape[0] // self.block_size
+        fused = getattr(self.head, "_fused", None) if self.head is not None else None
+        if (
+            fused is not None
+            and self.block_size > 1
+            and hidden_states.dim() == 2
+            and hidden_states.shape[0] == bs * self.block_size
+            and bs * (self.block_size - 1) <= 32
+            and envs.SGLANG_DFLASH_SAMPLER_NO_SLICE.get()
+        ):
+            # goal11-dense: the LM head on every block row (same weight traffic, no [:, 1:] gather copy) and the
+            # fused IPC argmax skips block position 0 through a row map.
+            hs = hidden_states
+            if hs.dtype != self.weight.dtype:
+                hs = hs.to(self.weight.dtype)
+            fused.argmax(self._logits(hs), self.out, self.org_vocab_start, group=self.block_size)
+            return
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :].reshape(
             -1, hidden_states.shape[-1]
         )
@@ -647,6 +666,389 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._embed_in_graph = False
         self._init_vocab_parallel_fast_paths()
         self._init_embed_in_graph()
+        self._mat_enabled = False
+        self._init_mat_in_verify()
+        self._graph_tokens_buf = None
+        self._tokens_graph_bs = set()
+        self._fused_publish_enabled = bool(envs.SGLANG_DFLASH_FUSED_PUBLISH.get()) and is_cuda() and not _is_npu
+        self._fused_publish_target = None
+        self._fused_publish_done = False
+
+    # ------------------------------------------------------------------
+    # goal11-glue: draft-KV materialization inside the target verify forward
+    # ------------------------------------------------------------------
+    def _init_mat_in_verify(self) -> None:
+        """Fork the draft-KV materialization onto a side stream inside the target verify forward (overlaps the LM
+        head). See SGLANG_DFLASH_MAT_IN_VERIFY in environ.py."""
+        if not envs.SGLANG_DFLASH_MAT_IN_VERIFY.get():
+            return
+        reason = None
+        target_model = self._target_worker.model_runner.model
+        if not is_cuda() or _is_npu:
+            reason = "not cuda"
+        elif self.draft_owns_attention:
+            reason = "dp attention"
+        elif self.use_compact_draft_cache:
+            reason = "compact draft cache"
+        elif self.lilicorr is not None or self.selector is not None or self._is_domino:
+            reason = "selector/lilicorr/domino draft"
+        elif self._fused_kv_helper is None or not self._use_fused_kv_materialize:
+            reason = "no fused KV helper"
+        elif getattr(self._fused_kv_helper, "max_position_hint", None) is None:
+            reason = "no rope position hint"
+        else:
+            from sglang.srt.models.mimo_v2 import MiMoV2ForCausalLM
+
+            # only MiMoV2ForCausalLM.forward runs dflash_pre/post_logits_hooks
+            if not isinstance(target_model, MiMoV2ForCausalLM):
+                reason = f"target model {type(target_model).__name__} has no pre-logits hook"
+        if reason is not None:
+            if get_parallel().tp_rank == 0:
+                logger.info("DFLASH materialize-in-verify disabled: %s", reason)
+            return
+        self._mat_max_tokens = int(envs.SGLANG_DFLASH_MAT_MAX_TOKENS.get())
+        try:
+            cap_bs = max(get_exec().graph.cuda_graph_config.decode.bs)
+        except Exception:
+            cap_bs = 0
+        cap_bs = max(cap_bs, self._mat_max_tokens // max(int(self.block_size), 1), 1)
+        # constant "commit every block row" lengths for the prefix-valid writer
+        self._mat_full_commit = torch.full(
+            (cap_bs,), int(self.block_size), dtype=torch.int32, device=self.device
+        )
+        self._mat_stream = torch.cuda.Stream(device=self.device)
+        self._mat_pending = False
+        self._mat_req = None
+        self._mat_ag_event = None
+        self._mat_keepalive = []
+        self._mat_graph_bs = set()
+        self._mat_logged = False
+        if not hasattr(target_model, "dflash_pre_logits_hooks"):
+            target_model.dflash_pre_logits_hooks = []
+        if not hasattr(target_model, "dflash_post_logits_hooks"):
+            target_model.dflash_post_logits_hooks = []
+        target_model.dflash_pre_logits_hooks.append(self._mat_fork_hook)
+        target_model.dflash_post_logits_hooks.append(self._mat_join_hook)
+        # in a captured graph, join after the tail hooks (vocab-parallel argmax) so the side chain also overlaps it
+        self._target_worker.model_runner.capture_tail_hooks.insert(0, self._mat_pre_argmax_hook)
+        self._target_worker.model_runner.capture_tail_hooks.append(self._mat_tail_join_hook)
+        self._mat_enabled = True
+        if get_parallel().tp_rank == 0:
+            logger.info(
+                "DFLASH materialize-in-verify enabled (side stream under the target LM head, <= %d tokens).",
+                self._mat_max_tokens,
+            )
+
+    def _mat_fork_hook(self, aux_hidden_states, forward_batch) -> None:
+        if not self._mat_enabled or not forward_batch.forward_mode.is_target_verify():
+            return
+        spec_info = getattr(forward_batch, "spec_info", None)
+        if not isinstance(spec_info, DFlashVerifyInput) or spec_info.ragged_verify_layout is not None:
+            return
+        block = int(self.block_size)
+        bs = int(forward_batch.batch_size)
+        n = int(aux_hidden_states.shape[0])
+        if n == 0 or n != bs * block or n > self._mat_max_tokens or aux_hidden_states.ndim != 2:
+            return
+        out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+        positions = forward_batch.positions
+        if out_cache_loc is None or positions is None or out_cache_loc.numel() < n or positions.numel() < n:
+            return
+        if bs > int(self._mat_full_commit.shape[0]):
+            return
+        # Only mark the fork point here: the side work is launched by the post-logits hook, i.e. AFTER the LM head
+        # (in a captured graph the earlier-created branch is launched first; the fc GEMM's 132 CTAs would otherwise
+        # take every SM and delay the LM head's 100 CTAs).
+        # deferred aux captures (SGLANG_DFLASH_AUX_DEFER) are packed HERE on the main stream (one ~1.5-us launch with
+        # the whole GPU): on the side stream under the LM head the 960-CTA pack starved for SMs (15 us, g11g_g7prof_ma)
+        # and delayed the fc
+        pend = getattr(aux_hidden_states, "_aux_pending", None)
+        aux_hidden_states._aux_pending = None
+        if pend:
+            from sglang.kernels.ops.speculative.aux_pack import aux_pack
+
+            aux_pack(aux_hidden_states, pend)
+        ev = torch.cuda.Event()
+        ev.record(torch.cuda.current_stream())
+        self._mat_req = (ev, aux_hidden_states, forward_batch, bs, n, positions, out_cache_loc, None)
+        if envs.SGLANG_DFLASH_MAT_EARLY_FORK.get():
+            # goal11-post: launch the side chain BEFORE the LM head: the fc gets the whole GPU first (~14 us), then the
+            # LM head streams alone while ag_norm / K/V GEMM / norm-RoPE / KV write run on the SMs it leaves free
+            self._mat_launch()
+
+    def _mat_launch(self) -> None:
+        ev, aux_hidden_states, forward_batch, bs, n, positions, out_cache_loc, pend = self._mat_req
+        self._mat_req = None
+        block = int(self.block_size)
+        side = self._mat_stream
+        side.wait_event(ev)
+        with torch.cuda.stream(side), draft_tp_context(self.draft_owns_attention):
+            if pend:
+                from sglang.kernels.ops.speculative.aux_pack import aux_pack
+
+                aux_pack(aux_hidden_states, pend)
+                self._mat_keepalive.extend(src for _, src in pend)
+            ctx_hidden = self._project_target_hidden(aux_hidden_states)
+            # the fc all-gather (ag_norm) is a spinning cross-rank collective: the main stream's vocab-parallel argmax
+            # (another one) waits for it, so the two never run concurrently (concurrent spinning collectives on two
+            # streams can deadlock across ranks once blocked CTAs hold the SMs -- seen as a hang in g11g_g3prof)
+            self._mat_ag_event = torch.cuda.Event()
+            self._mat_ag_event.record(side)
+            self._mat_write_kv(
+                ctx_hidden=ctx_hidden,
+                positions=positions[:n],
+                loc_2d=out_cache_loc[:n].view(bs, block),
+                commit_lens=self._mat_full_commit[:bs],
+            )
+        self._mat_keepalive.append(aux_hidden_states)
+        self._mat_pending = True
+        if torch.cuda.is_current_stream_capturing():
+            self._mat_graph_bs.add(bs)
+        else:
+            forward_batch._dflash_kv_materialized = True
+        if not self._mat_logged and get_parallel().tp_rank == 0:
+            self._mat_logged = True
+            logger.info("DFLASH materialize-in-verify: first fork (bs=%d, tokens=%d).", bs, n)
+
+    def _mat_join(self) -> None:
+        if self._mat_pending:
+            torch.cuda.current_stream().wait_stream(self._mat_stream)
+            self._mat_pending = False
+            self._mat_ag_event = None
+            self._mat_keepalive.clear()
+
+    def _mat_join_hook(self, forward_batch) -> None:
+        # post-logits: launch the side chain (it waits on the pre-LM-head fork event); eager forwards (and graph
+        # warmups) join right away, under capture the tail hook joins after the vocab-parallel argmax
+        if self._mat_req is not None:
+            self._mat_launch()
+        if self._mat_pending and not torch.cuda.is_current_stream_capturing():
+            self._mat_join()
+
+    def _mat_tail_join_hook(self, runner, out, forward_batch, num_tokens) -> None:
+        del runner, out, forward_batch, num_tokens
+        self._mat_join()
+
+    def _mat_pre_argmax_hook(self, runner, out, forward_batch, num_tokens) -> None:
+        # first capture tail hook (before the in-graph vocab-parallel argmax): order it after the side chain's ag_norm
+        del runner, out, forward_batch, num_tokens
+        if self._mat_pending and self._mat_ag_event is not None:
+            torch.cuda.current_stream().wait_event(self._mat_ag_event)
+            self._mat_ag_event = None
+
+    def _mat_write_kv(self, *, ctx_hidden, positions, loc_2d, commit_lens) -> None:
+        """FusedKVMaterializeHelper.materialize with fresh (graph-pool) outputs instead of the helper's growable
+        workspaces (a later eager prefill may reallocate those, which a captured graph must never see)."""
+        from sglang.kernels.ops.speculative.fused_kv_materialize import _fused_norm_rope_stacked
+
+        h = self._fused_kv_helper
+        n = int(ctx_hidden.shape[0])
+        if positions.dtype != torch.int64:
+            positions = positions.to(torch.int64)
+        if ctx_hidden.dtype != h.flat_kv_weight_t.dtype:
+            ctx_hidden = ctx_hidden.to(h.flat_kv_weight_t.dtype)
+        cos_sin_cache = h._ensure_rope_cache(h.max_position_hint)
+        proj = torch.mm(ctx_hidden, h.flat_kv_weight_t)
+        if envs.SGLANG_DFLASH_MAT_FUSED_KV_WRITE.get():
+            # goal11-post: k-norm/RoPE/v-scale + the KV write of every draft layer in one launch (full commit only)
+            pool = self.draft_model_runner.token_to_kv_pool
+            attns = [layer.self_attn.attn for layer in self.draft_model.layers]
+            tables = _kv_write_tables(pool, attns, h.n_layers, h.num_kv_heads, h.head_dim, ctx_hidden.dtype)
+            full_commit = commit_lens.data_ptr() == self._mat_full_commit.data_ptr()  # every block row is written
+            if tables is not None and full_commit and positions.dtype == torch.int64:
+                from sglang.kernels.ops.speculative.mat_kv_write import norm_rope_kv_write
+
+                norm_rope_kv_write(
+                    proj.view(n, h.n_layers, h.layer_out_dim), h.k_norm_weights, h.eps_values, cos_sin_cache, positions,
+                    loc_2d.reshape(-1).to(torch.int64), tables[0], tables[1], tables[2], h.num_kv_heads, h.head_dim,
+                    h.rotary_dim, v_scale=h.v_scale_values,
+                )
+                return
+        k_out = torch.empty(
+            (h.n_layers, n, h.num_kv_heads, h.head_dim), dtype=ctx_hidden.dtype, device=ctx_hidden.device
+        )
+        v_out = torch.empty_like(k_out)
+        cache_k, cache_v = _fused_norm_rope_stacked(
+            proj.view(n, h.n_layers, h.layer_out_dim),
+            h.k_norm_weights,
+            h.eps_values,
+            cos_sin_cache,
+            positions,
+            h.num_kv_heads,
+            h.head_dim,
+            h.rotary_dim,
+            k_out=k_out,
+            v_out=v_out,
+            v_scale=h.v_scale_values,
+        )
+        pool = self.draft_model_runner.token_to_kv_pool
+        attns = [layer.self_attn.attn for layer in self.draft_model.layers]
+        if envs.SGLANG_DFLASH_KV_WRITE_ALL.get() and _commit_all_layers_kv(
+            pool, attns, loc_2d, commit_lens, cache_k, cache_v
+        ):
+            return
+        for i, attn in enumerate(attns):
+            pool.set_kv_buffer_prefix_valid(
+                attn, loc_2d, commit_lens, cache_k[i], cache_v[i], attn.k_scale, attn.v_scale
+            )
+
+    def _fused_publish_target_for(self, on_publish, bs: int):
+        """(FutureMap, future_indices) when the scheduler's on_publish is FutureMap.publish bound to this batch's
+        future indices (overlap spec-v2) and the fused accept+relay kernel applies, else None."""
+        if not self._fused_publish_enabled or on_publish is None or SIMULATE_ACC_LEN > 0:
+            return None
+        func = getattr(on_publish, "func", None)
+        fm = getattr(func, "__self__", None)
+        args = getattr(on_publish, "args", ())
+        if (
+            fm is None
+            or getattr(func, "__name__", "") != "publish"
+            or len(args) != 1
+            or getattr(on_publish, "keywords", None)
+            or getattr(fm, "needs_confidence_relay", False)
+            or getattr(fm, "spec_algo", None) is None
+            or fm.spec_algo.is_ngram()
+        ):
+            return None
+        idx = args[0]
+        nsl = getattr(fm, "new_seq_lens_buf", None)
+        otb = getattr(fm, "output_tokens_buf", None)
+        if (
+            not isinstance(idx, torch.Tensor)
+            or idx.ndim != 1
+            or int(idx.shape[0]) != bs
+            or nsl is None
+            or otb is None
+            or nsl.device != idx.device
+        ):
+            return None
+        return (fm, idx)
+
+    def _draft_tokens_capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
+        del runner, out
+        buf = self._graph_tokens_buf
+        block = int(self.block_size)
+        if buf is None or self._draft_sampler is None or num_tokens % block != 0:
+            return
+        bs = num_tokens // block
+        if bs > int(buf.shape[0]):
+            return
+        ids = forward_batch.input_ids[:num_tokens].view(bs, block)
+        toks = buf[:bs]
+        toks[:, 0].copy_(ids[:, 0])
+        toks[:, 1:].copy_(self._draft_sampler.out[: bs * (block - 1)].view(bs, block - 1))
+        if torch.cuda.is_current_stream_capturing():
+            self._tokens_graph_bs.add(bs)
+
+    def _step_prep_defer_ok(self) -> bool:
+        return (
+            step_prep.enabled()
+            and self._use_triton_prepare_block
+            and bool(self._embed_in_graph)
+            and not self.use_compact_draft_cache
+        )
+
+    def _step_prep_bs_ok(self, bs: int) -> bool:
+        """goal11-post: open a fused-prep window only for a padding-free graph replay of both runners (anything else
+        would only replay the recorded ops eagerly, paying the recording's host time for nothing)."""
+        cache = getattr(self, "_sp_bs_cache", None)
+        if cache is None:
+            cache = self._sp_bs_cache = {}
+        ok = cache.get(bs)
+        if ok is None:
+            ok = True
+            for mr in (self.draft_model_runner, self._target_worker.model_runner):
+                r = getattr(mr, "decode_cuda_graph_runner", None)
+                if r is None or bs not in set(getattr(r, "capture_bs", []) or []):
+                    ok = False
+            cache[bs] = ok
+        return ok
+
+    def _prepare_verify_forward(
+        self, *, batch, draft_tokens, positions, verify_out_cache_loc, draft_input, block_size
+    ):
+        """Target-verify ForwardBatch + graph replay prep (input copies, attention metadata). Returns
+        (verify_forward_batch, verify_decode_graph, seq_lens_pre_verify)."""
+        # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
+        verify_input = DFlashVerifyInput(
+            draft_token=draft_tokens.reshape(-1),
+            positions=positions,
+            draft_token_num=int(self.block_size),
+            custom_mask=None,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        )
+
+        batch.out_cache_loc = verify_out_cache_loc
+
+        seq_lens_pre_verify = (
+            batch.seq_lens.clone() if self._need_mamba_verify_commit else None
+        )
+        seq_lens_cpu_backup = batch.seq_lens_cpu
+        seq_lens_sum_backup = batch.seq_lens_sum
+        if seq_lens_cpu_backup is not None:
+            # Verify host bound = committed prefix + one verify block (matches draft).
+            verify_host_seq_lens = seq_lens_cpu_backup + block_size
+            batch.seq_lens_cpu = verify_host_seq_lens
+            batch.seq_lens_sum = int(verify_host_seq_lens.sum())
+        elif draft_input.nxt_kv_lens_cpu is not None:
+            batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
+            batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
+
+        verify_forward_batch, verify_decode_graph = verify_input.prepare_for_verify(
+            batch, self.target_worker
+        )
+        batch.seq_lens_cpu = seq_lens_cpu_backup
+        batch.seq_lens_sum = seq_lens_sum_backup
+        if self._target_greedy_head is not None:
+            # Eager (non-graph) verify forwards emit the logits shard as well.
+            verify_forward_batch.skip_tp_logits_gather = True
+        return verify_forward_batch, verify_decode_graph, seq_lens_pre_verify
+
+    def _mat_snapshot_rows(self, loc_2d):
+        pool = self.draft_model_runner.token_to_kv_pool
+        loc = loc_2d.to(torch.int64)
+        rows = []
+        for layer in self.draft_model.layers:
+            lid = layer.self_attn.attn.layer_id - getattr(pool, "start_layer", 0)
+            rows.append((pool.k_buffer[lid][loc].clone(), pool.v_buffer[lid][loc].clone()))
+        return rows
+
+    def _mat_check_rows(self, before, loc_2d, commit_lens) -> None:
+        """SGLANG_DFLASH_MAT_CHECK: the side-stream rows (before) vs the eager materialization's rows (after) on the
+        accepted prefix of every draft layer; logs mismatching rows + max |diff| (host sync, debug only)."""
+        after = self._mat_snapshot_rows(loc_2d)
+        block = int(loc_2d.shape[1])
+        valid = torch.arange(block, device=loc_2d.device)[None, :] < commit_lens.to(torch.int64)[:, None]
+        bad = 0
+        maxdiff = 0.0
+        for (kb, vb), (ka, va) in zip(before, after):
+            for x, y in ((kb, ka), (vb, va)):
+                ne = (x != y).reshape(x.shape[0], x.shape[1], -1).any(-1) & valid
+                bad += int(ne.sum().item())
+                d = (x.float() - y.float()).abs().reshape(x.shape[0], x.shape[1], -1).amax(-1)
+                maxdiff = max(maxdiff, float(torch.where(valid, d, torch.zeros_like(d)).max().item()))
+        self._mat_check_n = getattr(self, "_mat_check_n", 0) + 1
+        self._mat_check_bad = getattr(self, "_mat_check_bad", 0) + bad
+        if bad or self._mat_check_n <= 3 or self._mat_check_n % 200 == 0:
+            logger.info(
+                "DFLASH MAT_CHECK rank%d step %d: %d mismatching rows (total %d), max|diff| %.3g, rows %d",
+                get_parallel().tp_rank,
+                self._mat_check_n,
+                bad,
+                self._mat_check_bad,
+                maxdiff,
+                int(valid.sum().item()) * 2 * len(before),
+            )
+
+    def _mat_done_for_verify(self, verify_forward_batch, graph_prepared: bool, ran_graph: bool) -> bool:
+        if not self._mat_enabled:
+            return False
+        if getattr(verify_forward_batch, "_dflash_kv_materialized", False):
+            return True
+        if graph_prepared and ran_graph:
+            runner = self._target_worker.model_runner.decode_cuda_graph_runner
+            return getattr(runner, "bs", None) in self._mat_graph_bs
+        return False
 
     @property
     def draft_worker(self):
@@ -746,6 +1148,21 @@ class DFlashWorkerV2(BaseSpecWorker):
                     self.draft_model_runner.capture_tail_hooks.append(
                         make_draft_sampler_capture_hook(self._draft_sampler)
                     )
+                    if envs.SGLANG_DFLASH_TOKENS_IN_GRAPH.get() and not self._is_domino:
+                        # goal11-glue: the verify candidates [bonus, draft tokens] are assembled inside the draft graph
+                        # (2 eager copies fewer per step) into a fixed buffer sized for the largest graph
+                        try:
+                            cap_bs = max(get_exec().graph.cuda_graph_config.decode.bs)
+                        except Exception:
+                            cap_bs = 0
+                        if cap_bs > 0:
+                            self._graph_tokens_buf = torch.empty(
+                                (cap_bs, int(self.block_size)), dtype=torch.long, device=self.device
+                            )
+                            # goal11-post: with SGLANG_STEP_PREP_FUSED the candidates are assembled by the verify's fused
+                            # replay prep instead (it reads the bonus column + the sampler output directly)
+                            if not step_prep.enabled():
+                                self.draft_model_runner.capture_tail_hooks.append(self._draft_tokens_capture_hook)
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
@@ -2131,10 +2548,24 @@ class DFlashWorkerV2(BaseSpecWorker):
                     attn.v_scale,
                 )
 
+        def _write_all_layers_kv(cache_k: torch.Tensor, cache_v: torch.Tensor) -> bool:
+            # goal11-dense: the per-layer prefix-valid commits as ONE launch (plain bf16 3-D MHA pool only)
+            if ctx_cache_loc_2d is None or commit_lens is None or not envs.SGLANG_DFLASH_KV_WRITE_ALL.get():
+                return False
+            return _commit_all_layers_kv(
+                token_to_kv_pool,
+                [layer.self_attn.attn for layer in self.draft_model.layers],
+                ctx_cache_loc_2d,
+                commit_lens,
+                cache_k,
+                cache_v,
+            )
+
         self._fused_kv_helper.materialize(
             ctx_hidden=ctx_hidden,
             positions=ctx_positions,
             write_layer_kv=_write_layer_kv,
+            write_all_layers_kv=_write_all_layers_kv,
         )
 
     def _update_target_mamba_state_after_verify(
@@ -2504,6 +2935,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         """draft_model.project_target_hidden with the fc output all-gather done by
         the multimem symm-mem kernel (NCCL fallback inside the gatherer)."""
         gatherer = self._fc_gatherer
+        fused_fc = getattr(self.draft_model, "_fc_ag_norm", None)
+        if fused_fc is not None and target_hidden.ndim == 2:
+            # goal11-dense: fc local slice + one-kernel all-gather + hidden_norm (TP8, <= 32 tokens)
+            out = fused_fc(target_hidden)
+            if out is not None:
+                return out
         if gatherer is None:
             return self.draft_model.project_target_hidden(target_hidden)
         fc = self.draft_model.fc
@@ -2570,16 +3007,33 @@ class DFlashWorkerV2(BaseSpecWorker):
                         out_tokens,
                         new_seq_lens,
                     ) = self._next_accept_bonus_buffers(bs)
-                    _compute_dflash_accept_bonus_triton_unchecked(
-                        candidates=candidates,
-                        target_top1=target_predict,
-                        accept_lens_out=accept_len,
-                        commit_lens_out=commit_lens,
-                        bonus_ids_out=bonus,
-                        out_tokens_out=out_tokens,
-                        prefix_lens=prefix_lens,
-                        new_seq_lens_out=new_seq_lens,
-                    )
+                    fused_target = self._fused_publish_target
+                    self._fused_publish_target = None
+                    if fused_target is not None and compute_dflash_accept_bonus_publish(
+                        candidates,
+                        target_predict,
+                        accept_len,
+                        commit_lens,
+                        bonus,
+                        out_tokens,
+                        prefix_lens,
+                        new_seq_lens,
+                        fused_target[1],
+                        fused_target[0].new_seq_lens_buf,
+                        fused_target[0].output_tokens_buf,
+                    ):
+                        self._fused_publish_done = True
+                    else:
+                        _compute_dflash_accept_bonus_triton_unchecked(
+                            candidates=candidates,
+                            target_top1=target_predict,
+                            accept_lens_out=accept_len,
+                            commit_lens_out=commit_lens,
+                            bonus_ids_out=bonus,
+                            out_tokens_out=out_tokens,
+                            prefix_lens=prefix_lens,
+                            new_seq_lens_out=new_seq_lens,
+                        )
                 except Exception as e:
                     self._use_triton_accept_bonus = False
                     logger.warning(
@@ -2648,7 +3102,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         bonus_tokens: torch.Tensor,
         new_seq_lens: torch.Tensor,
     ) -> DFlashDraftInputV2:
-        return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
+        di = make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
+        # goal11-post: the overlap resolve leaves the bonus gather to this worker's fused draft prep
+        di.defer_bonus_gather = self._step_prep_defer_ok()
+        return di
 
     def forward_batch_generation(
         self,
@@ -2824,7 +3281,33 @@ class DFlashWorkerV2(BaseSpecWorker):
         prefix_lens = batch.seq_lens
         positions_2d = self._draft_block_positions_buf[:bs]
         verify_out_cache_loc_2d = self._draft_verify_out_cache_loc_buf[:bs]
-        if self._use_triton_prepare_block:
+        # goal11-post (SGLANG_STEP_PREP_FUSED): prepare_block is deferred into the draft runner's fused replay prep
+        # (one launch with the input copies, FA metadata and page table); nothing below reads its outputs eagerly
+        # before the draft runner's load_batch (embedding in the graph, no compact cache, no early verify prep)
+        sp_defer = self._step_prep_defer_ok() and self._step_prep_bs_ok(bs)
+        bonus_gather = getattr(draft_input, "bonus_gather", None) if draft_input.bonus_tokens is None else None
+        if draft_input.bonus_tokens is None:
+            if bonus_gather is None:
+                raise RuntimeError("DFLASH draft input has neither bonus_tokens nor a deferred bonus gather")
+            if not (sp_defer and self._use_triton_prepare_block):
+                draft_input.bonus_tokens = bonus_gather[0][bonus_gather[1]]
+                bonus_gather = None
+        if sp_defer:
+            step_prep.begin()
+        if bonus_gather is not None:
+            # recorded into the draft runner's fused prep (bonus = output_tokens_buf[future_indices] read in-kernel)
+            step_prep.prepare_gathered(
+                bonus_buf=bonus_gather[0],
+                bonus_index=bonus_gather[1],
+                prefix_lens=prefix_lens.view(-1),
+                req_pool_indices=batch.req_pool_indices.view(-1),
+                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                block_ids_out=block_ids,
+                positions_out=positions_2d,
+                cache_loc_out=verify_out_cache_loc_2d,
+                mask_token_id=int(self._mask_token_id),
+            )
+        elif self._use_triton_prepare_block:
             try:
                 _prepare_dflash_draft_block_unchecked(
                     bonus_tokens=draft_input.bonus_tokens.view(-1),
@@ -2970,11 +3453,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                     bs=bs, sampling_info=batch.sampling_info
                 )
 
+        gt_buf = self._graph_tokens_buf
+        use_gt = gt_buf is not None and bs <= int(gt_buf.shape[0])
+        draft_tokens = (gt_buf if use_gt else self._draft_block_tokens_buf)[:bs]
+
         with (
             torch.inference_mode(),
             draft_tp_context(self.draft_owns_attention),
         ):
             draft_out = self.draft_model_runner.forward(forward_batch)
+        if sp_defer and (step_prep.pending() or step_prep.is_recording()):
+            step_prep.flush("draft (after forward)")  # never expected: the runner flushes before replay / eager forward
         draft_logits_output = draft_out.logits_output
 
         if (
@@ -3095,9 +3584,28 @@ class DFlashWorkerV2(BaseSpecWorker):
                     lm_head=lm_head,
                 ).view(bs, int(self.block_size) - 1)
 
-        draft_tokens = self._draft_block_tokens_buf[:bs]
-        draft_tokens[:, 0].copy_(block_ids[:, 0])
-        draft_tokens[:, 1:].copy_(draft_next)
+        tokens_in_graph = (
+            use_gt
+            and self._draft_sampler is not None
+            and draft_out.can_run_graph
+            and bool(self._tokens_graph_bs)
+            and not self._is_domino
+        )
+        # goal11-post (SGLANG_STEP_PREP_FUSED): the candidates copy joins the target runner's fused replay prep
+        # (opened here, flushed at the end of the verify load_batch); nothing reads draft_tokens before that
+        sp_verify = (
+            not tokens_in_graph
+            and step_prep.enabled()
+            and self._step_prep_bs_ok(bs)
+            and not batch.has_grammar
+            and not self._need_mamba_verify_commit
+            and not get_parallel().attn_dp_enabled
+            and not batch.is_extend_in_batch
+        )
+        if sp_verify:
+            step_prep.begin()
+        if not tokens_in_graph:
+            step_prep.tokens(draft_tokens, block_ids[:, 0], draft_next)
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
@@ -3105,43 +3613,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
         # --- 2) Target verify.
-        # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
-        custom_mask = None
-
-        verify_input_ids = draft_tokens.reshape(-1)
-        verify_input = DFlashVerifyInput(
-            draft_token=verify_input_ids,
-            positions=positions,
-            draft_token_num=int(self.block_size),
-            custom_mask=custom_mask,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
-        )
-
-        batch.out_cache_loc = verify_out_cache_loc
         sampling_info = batch.sampling_info
-
-        seq_lens_pre_verify = (
-            batch.seq_lens.clone() if self._need_mamba_verify_commit else None
+        verify_forward_batch, verify_decode_graph, seq_lens_pre_verify = self._prepare_verify_forward(
+            batch=batch,
+            draft_tokens=draft_tokens,
+            positions=positions,
+            verify_out_cache_loc=verify_out_cache_loc,
+            draft_input=draft_input,
+            block_size=block_size,
         )
-        seq_lens_cpu_backup = batch.seq_lens_cpu
-        seq_lens_sum_backup = batch.seq_lens_sum
-        if seq_lens_cpu_backup is not None:
-            # Verify host bound = committed prefix + one verify block (matches draft).
-            verify_host_seq_lens = seq_lens_cpu_backup + block_size
-            batch.seq_lens_cpu = verify_host_seq_lens
-            batch.seq_lens_sum = int(verify_host_seq_lens.sum())
-        elif draft_input.nxt_kv_lens_cpu is not None:
-            batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
-            batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
-
-        verify_forward_batch, verify_decode_graph = verify_input.prepare_for_verify(
-            batch, self.target_worker
-        )
-        batch.seq_lens_cpu = seq_lens_cpu_backup
-        batch.seq_lens_sum = seq_lens_sum_backup
-        if self._target_greedy_head is not None:
-            # Eager (non-graph) verify forwards emit the logits shard as well.
-            verify_forward_batch.skip_tp_logits_gather = True
+        if step_prep.pending() or step_prep.is_recording():
+            step_prep.flush("verify (after prepare)")  # paths that did not reach an eligible load_batch
 
         # Idle-DP guard: an idle rank's eager verify contributes raw scheduler
         # counts while a graph-replaying rank assumes the padded bucket, so
@@ -3168,6 +3650,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
+        if os.environ.get("SGLANG_MIMO_DENSE_TP_STAMPS", "0") == "1":
+            from sglang.srt.models.mimo_v2_dense_tp import dump_stamps
+
+            dump_stamps(bs * int(self.block_size))
 
         # greedy + no logprobs/grammar/penalties -> the target argmax
         # comes from the vocab-parallel head (in-graph) and the full logits are
@@ -3205,6 +3691,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             grammar_mask.apply(logits_output.next_token_logits)
 
         candidates = draft_tokens
+        # goal11-glue: the greedy Triton accept also performs the overlap scheduler's FutureMap relay writes
+        # (publish's new_seq_lens scatter + stash's bonus scatter) in the same launch
+        self._fused_publish_target = self._fused_publish_target_for(on_publish, bs)
+        self._fused_publish_done = False
         (
             accept_len,
             commit_lens,
@@ -3284,8 +3774,14 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+        fused_publish = self._fused_publish_done
+        self._fused_publish_target = None
+        self._fused_publish_done = False
         if on_publish is not None:
-            on_publish(new_seq_lens)
+            if fused_publish:
+                on_publish(new_seq_lens, prewritten=True)
+            else:
+                on_publish(new_seq_lens)
 
         # --- 3) Materialize committed verify-input tokens into draft KV cache.
         hidden = logits_output.hidden_states
@@ -3297,13 +3793,21 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
-        self._append_target_hidden_to_draft_kv_by_loc(
-            target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=verify_out_cache_loc,
-            cache_loc_2d=verify_out_cache_loc_2d,
-            positions=positions,
-            commit_lens=commit_lens,
-        )
+        # goal11-glue: skipped when the verify forward already materialized it on its side stream.
+        mat_done = self._mat_done_for_verify(verify_forward_batch, verify_decode_graph, can_run_cuda_graph)
+        mat_check = mat_done and envs.SGLANG_DFLASH_MAT_CHECK.get()
+        if mat_check:
+            mat_before = self._mat_snapshot_rows(verify_out_cache_loc_2d)
+        if not mat_done or mat_check:
+            self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+                cache_loc=verify_out_cache_loc,
+                cache_loc_2d=verify_out_cache_loc_2d,
+                positions=positions,
+                commit_lens=commit_lens,
+            )
+        if mat_check:
+            self._mat_check_rows(mat_before, verify_out_cache_loc_2d, commit_lens)
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
@@ -3312,6 +3816,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             bonus_tokens=bonus,
             new_seq_lens=new_seq_lens,
         )
+        if fused_publish:
+            next_draft_input.bonus_prestashed = True
 
         return GenerationBatchResult(
             logits_output=logits_output,
@@ -3326,3 +3832,103 @@ class DFlashWorkerV2(BaseSpecWorker):
             routed_experts_output=target_out.routed_experts_output,
             indexer_topk_output=target_out.indexer_topk_output,
         )
+
+
+_kv_tables = {}
+
+
+def _kv_write_tables(pool, attns, n_layers, num_kv_heads, head_dim, dtype):
+    """goal11-post: (k base table, v base table, row stride in elements) of the plain bf16 MHATokenToKVPool's draft layers
+    for mat_kv_write.norm_rope_kv_write, or None (unsupported pool -> the two-kernel path)."""
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+    if type(pool) is not MHATokenToKVPool or getattr(pool, "is_quantized_kv_cache", False):
+        return None
+    if pool.dtype != dtype or pool.store_dtype != dtype or pool.v_row_dim != pool.row_dim:
+        return None
+    if len(attns) != n_layers or num_kv_heads * head_dim != pool.row_dim:
+        return None
+    key = ("w", id(pool), tuple(a.layer_id for a in attns))
+    t = _kv_tables.get(key)
+    if t is None:
+        ks = [pool.k_buffer[a.layer_id - pool.start_layer] for a in attns]
+        vs = [pool.v_buffer[a.layer_id - pool.start_layer] for a in attns]
+        if any(x.dim() != 3 or not x.is_contiguous() or x.dtype != dtype for x in ks + vs):
+            return None
+        if len({x.stride(0) for x in ks + vs}) != 1 or ks[0].stride(0) != pool.row_dim:
+            return None
+        dev = ks[0].device
+        t = (
+            torch.tensor([x.data_ptr() for x in ks], dtype=torch.int64, device=dev),
+            torch.tensor([x.data_ptr() for x in vs], dtype=torch.int64, device=dev),
+            int(ks[0].stride(0)),
+        )
+        _kv_tables[key] = t
+    return t
+
+
+def _commit_all_layers_kv(pool, attns, loc_2d, commit_lens, cache_k, cache_v) -> bool:
+    """goal11-dense: set_kv_buffer_prefix_valid for every draft layer in one Triton launch. Only for the plain bf16
+    MHATokenToKVPool (3-D per-layer buffers, equal K/V rows, no quantization); False -> caller falls back."""
+    from sglang.kernels.ops.kvcache.cache_move import set_kv_buffer_prefix_valid_multi_layer
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+    if type(pool) is not MHATokenToKVPool or getattr(pool, "is_quantized_kv_cache", False):
+        return False
+    if pool.dtype != cache_k.dtype or pool.store_dtype != cache_k.dtype or pool.v_row_dim != pool.row_dim:
+        return False
+    L = cache_k.shape[0]
+    if L != len(attns) or cache_k.dim() != 4 or cache_k.shape != cache_v.shape or cache_k.stride() != cache_v.stride():
+        return False
+    T, Hkv, D = cache_k.shape[1], cache_k.shape[2], cache_k.shape[3]
+    if cache_k.stride(3) != 1 or cache_k.stride(2) != D or cache_k.stride(1) != Hkv * D or Hkv * D != pool.row_dim:
+        return False
+    if loc_2d.numel() == 0 or commit_lens.numel() == 0:
+        return True
+    key = (id(pool), tuple(a.layer_id for a in attns))
+    tables = _kv_tables.get(key)
+    if tables is None:
+        ks = [pool.k_buffer[a.layer_id - pool.start_layer] for a in attns]
+        vs = [pool.v_buffer[a.layer_id - pool.start_layer] for a in attns]
+        if any(t.dim() != 3 or not t.is_contiguous() for t in ks + vs):
+            return False
+        if len({t.stride(0) for t in ks + vs}) != 1:
+            return False
+        dev = cache_k.device
+        tables = (
+            torch.tensor([t.data_ptr() for t in ks], dtype=torch.int64, device=dev),
+            torch.tensor([t.data_ptr() for t in vs], dtype=torch.int64, device=dev),
+            ks[0].stride(0) * ks[0].element_size(),
+        )
+        _kv_tables[key] = tables
+    if loc_2d.dtype != torch.int64:
+        loc_2d = loc_2d.to(torch.int64)
+    if commit_lens.dtype != torch.int32:
+        commit_lens = commit_lens.to(torch.int32)
+    loc_2d = loc_2d.contiguous()
+    commit_lens = commit_lens.contiguous()
+    row_bytes = pool.row_dim * cache_k.element_size()
+    bytes_per_tile = 128 if row_bytes < 4096 else 256
+    n_tiles = triton.cdiv(row_bytes, bytes_per_tile)
+    grid = (int(loc_2d.shape[0]), int(loc_2d.shape[1]), L * n_tiles)
+    esz = cache_k.element_size()
+    set_kv_buffer_prefix_valid_multi_layer[grid](
+        cache_k,
+        cache_v,
+        tables[0],
+        tables[1],
+        loc_2d,
+        commit_lens,
+        int(cache_k.stride(0) * esz),
+        int(cache_k.stride(1) * esz),
+        int(cache_v.stride(1) * esz),
+        tables[2],
+        tables[2],
+        int(loc_2d.shape[1]),
+        ROW_BYTES=row_bytes,
+        BYTES_PER_TILE=bytes_per_tile,
+        N_TILES=n_tiles,
+        num_warps=4,
+        num_stages=2,
+    )
+    return True

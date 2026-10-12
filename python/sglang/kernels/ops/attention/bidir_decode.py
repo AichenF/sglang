@@ -1,8 +1,10 @@
 """Bidirectional (non-causal) paged attention for the DFlash draft propose block.
 
-Semantics match ``flash_attn_with_kvcache(..., causal=False, window_size=(-1, -1))``
-on the same page table and ``cache_seqlens``: every query row of request ``b``
-attends keys ``[0, cache_seqlens[b])`` through ``page_table[b]``.
+Semantics match ``flash_attn_with_kvcache(..., causal=False, window_size=(L, R), sinks=...)``
+on the same page table and ``cache_seqlens``: query row ``t`` of request ``b`` sits at position
+``cache_seqlens[b] - W + t`` (FA's bottom-right alignment) and attends keys ``[0, cache_seqlens[b])``
+through ``page_table[b]``, restricted to ``[pos - L, pos + R]`` when a window side is >= 0. A per-head
+sink is an extra (unscaled) logit in the softmax denominator that adds no value (as in swa_decode.py).
 
 Flash-decoding structure: the key range is split across programs so the grid
 covers the machine, and every query head of a request shares one gathered KV
@@ -10,6 +12,7 @@ tile -- the 16:1 GQA sharing FA3 cannot exploit at this size.
 """
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -28,15 +31,19 @@ _MAX_NSPLIT = 64
 
 # The draft block is 6-8 tokens; the cap rejects anything that is not one.
 _MAX_BLOCK_TOKENS = 32
+_WINDOWED_OK = os.environ.get("SGLANG_BIDIR_DECODE_WINDOWED", "1") == "1"
+# PDL launches of the decode + combine kernels (combine launch hidden under the decode kernel).
+_PDL = os.environ.get("SGLANG_BIDIR_DECODE_PDL", "1") == "1"
 
 
 @triton.jit
 def _bidir_decode_kernel(
-    Q, K, V, PT, SEQLENS, OUT, PART_O, PART_LSE,
+    Q, K, V, PT, SEQLENS, SINKS, OUT, PART_O, PART_LSE,
     stride_qm, stride_qh, stride_ks, stride_vs, stride_ptb,
     stride_om, stride_oh,
     stride_pob, stride_poh, stride_pos,
-    sm_scale,
+    sm_scale, WL, WR,         # window left / right (-1 = unbounded)
+    HAS_WIN: tl.constexpr, HAS_SINK: tl.constexpr,
     W: tl.constexpr,          # query rows per request (draft block size)
     HP: tl.constexpr,         # query heads per program
     D: tl.constexpr, DV: tl.constexpr,
@@ -44,7 +51,13 @@ def _bidir_decode_kernel(
     BLOCK_N: tl.constexpr,    # keys per iteration
     NSPLIT: tl.constexpr,     # kv splits; 1 = single-kernel path
     HQN: tl.constexpr,        # total query heads (for the PART_LSE index)
+    USE_PDL: tl.constexpr = False,
 ):
+    if USE_PDL:
+        # PDL: wait for the producer of q / the new KV rows, then let the combine kernel launch right away
+        # (it waits for this grid's completion itself).
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     b = tl.program_id(0)
     hg = tl.program_id(1)
     sp = tl.program_id(2)
@@ -64,6 +77,11 @@ def _bidir_decode_kernel(
     )
 
     nblk = tl.cdiv(seqlen, BLOCK_N)
+    qpos = seqlen - W + t               # FA bottom-right alignment of the block rows
+    blo = 0
+    if HAS_WIN:
+        if WL >= 0:
+            blo = tl.maximum(seqlen - W - WL, 0) // BLOCK_N
 
     m_i = tl.full((BLOCK_R,), _NEG, tl.float32)
     l_i = tl.zeros((BLOCK_R,), tl.float32)
@@ -72,7 +90,7 @@ def _bidir_decode_kernel(
 
     # Strided, not contiguous: a contiguous split leaves late programs empty
     # whenever NSPLIT does not divide nblk.
-    for bi in tl.range(sp, nblk, NSPLIT):
+    for bi in tl.range(blo + sp, nblk, NSPLIT):
         start = bi * BLOCK_N
         j = start + tl.arange(0, BLOCK_N)
         kvalid = j < seqlen
@@ -81,7 +99,12 @@ def _bidir_decode_kernel(
                     mask=kvalid[:, None], other=0.0)
         s = tl.dot(q, tl.trans(k)) * sm_scale
 
-        keep = kvalid[None, :]
+        keep = rvalid[:, None] & kvalid[None, :]
+        if HAS_WIN:
+            if WL >= 0:
+                keep = keep & (j[None, :] >= (qpos - WL)[:, None])
+            if WR >= 0:
+                keep = keep & (j[None, :] <= (qpos + WR)[:, None])
         # Masked entries must sit strictly below the -1e30 running max, so a
         # fully masked tile contributes exactly zero rather than ones.
         s = tl.where(keep, s, float("-inf"))
@@ -99,6 +122,12 @@ def _bidir_decode_kernel(
         # A padded CUDA-graph slot has cache_seqlens == 0, so the loop never
         # runs and l_i stays 0; emit zeros rather than 0/0 = NaN, which would
         # otherwise flow into o_proj and the all-reduce.
+        if HAS_SINK:
+            sink = tl.load(SINKS + h, mask=rvalid, other=float("-inf")).to(tl.float32)
+            m2 = tl.maximum(m_i, sink)
+            sc = tl.exp(m_i - m2)
+            acc = acc * sc[:, None]
+            l_i = l_i * sc + tl.where(l_i > 0, tl.exp(sink - m2), 0.0)
         o = acc / tl.where(l_i > 0, l_i, 1.0)[:, None]
         tl.store(
             OUT + m_idx[:, None] * stride_om + h[:, None] * stride_oh + dv[None, :],
@@ -123,10 +152,13 @@ def _bidir_decode_kernel(
 
 @triton.jit
 def _bidir_combine_kernel(
-    PART_O, PART_LSE, OUT,
+    PART_O, PART_LSE, SINKS, OUT,
     stride_pob, stride_poh, stride_pos, stride_om, stride_oh,
-    NSPLIT: tl.constexpr, DV: tl.constexpr, HQN: tl.constexpr,
+    NSPLIT: tl.constexpr, DV: tl.constexpr, HQN: tl.constexpr, HAS_SINK: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
     m = tl.program_id(0)
     h = tl.program_id(1)
     sp = tl.arange(0, NSPLIT)
@@ -135,12 +167,18 @@ def _bidir_combine_kernel(
     # All splits empty (cache_seqlens == 0 on a padded slot): mx is -inf and
     # exp(-inf - -inf) is NaN. Pin the frame and let the zero denominator
     # guard below produce a zero row instead.
+    empty = mx == float("-inf")
+    if HAS_SINK:
+        sink = tl.load(SINKS + h).to(tl.float32)
+        mx = tl.maximum(mx, sink)
     mx = tl.where(mx > float("-inf"), mx, 0.0)
     w = tl.exp(lse - mx)
     dv = tl.arange(0, DV)
     po = tl.load(PART_O + m * stride_pob + h * stride_poh
                  + sp[:, None] * stride_pos + dv[None, :])
     den = tl.sum(w)
+    if HAS_SINK:
+        den += tl.where(empty, 0.0, tl.exp(sink - mx))
     o = tl.sum(po * w[:, None], 0) / tl.where(den > 0, den, 1.0)
     tl.store(OUT + m * stride_om + h * stride_oh + dv,
              o.to(OUT.dtype.element_ty))
@@ -197,13 +235,15 @@ def can_use_bidir_decode(
         return False
     if q.dtype != torch.bfloat16:
         return False
-    # Sinks are not built for this draft (is_nemotron_35_draft_config is False),
-    # and FP8 KV descaling is a different contract.
-    if any(k in kwargs for k in ("q_descale", "k_descale", "v_descale", "sinks",
+    # Per-head sinks are supported (MiMo-V2.6 draft); FP8 KV descaling is a
+    # different contract.
+    if any(k in kwargs for k in ("q_descale", "k_descale", "v_descale",
                                  "score_mod", "rel_bias")):
         return False
-    # Full context only; a finite window is not what this kernel computes.
-    if window_size[0] >= 0 or window_size[1] >= 0:
+    if window_size[0] < -1 or window_size[1] < -1:
+        return False
+    # SGLANG_BIDIR_DECODE_WINDOWED=0 keeps windowed / sink calls (MiMo-V2.6 draft) on FA3 (A/B knob).
+    if (window_size[0] >= 0 or window_size[1] >= 0 or "sinks" in kwargs) and not _WINDOWED_OK:
         return False
     # Uniform rows per request (the draft-block graph shape); ragged falls back.
     return q.shape[0] == cache_seqlens.shape[0] * max_seqlen_q
@@ -218,15 +258,18 @@ def bidir_decode_attention(
     *,
     block_tokens: int,
     sm_scale: float,
+    window_size: tuple = (-1, -1),
+    sinks: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     heads_per_program: int = _HEADS_PER_PROGRAM,
-    block_n: int = _BLOCK_N,
+    block_n: Optional[int] = None,
     nsplit: Optional[int] = None,
     num_warps: int = _NUM_WARPS,
     num_stages: int = _NUM_STAGES,
 ) -> torch.Tensor:
     """q: [M, HQ, D]; k_cache/v_cache: [slots, ..., D]; page_table: [bs, pages]
-    (page_size 1); cache_seqlens: [bs] int32.  Non-causal, full context."""
+    (page_size 1); cache_seqlens: [bs] int32.  Non-causal; window_size = (left, right) as in FA
+    (-1 = unbounded side); sinks: optional fp32/bf16 [HQ] per-head sink logits."""
     # The kernel loads the head dim as one contiguous vector; row and head
     # strides are explicit, so a row-strided q (the QKV slice) is fine.
     if q.stride(-1) != 1:
@@ -256,23 +299,32 @@ def bidir_decode_attention(
         part_lse = torch.empty((m, hq, nsplit), device=q.device, dtype=torch.float32)
         spo, sph, sps = part_o.stride(0), part_o.stride(1), part_o.stride(2)
 
+    wl, wr = int(window_size[0]), int(window_size[1])
+    has_win = wl >= 0 or wr >= 0
+    if block_n is None:
+        # windowed draft (V2.6, ~1k keys per request): 32-key tiles measured fastest on H200
+        # (7.6 vs 8.9 us at B4 x 8 rows x 16 heads); full-context keeps the original 64
+        block_n = 32 if has_win else _BLOCK_N
+    sink_arg = sinks if sinks is not None else q
     _bidir_decode_kernel[(bs, head_groups, nsplit)](
-        q, k2, v2, page_table, cache_seqlens, out_view, part_o, part_lse,
+        q, k2, v2, page_table, cache_seqlens, sink_arg, out_view, part_o, part_lse,
         q.stride(0), q.stride(1), k2.stride(0), v2.stride(0), page_table.stride(0),
         out_view.stride(0), out_view.stride(1),
         spo, sph, sps,
-        sm_scale,
+        sm_scale, wl, wr, HAS_WIN=has_win, HAS_SINK=sinks is not None,
         W=block_tokens, HP=heads_per_program,
         D=d, DV=dv,
         BLOCK_R=max(16, triton.next_power_of_2(block_tokens * heads_per_program)),
-        BLOCK_N=block_n, NSPLIT=nsplit, HQN=hq,
+        BLOCK_N=block_n, NSPLIT=nsplit, HQN=hq, USE_PDL=_PDL,
         num_warps=num_warps, num_stages=num_stages,
+        **({"launch_pdl": True} if _PDL else {}),
     )
     if nsplit > 1:
         _bidir_combine_kernel[(m, hq)](
-            part_o, part_lse, out_view,
+            part_o, part_lse, sink_arg, out_view,
             part_o.stride(0), part_o.stride(1), part_o.stride(2),
             out_view.stride(0), out_view.stride(1),
-            NSPLIT=nsplit, DV=dv, HQN=hq, num_warps=4,
+            NSPLIT=nsplit, DV=dv, HQN=hq, HAS_SINK=sinks is not None, USE_PDL=_PDL, num_warps=4,
+            **({"launch_pdl": True} if _PDL else {}),
         )
     return out
