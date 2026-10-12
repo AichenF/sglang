@@ -37,11 +37,17 @@ class AuxHiddenStatePacker:
     carries one, so every graph size aliases it instead of pinning its own.
     """
 
-    def __init__(self, num_captures: int, out: Optional[torch.Tensor] = None) -> None:
+    def __init__(
+        self, num_captures: int, out: Optional[torch.Tensor] = None, defer_stable: bool = False
+    ) -> None:
         self._num_captures = int(num_captures)
         self._buffer = out
         self._feature_size: Optional[int] = None
         self._idx = 0
+        # goal11-glue: capture_stable() records (slot start, source) instead of copying; finalize() hands the list to
+        # flush_aux_pending (one launch for every deferred capture, possibly on a side stream)
+        self._defer = bool(defer_stable)
+        self._pending: List = []
 
     @classmethod
     def for_batch(
@@ -49,7 +55,7 @@ class AuxHiddenStatePacker:
     ) -> AuxHiddenStatePacker:
         return cls(num_captures, out=forward_batch.aux_hidden_states_buffer)
 
-    def append(self, hidden: torch.Tensor) -> None:
+    def _slot(self, hidden: torch.Tensor) -> int:
         feature_size = int(hidden.shape[-1])
         if self._feature_size is None:
             self._feature_size = feature_size
@@ -61,13 +67,43 @@ class AuxHiddenStatePacker:
                     f"aux hidden output buffer is {tuple(self._buffer.shape)} "
                     f"{self._buffer.dtype}, captures need {shape} {hidden.dtype}"
                 )
-        start = self._idx * self._feature_size
+        return self._idx * self._feature_size
+
+    def append(self, hidden: torch.Tensor) -> None:
+        start = self._slot(hidden)
         self._buffer[..., start : start + self._feature_size].copy_(hidden)
         self._idx += 1
 
     def capture(self, hidden: torch.Tensor, *, owned: bool = False) -> None:
         """Write directly to the final packed buffer, without an intermediate copy."""
         self.append(hidden)
+
+    def capture_stable(self, hidden: torch.Tensor) -> None:
+        """Like capture(), for a source whose storage is NOT written again before the packed buffer is consumed
+        (fixed norm-next residual buffers, the final updated residual): deferred to flush_aux_pending when enabled."""
+        if (
+            not self._defer
+            or hidden.dim() != 2
+            or not hidden.is_contiguous()
+            or hidden.dtype != torch.bfloat16
+            or len(self._pending) >= _AUX_PACK_MAX
+        ):
+            self.append(hidden)
+            return
+        start = self._slot(hidden)
+        if (
+            self._buffer.dim() != 2
+            or hidden.shape[0] < self._buffer.shape[0]
+            or self._buffer.stride(-1) != 1
+        ):
+            self.append_at(hidden, start)
+            return
+        self._pending.append((start, hidden))
+        self._idx += 1
+
+    def append_at(self, hidden: torch.Tensor, start: int) -> None:
+        self._buffer[..., start : start + self._feature_size].copy_(hidden)
+        self._idx += 1
 
     def __len__(self) -> int:
         return self._idx
@@ -78,6 +114,9 @@ class AuxHiddenStatePacker:
             raise RuntimeError(
                 f"captured {self._idx} of {self._num_captures} aux hidden states"
             )
+        if self._pending:
+            self._buffer._aux_pending = self._pending
+            self._pending = []
         return self._buffer
 
 
@@ -91,3 +130,26 @@ def pack_aux_hidden_states(aux_hidden_states: AuxHiddenStates) -> torch.Tensor:
     if len(aux_hidden_states) == 1:
         return aux_hidden_states[0]
     return torch.cat(aux_hidden_states, dim=-1)
+
+
+# ---- goal11-glue: deferred aux captures, packed in one launch ----
+_AUX_PACK_MAX = 5
+
+
+def aux_has_pending(buf) -> bool:
+    return bool(getattr(buf, "_aux_pending", None))
+
+
+def flush_aux_pending(buf, keepalive: Optional[list] = None) -> None:
+    """Copy the captures deferred by AuxHiddenStatePacker.capture_stable into the packed buffer (one Triton launch on
+    the current stream). ``keepalive``: receives the sources (the caller must keep them alive until the copy is ordered
+    before any reuse, e.g. until a side stream is joined)."""
+    pend = getattr(buf, "_aux_pending", None)
+    if not pend:
+        return
+    buf._aux_pending = None
+    from sglang.kernels.ops.speculative.aux_pack import aux_pack
+
+    aux_pack(buf, pend)
+    if keepalive is not None:
+        keepalive.extend(src for _, src in pend)

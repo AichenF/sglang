@@ -1,5 +1,7 @@
 """Guarded MiMo target-verify RoPE and BF16 KV-cache fusion."""
 
+import os
+
 import torch
 
 from sglang.srt.environ import envs
@@ -112,3 +114,32 @@ def try_fused_mimo_rope_kv(attention, qkv, positions, forward_batch):
     cos_sin, locations, keys, values = selected
     run(qkv, cos_sin, positions, locations, keys, values)
     return True
+
+
+def try_defer_mimo_rope_kv_to_fa_verify(attention, qkv, positions, forward_batch):
+    """Full-attention layers: hand RoPE + KV store to the fa_verify attention kernel (fused) instead of running the
+    mimo_rope_kv kernel. Returns True when deferred: the caller must pass save_kv_cache=False and the UN-rotated q.
+    The backend runs mimo_rope_kv itself if it ends up not taking the fa_verify path (forward_batch._fav_rope)."""
+    if os.environ.get("SGLANG_FA_VERIFY_ROPE", "0") != "1" or os.environ.get("SGLANG_FA_VERIFY", "1") != "1":
+        return False
+    if not envs.SGLANG_OPT_MIMO_ROPE_KV.get():
+        return False
+    sw = getattr(attention.attn, "sliding_window_size", -1)
+    if sw is not None and sw > -1:
+        return False  # SWA layer
+    if getattr(attention, "attention_sink_bias", None) is not None:
+        return False
+    selected = select_mimo_rope_kv(attention, qkv, positions, forward_batch)
+    if selected is None:
+        return False
+    cos_sin, locations, keys, values = selected
+    forward_batch._fav_rope = (cos_sin, positions, locations, keys, values, qkv)
+    return True
+
+
+def run_deferred_mimo_rope_kv(fav_rope):
+    """Fallback for a deferred layer whose attention did not take the fused fa_verify path."""
+    from sglang.kernels.ops.attention.mimo_rope_kv import run
+
+    cos_sin, positions, locations, keys, values, qkv = fav_rope
+    run(qkv, cos_sin, positions, locations, keys, values)

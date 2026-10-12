@@ -588,6 +588,16 @@ def normal_decode_set_metadata(
     page_table / swa_page_table row is (re)written; the tail keeps stale values
     across CUDA-graph replays, so consumers must bound reads by cache_seqlens.
     """
+    from sglang.kernels.ops.speculative import step_prep
+
+    if step_prep.is_recording():  # goal11-post: fused replay prep (step_prep.py)
+        step_prep.record(
+            "metadata", cache_seqlens_int32=cache_seqlens_int32, cu_seqlens_k=cu_seqlens_k, page_table=page_table,
+            req_to_token=req_to_token, req_pool_indices=req_pool_indices, max_seq_pages=max_seq_pages,
+            seq_lens=seq_lens, seq_len_delta=seq_len_delta, page_size=page_size, swa_page_table=swa_page_table,
+            token_to_kv_pool=token_to_kv_pool, skip_page_table=skip_page_table,
+        )
+        return
     assert page_size > 0 and (page_size & (page_size - 1)) == 0, (
         f"page_size must be a power of two, got {page_size}"
     )

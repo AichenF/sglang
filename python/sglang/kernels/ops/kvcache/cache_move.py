@@ -183,3 +183,51 @@ def copy_all_layer_kv_cache_func(
         num_warps=kv_copy_config["num_warps"],
         num_stages=2,
     )
+
+
+@triton.jit
+def set_kv_buffer_prefix_valid_multi_layer(
+    src_k_ptr,
+    src_v_ptr,
+    dst_k_table,
+    dst_v_table,
+    loc_2d_ptr,
+    commit_len_ptr,
+    src_layer_stride,
+    src_k_row_stride,
+    src_v_row_stride,
+    dst_k_row_stride,
+    dst_v_row_stride,
+    block_size,
+    ROW_BYTES: tl.constexpr,
+    BYTES_PER_TILE: tl.constexpr,
+    N_TILES: tl.constexpr,
+):
+    """goal11-dense: set_kv_buffer_prefix_valid_tiled for ALL draft layers in one launch (grid axis 2 = layer x
+    tile). src_* = stacked [layers, rows, row] buffers; dst_*_table = per-layer cache base addresses (int64)."""
+    bid = tl.program_id(0)
+    row = tl.program_id(1)
+    lt = tl.program_id(2)
+    layer = lt // N_TILES
+    tid = lt - layer * N_TILES
+
+    commit_len = tl.load(commit_len_ptr + bid)
+    if row >= commit_len:
+        return
+
+    byte_off = tid * BYTES_PER_TILE + tl.arange(0, BYTES_PER_TILE)
+    mask_byte = byte_off < ROW_BYTES
+    tl.multiple_of(byte_off, 16)
+
+    loc = tl.load(loc_2d_ptr + bid * block_size + row)
+    src_row = bid * block_size + row
+
+    src_k = tl.cast(src_k_ptr, tl.pointer_type(tl.uint8)) + layer * src_layer_stride
+    src_v = tl.cast(src_v_ptr, tl.pointer_type(tl.uint8)) + layer * src_layer_stride
+    dst_k = tl.load(dst_k_table + layer).to(tl.pointer_type(tl.uint8))
+    dst_v = tl.load(dst_v_table + layer).to(tl.pointer_type(tl.uint8))
+
+    k_val = tl.load(src_k + src_row * src_k_row_stride + byte_off, mask=mask_byte, other=0)
+    v_val = tl.load(src_v + src_row * src_v_row_stride + byte_off, mask=mask_byte, other=0)
+    tl.store(dst_k + loc * dst_k_row_stride + byte_off, k_val, mask=mask_byte)
+    tl.store(dst_v + loc * dst_v_row_stride + byte_off, v_val, mask=mask_byte)

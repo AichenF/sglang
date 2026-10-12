@@ -25,6 +25,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag as symm_ag
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +148,17 @@ class VocabParallelGreedyHead:
             if self.tp_size == 1
             else ("multimem" if self._state is not None else "nccl")
         )
+        # goal11-dense: TP8 rows <= 32 -> local argmax + IPC exchange + select in one kernel
+        self._fused = None
+        if self.tp_size == 8 and envs.SGLANG_DFLASH_TP_ARGMAX.get():
+            try:
+                from sglang.kernels.ops.communication.dflash_tp_fused import get_state
+
+                self._fused = get_state(tp_group)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning("VocabParallelGreedyHead[%s]: fused argmax unavailable (%s)", self.name, e)
+            if self._fused is not None:
+                logger.info("VocabParallelGreedyHead[%s]: fused IPC argmax for <= 32 rows", self.name)
 
     def _build_symm_state(self):
         try:
@@ -186,6 +198,9 @@ class VocabParallelGreedyHead:
         assert logits.stride(1) == 1
         if n == 0:
             return self.out[:0]
+        if self._fused is not None and n <= 32:
+            self._fused.argmax(logits, self.out, self.vocab_start)
+            return self.out[:n]
         pairs = self.pairs[:n]
         _row_argmax_pairs_kernel[(n,)](
             logits,
