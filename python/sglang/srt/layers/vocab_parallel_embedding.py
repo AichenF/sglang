@@ -582,7 +582,12 @@ class VocabParallelEmbedding(torch.nn.Module):
                 out = torch.empty(
                     ids.shape[0], self.embedding_dim, dtype=self.weight.dtype, device=input_.device
                 )
-                st.embed(ids, self.weight, out, self._fused_embed_ranges)
+                full = getattr(self, "_g12_full_weight", None)
+                if full is not None:
+                    # goal12-glue: replicated table -> local gather (no owner push / receive polling)
+                    st.embed(ids, full, out, self._g12_local_ranges, local=True)
+                else:
+                    st.embed(ids, self.weight, out, self._fused_embed_ranges)
                 return out.view(*input_.shape, self.embedding_dim)
         output_parallel = self._embed_local_shard(input_)
         if self.tp_size > 1 and not get_attn_tp_context().input_scattered:

@@ -17,6 +17,7 @@ torch.cuda.CUDAGraph per shape.
 
 from __future__ import annotations
 
+import os
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
@@ -158,7 +159,12 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             self._reuse_output_buffer = self._output_buffer is not None
         del warmup_output
 
-        graph = torch.cuda.CUDAGraph()
+        # goal12-glue P9 diagnostics: keep the bs-4 graphs and dump their nodes / edge types (SGLANG_G12_GRAPH_CENSUS=<dir>)
+        census_dir = os.environ.get("SGLANG_G12_GRAPH_CENSUS", "")
+        census = bool(census_dir) and getattr(shape_key, "size", None) == int(
+            os.environ.get("SGLANG_G12_GRAPH_CENSUS_BS", "4")
+        )
+        graph = torch.cuda.CUDAGraph(keep_graph=True) if census else torch.cuda.CUDAGraph()
 
         graph_ctx: Callable[..., AbstractContextManager]
         if (
@@ -190,6 +196,24 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
         if profiler is not None:
             profiler.step()
+
+        if census:
+            try:
+                from sglang.kernels.ops.speculative.graph_census import dump_graph
+
+                mr = getattr(self._cuda_graph_runner, "model_runner", None)
+                role = "draft" if getattr(mr, "is_draft_worker", False) else "target"
+                rank = get_parallel().tp_rank
+                dump_graph(
+                    graph.raw_cuda_graph(),
+                    os.path.join(census_dir, f"census_{role}_bs{shape_key.size}_rank{rank}.jsonl"),
+                    f"{role}_bs{shape_key.size}",
+                )
+            except Exception as e:  # diagnostics must never break capture
+                import logging
+
+                logging.getLogger(__name__).warning("goal12 graph census failed: %r", e)
+            graph.instantiate()
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out

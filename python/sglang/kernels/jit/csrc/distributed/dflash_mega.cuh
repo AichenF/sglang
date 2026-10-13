@@ -59,6 +59,11 @@
 #ifndef DM_NO_ATT
 #define DM_NO_ATT 0
 #endif
+#ifndef DM_QUIET
+#define DM_QUIET 0  // 1 (goal12): the weight producer does not TMA-issue units of the phases after a release point (qkv rows, gate_up act) of
+#endif              // its CTA until that release retired -- it L2-prefetches them meanwhile. The release fence (MEMBAR) waits for the SM's
+                    // in-flight HBM loads (~+0.3 us per 12 KB, ub/handoff.cu); the next phase's units were issued 2-4 us before these
+                    // releases (lab stamps: qkv-rows release med 1.79 / max 2.82 us, gate_up release med 1.28 / max 2.82 us)
 
 namespace sglang {
 namespace dflash_mega {
@@ -500,6 +505,26 @@ DEV void producer(const Params& p, Smem& s, int c, int rank) {
       }
       mbar_wait(&s.empty[slot], par);
     }
+#if DM_QUIET
+    {
+      // releases of this CTA before unit (l, ph): qkv rows (if it has qkv tiles) after phase QKV, gate_up act after phase GU, per layer
+      // DM_QUIET 2: attention CTAs do not hold their o_proj units (they must be in flight BEFORE the attention phase: issued at the qkv
+      // release they queued the attention's Q / combine loads, lab +1 us per layer); the down units are held on every CTA
+      const int hq = p.plan.n[PH_QKV][c][0] > 0 ? 1 : 0;
+      const bool hold_o = !(DM_QUIET >= 2 && c < NATT);
+      const int need = ld.l * (hq + 1) + (ld.ph >= PH_DN ? hq + 1 : (ld.ph >= PH_O && hold_o ? hq : 0));
+      volatile int* relc = s.misc + 2;
+      if (*relc < need) {
+        UIt q = ld;
+        bool vq = true;
+        for (uint32_t i = 0; i < nslot && vq; ++i) {   // the held units into L2 (prefetches are not waited for by the release fence)
+          uit_issue(p, q, true, nullptr, nullptr, 0);
+          vq = uit_next(p, c, rank, q);
+        }
+        while (*relc < need) __nanosleep(64);
+      }
+    }
+#endif
     if (ld.sl == 0 && ld.u == 0 && ld.ph != PH_QKV) dstamp(p, ld.l, 60 + ld.ph);
     const int t1 = (2 * ld.sl + 1 < ld.nt) ? 1 : 0;
     mbar_expect_tx(&s.full[slot], (1 + t1) * TILEB);
@@ -759,7 +784,11 @@ DEV void allreduce(const Params& p, Smem& s, int t, int kar, int ctid, unsigned 
     if (ctid == 0) p.xs[buf * MT + t] = scale;
   }
   bar_sync(1, NCT);
-  if (ctid == 0) red_release(p.cnt + C_X, 1u);
+  if (ctid == 0) {
+    dstamp(p, l, 116 + 2 * (kar & 1));
+    red_release(p.cnt + C_X, 1u);
+    dstamp(p, l, 117 + 2 * (kar & 1));
+  }
 }
 
 // ---- layer-0 input RMSNorm + per-token quant (rmsnorm_quant numerics), token CTA ----
@@ -1021,6 +1050,7 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
       dstamp(p, l, 121);
       for (int k = 0; k < nt; ++k) red_release(p.cnt + C_QKV + tl[k], 1u);
       dstamp(p, l, 122);
+      if (DM_QUIET && nt > 0) { volatile int* relc = s.misc + 2; *relc = *relc + 1; }   // -> the producer's held units
     }
 #endif
   } else if constexpr (PH == PH_GU) {
@@ -1054,8 +1084,11 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
       if (v) atomicMax(am + ctid, v);
       __syncwarp();
       if (ctid == 0) {
+        dstamp(p, l, 125);
         __threadfence();  // the warp's amax atomics before the release
         red_release(p.cnt + C_ACT, 1u);
+        dstamp(p, l, 126);
+        if (DM_QUIET) { volatile int* relc = s.misc + 2; *relc = *relc + 1; }
       }
     }
   } else {
@@ -1446,7 +1479,9 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
     for (int w = 0; w < 8; ++w) amx = fmaxf(amx, s.red[16 + w]);
     unsigned* am = p.amax + ((((E & 1u) * 2u + 0u) * NL + l) * MT);
     if (amx > 0.f) atomicMax(am + BLK * b + rank, __float_as_uint(amx));
+    dstamp(p, l, 114);
     red_release(p.cnt + C_ATT, 1u);
+    dstamp(p, l, 115);
   }
 }
 
@@ -1496,6 +1531,7 @@ __global__ void __launch_bounds__(THREADS, 1) dflash_mega_kernel(const __grid_co
     mbar_init(s.kvempty, 1);
     mbar_init(s.combbar, 1);
     mbar_init(s.combok, CS);
+    s.misc[2] = 0;   // DM_QUIET release counter
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
   __syncthreads();

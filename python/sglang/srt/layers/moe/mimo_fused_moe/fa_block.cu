@@ -81,6 +81,18 @@ static_assert(OFF_MS + MS_BYTES <= OFF_KV && OFF_MS + MS_BYTES <= OFF_W + (NW_EA
 #define FAB_WD 2           // W k-tiles in flight per CTA after its attention (pacing: unpaced, the early finishers' W stream delayed the
                            // late CTAs' KV by ~3 us; 1: same, 4: +1.2 us)
 #endif
+#ifndef FAB_W_AFTER_REL
+#define FAB_W_AFTER_REL 0  // 1 (goal12): the W k-tiles that go into the KV ring (att_done) are issued only after this CTA released its attention partial:
+#endif                     // the gpu-scope release fence (MEMBAR.ALL.GPU) waits for the SM's in-flight HBM loads (~+0.3 us per 12 KB, ub/handoff.cu)
+#ifndef FAB_W_PF
+#define FAB_W_PF 0         // 1 (goal12): W k-tiles NW_EARLY.. are L2-PREFETCHED at att_done (prefetches are not waited for by a release fence) and
+#endif                     // TMA'd (L2 hits, in k order) only after this CTA's combine release: with FAB_W_AFTER_REL alone the in-flight W tiles
+                           // just moved from the partial release to the combine release (in situ a2k: +0.8 us there, tail unchanged).
+                           // In situ (a3k) the combine release -> o_proj flags got 0.8 us faster but the MMA 0.7 us slower (W late).
+                           // 2: the TMAs right after this CTA's PARTIAL release (they land from L2 during the combine)
+#ifndef FAB_NO_ACQFENCE
+#define FAB_NO_ACQFENCE 0  // 1 (goal12): no fence.acq_rel.gpu after the combine-flag polls (each poller ld.acquire's its flag; the named barrier orders the
+#endif                     // TMA-issuing thread after them): that consumer-side MEMBAR.ALL.GPU also waits for this SM's W k-tiles in flight
 constexpr int SMEM_ALLOC = SMEM_TOP + 1024;
 static_assert(OFF_X + COLS * M * 4 <= SMEM_TOP && OFF_KV % 1024 == 0 && OFF_A % 1024 == 0 && SMEM_ALLOC <= 232448 && NW_EARLY >= 0, "fab smem");
 static_assert(NOP <= NCTA && NOP * CROWS == NREQ * ROWS, "fab geometry");
@@ -93,6 +105,8 @@ __device__ __forceinline__ size_t tp_rs_idx(int src, int t, int k, int m) {
 }
 constexpr int MODE_POS64 = 1, MODE_LOC64 = 2, MODE_FULL_LOCAL = 4, MODE_NO_PUSH = 8, MODE_ATT_ONLY = 16;
 constexpr int MODE_DBG_NOPOLL = 32, MODE_DBG_NOW = 64;   // diagnostics (wrong results): no combine-flag polls / no W loads
+constexpr int MODE_DBG_QLATE_SHIFT = 16;                 // diagnostics (goal12 P3 bound): mode bits 16..25 = Q delay in 16-ns units -- the consumer
+                                                         // warpgroups wait until (CTA entry + delay) after griddepcontrol.wait (KV producer unaffected)
 constexpr float LOG2E = 1.4426950408889634f;
 
 struct Params {
@@ -267,6 +281,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) fa_block_kernel(const __grid_cons
     const uint32_t ptbar = bgo + 8;                     // [PTR] page-table slot landed (TMA)
     const uint32_t ms_full = ptbar + PTR * 8;                 // the stash landed (bulk copies)
     const uint32_t ms_dead = ms_full + 8;                     // the stash was read for the last time (8 consumer warps): W k-tile NW_EARLY may land
+    const uint32_t cmbrel = ms_dead + 8;                      // FAB_W_PF: this CTA's combine flag (1) / partial flag (2) released (consumer thread 0) -> W TMAs
     const int tid = threadIdx.x, wg = tid >> 7;
     const int c = blockIdx.x;
     const int b = c / NSPLIT, sp = c - b * NSPLIT;
@@ -279,9 +294,9 @@ __global__ void __launch_bounds__(NTHREADS, 1) fa_block_kernel(const __grid_cons
         for (int s = 0; s < STAGES; ++s) { mbar_init(kv_full + s * 8, 128); mbar_init(kv_empty + s * 8, 256); }
         for (int i = 0; i < NKT; ++i) mbar_init(wfull + i * 8, 1);
         for (int i = 0; i < NA; ++i) { mbar_init(afull + i * 8, 1); mbar_init(aempty + i * 8, 8); }
-        mbar_init(att_done, 8); mbar_init(xfull, 1); mbar_init(bgo, 1);
+        mbar_init(att_done, FAB_W_AFTER_REL ? 1 : 8); mbar_init(xfull, 1); mbar_init(bgo, 1);
         for (int i = 0; i < PTR; ++i) mbar_init(ptbar + i * 8, 1);
-        mbar_init(ms_full, 1); mbar_init(ms_dead, 8);
+        mbar_init(ms_full, 1); mbar_init(ms_dead, 8); mbar_init(cmbrel, 1);
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         if (opj) mbar_expect(xfull, COLS * M * 4);   // armed before the partner can see the barrier (cluster sync below)
     }
@@ -401,8 +416,14 @@ __global__ void __launch_bounds__(NTHREADS, 1) fa_block_kernel(const __grid_cons
                 mbar_wait(att_done, 0);
                 BSTAMP(2);
                 // issue order: k-tiles NW_EARLY + 1 .. 15 (paced), then k-tile NW_EARLY once the stash under it is dead
+                // (FAB_W_PF: L2 prefetches now, the TMAs in k order after the combine release)
                 const int kt0 = FAB_EARLY_W ? NW_EARLY : 0;
-                auto seq = [&](int j) { return j < NW_EARLY ? j : (j + 1 < NKT ? j + 1 : NW_EARLY); };   // j-th issued k-tile
+                if (FAB_W_PF && !(P.mode & MODE_DBG_NOW)) {
+                    const uint64_t pl = policy_evict_last();
+                    for (int kt = kt0; kt < NKT; ++kt) tma_prefetch_2d(&P.tm_w, h * (KO / CL) + kt * KT, q * PCOLS, pl);
+                    mbar_wait(cmbrel, 0);
+                }
+                auto seq = [&](int j) { return FAB_W_PF ? j : (j < NW_EARLY ? j : (j + 1 < NKT ? j + 1 : NW_EARLY)); };   // j-th issued k-tile
                 for (int j = kt0; j < NKT && !(P.mode & MODE_DBG_NOW); ++j) {
                     const int kt = seq(j);
                     if (kt == NW_EARLY) mbar_wait(ms_dead, 0);
@@ -434,6 +455,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) fa_block_kernel(const __grid_cons
         const int g = lane >> 2, c4 = lane & 3;
         const int tok = cw * 4 + warp;         // this warp's 16 rows are token `tok`, heads 0..15
         const int h0 = g, h1 = g + 8;
+        const unsigned long long qlate = (unsigned long long)((P.mode >> MODE_DBG_QLATE_SHIFT) & 0x3ff) * 16ull;
+        const unsigned long long t_ent = qlate ? gtimer() : 0ull;
         if (FAB_EARLY_W == 2 && opj && ct == 0) {
             const int q = c / CL;
             for (int kt = 0; kt < NW_EARLY; ++kt) {
@@ -469,6 +492,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) fa_block_kernel(const __grid_cons
         }
         if (opj && hgc == 0 && ct < 40) slotc = ld_idx(P.loc, b2 * W + tokc, P.mode & MODE_LOC64);
         griddep_wait();
+        if (qlate) { while (gtimer() < t_ent + qlate) {} }
         const unsigned epoch = (unsigned)__ldcg(P.work + 2) + 1u;
         if (ct == 0) BSTAMP(3);
         uint32_t qf[D / 16][4];
@@ -648,7 +672,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) fa_block_kernel(const __grid_cons
             mbar_arrive(kv_empty + s_prev * 8);
         }
         __syncwarp();
-        if (lane == 0) mbar_arrive(att_done);   // this warp's last KV-ring read retired: W k-tiles may land there
+        if (!FAB_W_AFTER_REL && lane == 0) mbar_arrive(att_done);   // this warp's last KV-ring read retired: W k-tiles may land there
         // ---- normalized partial O + log2 LSE of this split, [b][row][split][dv]
         l0 += __shfl_xor_sync(0xffffffffu, l0, 1);
         l0 += __shfl_xor_sync(0xffffffffu, l0, 2);
@@ -677,6 +701,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) fa_block_kernel(const __grid_cons
             BSTAMP(5);
             st_release_gpu(P.flags_att + c * FLAG_STRIDE, epoch);   // cumulative over the 256 threads' partial stores (barrier above)
             BSTAMP(18);
+            if (FAB_W_AFTER_REL) mbar_arrive(att_done);   // every consumer warp's last KV-ring read retired before the barrier above
+            if (FAB_W_PF == 2 && opj) mbar_arrive(cmbrel);
         }
         if (opj) {
             // ---- the 8 new keys' contribution to rows [4c, 4c + 4) (token tokc, heads 4 hgc ..): a 34th split computed from the stash --
@@ -804,6 +830,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) fa_block_kernel(const __grid_cons
                     BSTAMP(7);
                     st_release_gpu(P.flags_cmb + c * FLAG_STRIDE, epoch);
                     BSTAMP(17);
+                    if (FAB_W_PF == 1) mbar_arrive(cmbrel);
                 }
             }
             // ---- o_proj: D[96 (+32) W rows][32 tokens] += W[rows][k] * A[tok][k] over this CTA's K half; warpgroup cw takes rows 64 cw ..
@@ -816,7 +843,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) fa_block_kernel(const __grid_cons
             }
             named_sync(3, 256);
             if (ct == 0) {
-                asm volatile("fence.acq_rel.gpu;" ::: "memory");
+                if (!FAB_NO_ACQFENCE) asm volatile("fence.acq_rel.gpu;" ::: "memory");
                 BSTAMP(8);
                 asm volatile("fence.proxy.async.global;" ::: "memory");   // generic-proxy stores (released) -> async-proxy TMA reads
                 for (int kt = 0; kt < NA; ++kt) {
@@ -1054,4 +1081,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("MODE_ATT_ONLY") = fab::MODE_ATT_ONLY;
     m.attr("MODE_DBG_NOPOLL") = fab::MODE_DBG_NOPOLL;
     m.attr("MODE_DBG_NOW") = fab::MODE_DBG_NOW;
+    m.attr("MODE_DBG_QLATE_SHIFT") = fab::MODE_DBG_QLATE_SHIFT;
 }

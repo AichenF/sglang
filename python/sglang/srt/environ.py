@@ -1302,6 +1302,24 @@ class Envs:
     SGLANG_DFLASH_MAT_FUSED_KV_WRITE = EnvBool(True)
     # goal11-post: launch the materialize-in-verify side chain at the fork (before the LM head) instead of after it
     SGLANG_DFLASH_MAT_EARLY_FORK = EnvBool(True)
+    # goal12-glue: replicate the full target embedding table on every TP8 rank (1.87 GB/rank, built after the KV pools are
+    # sized -> taken from the non-static reserve, max_total_num_tokens unchanged) so the step-start embed_nq (verify) and
+    # embed_ag (draft) are local gathers (no owner push / NVLink receive polling); bitwise identical rows.
+    # E2E (333, B4 x 64k): -16..-26 us/step (core per-step mean), default ON
+    SGLANG_G12_EMBED_LOCAL = EnvBool(True)
+    # goal12-glue: the target verify's replay prep (input copies, SWA write loc, FA metadata, page tables) is recorded
+    # BEFORE the draft forward and runs in the SAME launch as the draft's prep (step_prep group); the draft graph's
+    # fused argmax writes the verify candidates straight into the target's static input_ids -> no eager launch between
+    # the draft and the verify graph
+    SGLANG_G12_VERIFY_EARLY = EnvBool(False)
+    # goal12-glue (P9): embed_ag / embed_nq trigger their PDL secondary (dflash_mega with SGLANG_DFLASH_MEGA_PDL=1 /
+    # layer 0's qkv kernel) at entry instead of at exit, so its pre-wait weight streaming overlaps the embedding
+    SGLANG_G12_EMBED_EARLY_TRIGGER = EnvBool(False)
+    # goal12-glue diagnostics (bounds only, default 0): k empty eager kernels / k single-node graph launches inserted
+    # after the accept kernel every decode step; DUP_ARGMAX: every fused IPC argmax runs 1 + n times (same result)
+    SGLANG_G12_SLOPE_EAGER = EnvInt(0)
+    SGLANG_G12_SLOPE_GRAPH = EnvInt(0)
+    SGLANG_G12_DUP_ARGMAX = EnvInt(0)
     SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP = EnvBool(False)
 
     # ===================================================================

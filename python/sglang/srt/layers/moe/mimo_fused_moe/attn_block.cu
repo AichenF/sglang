@@ -705,9 +705,13 @@ __device__ __forceinline__ void attention_ks(const Params& P, uint8_t* smem, int
     }
     if (tid == 0) CSTAMP(13);
     // ---- exchange: send the partner's dims (tile 1 - kh) + my row sums; keep tile kh
-    const int si = kh ^ 1, ki = kh;
-    st_async_v2(pxo + (rA * 64 + 8 * warp + cA) * 4, o[si][0], o[si][1], pbo);
-    st_async_v2(pxo + (rB * 64 + 8 * warp + cA) * 4, o[si][2], o[si][3], pbo);
+    // the partner's tile (1 - kh) / mine (kh) by select, not o[runtime index]: a runtime-indexed register array goes to local memory
+    // (STL.128 x 2 + LDL on the attention -> release critical path)
+    float osd[4], okp[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) { osd[i] = kh ? o[0][i] : o[1][i]; okp[i] = kh ? o[1][i] : o[0][i]; }
+    st_async_v2(pxo + (rA * 64 + 8 * warp + cA) * 4, osd[0], osd[1], pbo);
+    st_async_v2(pxo + (rB * 64 + 8 * warp + cA) * 4, osd[2], osd[3], pbo);
     if (warp == 0 && (lane & 3) == 0) {
         st_async_f32(pxl + rA * 4, l0, pbo); st_async_f32(pxl + rB * 4, l1, pbo);
 #if !BLK_KS_MAXX
@@ -740,12 +744,12 @@ __device__ __forceinline__ void attention_ks(const Params& P, uint8_t* smem, int
     {
         const int t = rA / HP, h = hg * HP + (rA % HP);
         *reinterpret_cast<unsigned*>(&P.attn_out[(size_t)(b * W + t) * KO + (size_t)h * DV + dim]) =
-            pack_bf16((o[ki][0] * c0s + pa0.x * p0s) * inv0, (o[ki][1] * c0s + pa0.y * p0s) * inv0);
+            pack_bf16((okp[0] * c0s + pa0.x * p0s) * inv0, (okp[1] * c0s + pa0.y * p0s) * inv0);
     }
     {
         const int t = rB / HP, h = hg * HP + (rB % HP);
         *reinterpret_cast<unsigned*>(&P.attn_out[(size_t)(b * W + t) * KO + (size_t)h * DV + dim]) =
-            pack_bf16((o[ki][2] * c1s + pa1.x * p1s) * inv1, (o[ki][3] * c1s + pa1.y * p1s) * inv1);
+            pack_bf16((okp[2] * c1s + pa1.x * p1s) * inv1, (okp[3] * c1s + pa1.y * p1s) * inv1);
     }
 }
 
@@ -1014,8 +1018,14 @@ constexpr int G_W = 8192, G_X = M * QBK, G_SX = M * 4, G_ST = 12288;   // <= 60 
 #ifndef MEGA_LL
 #define MEGA_LL 0                              // 1: qkv rows handed to the attention CTAs as LL messages {6 bf16, epoch} (no release fence, no flag
 #endif                                         //    round trip: the consumers' tag polls ARE the data loads); 0: bf16 rows + per-CTA release flags
+#ifndef MEGA_EARLY_KV
+#define MEGA_EARLY_KV 1                        // 1 (goal12): attention CTAs issue their K / V window gathers at kernel entry (the old keys depend on no running
+#endif                                         //    kernel; the math warps idle ~7 us before the first GEMM data): the window K / V live ABOVE a 12-stage GEMM ring
+                                               //    (MEGA_OFF_KV), the scratch written after the GEMM (Q, P, row stats, DSMEM exchange) inside the dead ring.
+                                               //    Gathers issued after the GEMM sat on the critical path (in situ +0.8..1.3 us of cp.async issue before the
+                                               //    finalize); issued after the qkv release (MEGA_REL_EARLY) they gated the attention inputs instead.
 #ifndef MEGA_LATE_GATHER
-#define MEGA_LATE_GATHER 1                     // 1: attention CTAs compute their window slots in the prologue but issue the K / V gathers after their
+#define MEGA_LATE_GATHER (MEGA_EARLY_KV ? 0 : 1)                     // 1: attention CTAs compute their window slots in the prologue but issue the K / V gathers after their
 #endif                                         //    GEMM loop (L2-resident rows, landing during the handoff) -> their GEMM ring can use 16 stages
 #ifndef MEGA_KVPF_END
 #define MEGA_KVPF_END 0                        // 1: the next SWA layer's K / V L2 prefetch at the kernel end; 0: right after the attention release
@@ -1075,6 +1085,21 @@ constexpr int G_W = 8192, G_X = M * QBK, G_SX = M * 4, G_ST = 12288;   // <= 60 
 #ifndef MEGA_ATT_EARLY_W
 #define MEGA_ATT_EARLY_W 0                     // 1: attention CTAs issue their o_proj weight k-tiles 0..7 right after their GEMM loop (not after att_in):
 #endif                                         //    without the o_proj tail prefetch they stream from HBM and need the lead time
+#ifndef MEGA_REL_EARLY
+#define MEGA_REL_EARLY 1                       // 1 (goal12): attention CTAs store + release their qkv rows BEFORE issuing their K / V window gathers (the
+#endif                                         //    gather issue sat between their GEMM loop and the finalize: +0.77 us in situ), released by math tid 0 after
+                                               //    the row-store barrier (its SM has no TMA / cp.async in flight then: the gpu-scope release fence = MEMBAR.ALL.GPU
+                                               //    waits for the SM's in-flight loads, ub/handoff.cu: 0.3 us idle, +0.3 us per 12 KB of HBM TMA in flight)
+#ifndef MEGA_PRELOAD
+#define MEGA_PRELOAD 1                         // 1 (goal12): attention CTAs load what mega_attention needs from EARLIER kernels (seqlen, positions -> cos/sin
+#endif                                         //    values, KV write slot, sinks) BEFORE polling the qkv flags (in situ "flags seen -> inputs" was 1.0 us with the
+                                               //    window already in smem: positions -> cos_sin is a dependent load chain after the poll)
+#ifndef MEGA_OPW_PACE
+#define MEGA_OPW_PACE 0                        // 1 (goal12): the other CTAs stream their o_proj weights from gdone as before, but ONE k-tile deep until their qkv
+#endif                                         //    flag release retired (qrel), then BLK_WD deep (OPW_LATE delayed the o_proj phase; 36 KB in flight cost the release ~0.9 us)
+#ifndef MEGA_OPW_LATE
+#define MEGA_OPW_LATE 0                        // 1 (goal12): the other CTAs start their o_proj weight TMAs after their qkv flag release (qrel), not at gdone:
+#endif                                         //    with 3 weight k-tiles (36 KB) in flight the release fence took ~1.0 us in situ (rows stored -> released)
 #ifndef MEGA_KCH
 #define MEGA_KCH 1                             // independent accumulator chains per k-block (1 = DeepGEMM's single chain)
 #endif
@@ -1083,12 +1108,16 @@ constexpr int G_W = 8192, G_X = M * QBK, G_SX = M * 4, G_ST = 12288;   // <= 60 
 #endif
 constexpr int GNS_ATT = 10, GNS_OTH = 16;      // GEMM ring stages: attention CTAs below OFF_ATT, the others below OFF_X
 #ifndef MEGA_GNS_ATT
-#define MEGA_GNS_ATT (MEGA_LATE_GATHER ? 16 : (MEGA_PAIRS ? 8 : 10))   // GEMM ring depth of the attention CTAs (early gathers: K/V window above OFF_ATT)
+#define MEGA_GNS_ATT (MEGA_EARLY_KV ? 12 : MEGA_LATE_GATHER ? 16 : (MEGA_PAIRS ? 8 : 10))   // GEMM ring depth of the attention CTAs (early gathers: K/V window above OFF_ATT)
 #endif
 #ifndef MEGA_GNS_OTH
 #define MEGA_GNS_OTH 16                        // GEMM ring depth of the other CTAs (<= GNS_OTH)
 #endif
-static_assert((MEGA_LATE_GATHER || MEGA_GNS_ATT <= GNS_ATT) && MEGA_GNS_OTH <= GNS_OTH && MEGA_GNS_ATT % 2 == 0 && MEGA_GNS_OTH % 2 == 0, "mega ring depth");
+constexpr int MEGA_OFF_KV = 12 * G_ST;        // MEGA_EARLY_KV: window K | V | slot list of an attention CTA (above its 12-stage GEMM ring)
+static_assert(!MEGA_EARLY_KV || (!MEGA_LATE_GATHER && !MEGA_GWARP && !MEGA_MID_GATHER && !MEGA_LL && MEGA_GNS_ATT * G_ST <= MEGA_OFF_KV
+                                 && MEGA_OFF_KV >= OFF_ATT + 16 * (DQK + 8) * 2 + 16 * (80 + 8) * 2 + (2 * NW * 16 + 32 + 16 * 64) * 4
+                                 && MEGA_OFF_KV + (80 * (DQK + 8) + 96 * (DV + 8)) * 2 + 80 * 4 <= OFF_X), "early-KV attention scratch");
+static_assert((MEGA_LATE_GATHER || MEGA_EARLY_KV || MEGA_GNS_ATT <= GNS_ATT) && MEGA_GNS_OTH <= GNS_OTH && MEGA_GNS_ATT % 2 == 0 && MEGA_GNS_OTH % 2 == 0, "mega ring depth");
 // every ring stage must always be consumed by the SAME warpgroup (it then waits for lap k only after it consumed lap k - 1 of that stage):
 // a warpgroup two laps ahead of a stage whose data has not landed yet would see the parity of lap k as 'complete' (mbarrier parity aliasing)
 // -> E2E GPU hang g11m_m7_eg_r1 (pairs + a 10-stage ring: stage s alternated between the warpgroups from lap to lap)
@@ -1242,6 +1271,34 @@ __device__ __forceinline__ void mega_ll_gather(const MegaParams& P, uint8_t* sme
     named_bar_sync(1, NMATH);
 }
 
+// the megakernel's key-split attention scratch: attention_ks's layout (from OFF_ATT), or with MEGA_EARLY_KV the window K | V | slots at
+// MEGA_OFF_KV (above the attention CTAs' 12-stage GEMM ring: gathered at kernel entry) and Q | P | row stats | DSMEM exchange from OFF_ATT
+// (inside the GEMM ring: written only after the GEMM; below OFF_ATT = the o_proj stages issued after att_in)
+struct MegaAtt { __nv_bfloat16 *Qs, *Ks, *Vs, *Ps; float *rmax, *rsum; int* s_slot; float *xm, *xl, *xo; };
+__device__ __forceinline__ MegaAtt mega_att(uint8_t* smem) {
+    constexpr int MPAD = 16, NRMAX = 80, KP = DQK + 8, VP = DV + 8, PP = NRMAX + 8;
+    MegaAtt a;
+    a.Qs = reinterpret_cast<__nv_bfloat16*>(smem + OFF_ATT);
+#if MEGA_EARLY_KV
+    a.Ps = a.Qs + MPAD * KP;
+    a.rmax = reinterpret_cast<float*>(a.Ps + MPAD * PP);
+    a.rsum = a.rmax + NW * MPAD;
+    a.xm = a.rsum + NW * MPAD; a.xl = a.xm + MPAD; a.xo = a.xl + MPAD;
+    a.Ks = reinterpret_cast<__nv_bfloat16*>(smem + MEGA_OFF_KV);
+    a.Vs = a.Ks + NRMAX * KP;
+    a.s_slot = reinterpret_cast<int*>(a.Vs + (NRMAX + 16) * VP);
+#else
+    a.Ks = a.Qs + MPAD * KP;
+    a.Vs = a.Ks + NRMAX * KP;
+    a.Ps = a.Vs + (NRMAX + 16) * VP;
+    a.rmax = reinterpret_cast<float*>(a.Ps + MPAD * PP);
+    a.rsum = a.rmax + NW * MPAD;
+    a.s_slot = reinterpret_cast<int*>(a.rsum + NW * MPAD);
+    a.xm = reinterpret_cast<float*>(a.s_slot + NRMAX); a.xl = a.xm + MPAD; a.xo = a.xl + MPAD;
+#endif
+    return a;
+}
+
 // K / V window gathers of a key-split attention CTA (attention_ks's slot + gather code), issued in the prologue (cp.async, not waited)
 template <int WINDOW>
 __device__ __forceinline__ void mega_gathers(const MegaParams& P, uint8_t* smem, int b, int hg, int kh) {
@@ -1251,13 +1308,11 @@ __device__ __forceinline__ void mega_gathers(const MegaParams& P, uint8_t* smem,
     constexpr int KP = DQK + 8, VP = DV + 8, PP = NRMAX + 8;
     constexpr int KCH = DQK / 8, VCH = DV / 8;
     constexpr int NOLD = NKEY - W;
-    __nv_bfloat16* Qs = reinterpret_cast<__nv_bfloat16*>(smem + OFF_ATT);
-    __nv_bfloat16* Ks = Qs + MPAD * KP;
-    __nv_bfloat16* Vs = Ks + NRMAX * KP;
-    __nv_bfloat16* Ps = Vs + (NRMAX + 16) * VP;
-    float* rmax = reinterpret_cast<float*>(Ps + MPAD * PP);
-    float* rsum = rmax + NW * MPAD;
-    int* s_slot = reinterpret_cast<int*>(rsum + NW * MPAD);
+    const MegaAtt ma = mega_att(smem);
+    __nv_bfloat16* Ks = ma.Ks;
+    __nv_bfloat16* Vs = ma.Vs;
+    int* s_slot = ma.s_slot;
+    (void)MPAD; (void)PP;
     const int tid = threadIdx.x;
     const int R0 = kh ? R0H : 0, NR = kh ? NRMAX : R0H;
     const int seqlen = P.seqlens[b];
@@ -1286,13 +1341,11 @@ __device__ __forceinline__ void mega_gather_issue(const MegaParams& P, uint8_t* 
     constexpr int KP = DQK + 8, VP = DV + 8, PP = NRMAX + 8;
     constexpr int KCH = DQK / 8, VCH = DV / 8;
     constexpr int NOLD = NKEY - W;
-    __nv_bfloat16* Qs = reinterpret_cast<__nv_bfloat16*>(smem + OFF_ATT);
-    __nv_bfloat16* Ks = Qs + MPAD * KP;
-    __nv_bfloat16* Vs = Ks + NRMAX * KP;
-    __nv_bfloat16* Ps = Vs + (NRMAX + 16) * VP;
-    float* rmax = reinterpret_cast<float*>(Ps + MPAD * PP);
-    float* rsum = rmax + NW * MPAD;
-    const int* s_slot = reinterpret_cast<const int*>(rsum + NW * MPAD);
+    const MegaAtt ma = mega_att(smem);
+    __nv_bfloat16* Ks = ma.Ks;
+    __nv_bfloat16* Vs = ma.Vs;
+    const int* s_slot = ma.s_slot;
+    (void)MPAD; (void)PP;
     const int tid = threadIdx.x;
     const int R0 = kh ? R0H : 0, NR = kh ? NRMAX : R0H;
 #endif
@@ -1331,13 +1384,11 @@ __device__ __forceinline__ void mega_gather_warp(const MegaParams& P, uint8_t* s
     constexpr int KP = DQK + 8, VP = DV + 8, PP = NRMAX + 8;
     constexpr int KCH = DQK / 8, VCH = DV / 8, CPR = KCH + VCH;
     constexpr int NOLD = NKEY - W;
-    __nv_bfloat16* Qs = reinterpret_cast<__nv_bfloat16*>(smem + OFF_ATT);
-    __nv_bfloat16* Ks = Qs + MPAD * KP;
-    __nv_bfloat16* Vs = Ks + NRMAX * KP;
-    __nv_bfloat16* Ps = Vs + (NRMAX + 16) * VP;
-    float* rmax = reinterpret_cast<float*>(Ps + MPAD * PP);
-    float* rsum = rmax + NW * MPAD;
-    const int* s_slot = reinterpret_cast<const int*>(rsum + NW * MPAD);
+    const MegaAtt ma = mega_att(smem);
+    __nv_bfloat16* Ks = ma.Ks;
+    __nv_bfloat16* Vs = ma.Vs;
+    const int* s_slot = ma.s_slot;
+    (void)MPAD; (void)PP;
     const int R0 = kh ? R0H : 0, NR = kh ? NRMAX : R0H;
     // zero rows first (padding keys outside the window), then the plain arrive (release: orders the warp's zero stores)
     for (int i = gt; i < NR * CPR; i += NGT) {
@@ -1366,11 +1417,34 @@ __device__ __forceinline__ __nv_bfloat16 ldcg_bf(const __nv_bfloat16* p) {
     const unsigned short u = __ldcg(reinterpret_cast<const unsigned short*>(p));
     return __ushort_as_bfloat16(u);
 }
+// mega_attention's inputs written by EARLIER kernels (no dependency on this grid's qkv rows)
+struct MegaPre { int seqlen; long long kslot; float sk0, sk1; __nv_bfloat16 qc[2], qsn[2], kc_, ks_; };
+__device__ __forceinline__ MegaPre mega_att_pre(const MegaParams& P, int b, int hg, int kh) {
+    constexpr int W = VT;
+    MegaPre r;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const bool pos64 = P.mode & MODE_POS64;
+    const int qr = tid >> 4, qq = tid & 15;
+    const int qtok = b * W + qr / HP, ktok = b * W + warp;
+    r.seqlen = P.seqlens[b];
+    const long long qpos = ld_idx(P.positions, qtok, pos64), kpos = ld_idx(P.positions, ktok, pos64);
+    r.kslot = ld_idx(P.loc, ktok, P.mode & MODE_LOC64);
+    r.sk0 = 0.f; r.sk1 = 0.f;
+    if (P.mode & MODE_SINK) { r.sk0 = P.sinks[hg * HP + ((lane >> 2) % HP)] * LOG2E; r.sk1 = P.sinks[hg * HP + (((lane >> 2) + 8) % HP)] * LOG2E; }
+    const __nv_bfloat16* qcs = P.cos_sin + (size_t)qpos * 64;
+    const __nv_bfloat16* kcs = P.cos_sin + (size_t)kpos * 64;
+#pragma unroll
+    for (int e = 0; e < 2; ++e) { const int i = 2 * qq + e; r.qc[e] = qcs[i]; r.qsn[e] = qcs[32 + i]; }
+    r.kc_ = __float2bfloat16(0.f); r.ks_ = r.kc_;
+    if (kh) { r.kc_ = kcs[lane]; r.ks_ = kcs[32 + lane]; }
+    return r;
+}
+
 // attention_ks from the qkv loads on (the gathers are in flight since mega_gathers); qkv rows written by phase 0 of THIS grid ->
 // L2-coherent (.cg) loads after the row-group flags were acquired
 template <int WINDOW>
 __device__ __forceinline__ void mega_attention(const MegaParams& P, uint8_t* smem, int b, int hg, int kh, uint64_t* att_in, uint64_t* xm_full, uint64_t* xo_full,
-                                               uint64_t* gath_full) {
+                                               uint64_t* gath_full, const MegaPre& pre) {
     constexpr int W = VT;
     constexpr int NKEY = WINDOW - 1 + W, NPAD = (NKEY + 15) / 16 * 16, MR = W * HP, MPAD = 16;
     constexpr int R0H = 64, NRMAX = NPAD - R0H;
@@ -1378,34 +1452,29 @@ __device__ __forceinline__ void mega_attention(const MegaParams& P, uint8_t* sme
     constexpr int QKT = DQK / 16, DT8 = DV / 8, NTW = 2;
     constexpr int NOLD = NKEY - W;
     static_assert(MR == 16 && NRMAX == 80 && NOLD >= R0H && DT8 == 2 * NW, "key-split geometry");
-    __nv_bfloat16* Qs = reinterpret_cast<__nv_bfloat16*>(smem + OFF_ATT);
-    __nv_bfloat16* Ks = Qs + MPAD * KP;
-    __nv_bfloat16* Vs = Ks + NRMAX * KP;
-    __nv_bfloat16* Ps = Vs + (NRMAX + 16) * VP;
-    float* rmax = reinterpret_cast<float*>(Ps + MPAD * PP);
-    float* rsum = rmax + NW * MPAD;
-    int* s_slot = reinterpret_cast<int*>(rsum + NW * MPAD);
-    float* xm = reinterpret_cast<float*>(s_slot + NRMAX);
-    float* xl = xm + MPAD;
-    float* xo = xl + MPAD;
+    const MegaAtt ma = mega_att(smem);
+    __nv_bfloat16* Qs = ma.Qs;
+    __nv_bfloat16* Ks = ma.Ks;
+    __nv_bfloat16* Vs = ma.Vs;
+    __nv_bfloat16* Ps = ma.Ps;
+    float* rmax = ma.rmax;
+    float* rsum = ma.rsum;
+    float* xm = ma.xm;
+    float* xl = ma.xl;
+    float* xo = ma.xo;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int R0 = kh ? R0H : 0, NT8 = (kh ? NRMAX : R0H) / 8, NK16 = (kh ? NRMAX : R0H) / 16;
     const uint32_t pxm = mapa(sa(xm), (uint32_t)(kh ^ 1)), pxl = mapa(sa(xl), (uint32_t)(kh ^ 1)), pxo = mapa(sa(xo), (uint32_t)(kh ^ 1));
     const uint32_t pbm = mapa(sa(xm_full), (uint32_t)(kh ^ 1)), pbo = mapa(sa(xo_full), (uint32_t)(kh ^ 1));
-    const bool pos64 = P.mode & MODE_POS64;
     const int qr = tid >> 4, qq = tid & 15;
     const int qtok = b * W + qr / HP, qh = hg * HP + (qr % HP);
     const int ktok = b * W + warp;
-    const int seqlen = P.seqlens[b];
-    const long long qpos = ld_idx(P.positions, qtok, pos64), kpos = ld_idx(P.positions, ktok, pos64);
-    const long long kslot = ld_idx(P.loc, ktok, P.mode & MODE_LOC64);
-    float sk0 = 0.f, sk1 = 0.f;
-    if (P.mode & MODE_SINK) { sk0 = P.sinks[hg * HP + ((lane >> 2) % HP)] * LOG2E; sk1 = P.sinks[hg * HP + (((lane >> 2) + 8) % HP)] * LOG2E; }
+    const int seqlen = pre.seqlen;
+    const long long kslot = pre.kslot;
+    const float sk0 = pre.sk0, sk1 = pre.sk1;
     const int base_pos = seqlen - W - (WINDOW - 1);
-    const __nv_bfloat16* qcs = P.cos_sin + (size_t)qpos * 64;
-    const __nv_bfloat16* kcs = P.cos_sin + (size_t)kpos * 64;
-    __nv_bfloat16 qx[2], qy[2], qc[2], qsn[2];
-    __nv_bfloat16 kx = __float2bfloat16(0.f), ky = kx, kc_ = kx, ks_ = kx;
+    __nv_bfloat16 qx[2], qy[2], qc[2] = {pre.qc[0], pre.qc[1]}, qsn[2] = {pre.qsn[0], pre.qsn[1]};
+    __nv_bfloat16 kx = __float2bfloat16(0.f), ky = kx, kc_ = pre.kc_, ks_ = pre.ks_;
     uint4 qrest, krest = make_uint4(0u, 0u, 0u, 0u);
 #if MEGA_LL
     {
@@ -1413,10 +1482,10 @@ __device__ __forceinline__ void mega_attention(const MegaParams& P, uint8_t* sme
         const __nv_bfloat16* qsrc = qs + (qr / HP) * QS_LD + (qr % HP) * DQK;
         const __nv_bfloat16* ksrc = qs + warp * QS_LD + 2 * DQK;
 #pragma unroll
-        for (int e = 0; e < 2; ++e) { const int i = 2 * qq + e; qx[e] = qsrc[i]; qy[e] = qsrc[i + 32]; qc[e] = qcs[i]; qsn[e] = qcs[32 + i]; }
+        for (int e = 0; e < 2; ++e) { const int i = 2 * qq + e; qx[e] = qsrc[i]; qy[e] = qsrc[i + 32]; }
         qrest = *reinterpret_cast<const uint4*>(qsrc + 64 + 8 * qq);
         if (kh) {
-            kx = ksrc[lane]; ky = ksrc[lane + 32]; kc_ = kcs[lane]; ks_ = kcs[32 + lane];
+            kx = ksrc[lane]; ky = ksrc[lane + 32];
             krest = *reinterpret_cast<const uint4*>(lane < 16 ? ksrc + 64 + 8 * lane : ksrc + DQK + 8 * (lane - 16));
         }
     }
@@ -1425,10 +1494,10 @@ __device__ __forceinline__ void mega_attention(const MegaParams& P, uint8_t* sme
         const __nv_bfloat16* qsrc = P.qout + (size_t)qtok * QKVW + (size_t)qh * DQK;
         const __nv_bfloat16* ksrc = P.qout + (size_t)ktok * QKVW + NH * DQK;
 #pragma unroll
-        for (int e = 0; e < 2; ++e) { const int i = 2 * qq + e; qx[e] = ldcg_bf(qsrc + i); qy[e] = ldcg_bf(qsrc + i + 32); qc[e] = qcs[i]; qsn[e] = qcs[32 + i]; }
+        for (int e = 0; e < 2; ++e) { const int i = 2 * qq + e; qx[e] = ldcg_bf(qsrc + i); qy[e] = ldcg_bf(qsrc + i + 32); }
         qrest = __ldcg(reinterpret_cast<const uint4*>(qsrc + 64 + 8 * qq));
         if (kh) {
-            kx = ldcg_bf(ksrc + lane); ky = ldcg_bf(ksrc + lane + 32); kc_ = kcs[lane]; ks_ = kcs[32 + lane];
+            kx = ldcg_bf(ksrc + lane); ky = ldcg_bf(ksrc + lane + 32);
             krest = __ldcg(reinterpret_cast<const uint4*>(lane < 16 ? ksrc + 64 + 8 * lane : ksrc + DQK + 8 * (lane - 16)));
         }
     }
@@ -1572,9 +1641,13 @@ __device__ __forceinline__ void mega_attention(const MegaParams& P, uint8_t* sme
             if (kk + 1 < NK16) mma16816(o[di], pa[kk + 1], vb[di] + 2);
         }
     }
-    const int si = kh ^ 1, ki = kh;
-    st_async_v2(pxo + (rA * 64 + 8 * warp + cA) * 4, o[si][0], o[si][1], pbo);
-    st_async_v2(pxo + (rB * 64 + 8 * warp + cA) * 4, o[si][2], o[si][3], pbo);
+    // the partner's tile (1 - kh) / mine (kh) by select, not o[runtime index]: a runtime-indexed register array goes to local memory
+    // (STL.128 x 2 + LDL on the attention -> release critical path)
+    float osd[4], okp[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) { osd[i] = kh ? o[0][i] : o[1][i]; okp[i] = kh ? o[1][i] : o[0][i]; }
+    st_async_v2(pxo + (rA * 64 + 8 * warp + cA) * 4, osd[0], osd[1], pbo);
+    st_async_v2(pxo + (rB * 64 + 8 * warp + cA) * 4, osd[2], osd[3], pbo);
     if (warp == 0 && (lane & 3) == 0) { st_async_f32(pxl + rA * 4, l0, pbo); st_async_f32(pxl + rB * 4, l1, pbo); }
     mbar_wait(xo_full, 0);
     float lt0 = kh ? xl[rA] + l0 : l0 + xl[rA], lt1 = kh ? xl[rB] + l1 : l1 + xl[rB];
@@ -1587,12 +1660,12 @@ __device__ __forceinline__ void mega_attention(const MegaParams& P, uint8_t* sme
     {
         const int t = rA / HP, h = hg * HP + (rA % HP);
         *reinterpret_cast<unsigned*>(&P.attn_out[(size_t)(b * W + t) * KO + (size_t)h * DV + dim]) =
-            pack_bf16((o[ki][0] + pa0.x) * inv0, (o[ki][1] + pa0.y) * inv0);
+            pack_bf16((okp[0] + pa0.x) * inv0, (okp[1] + pa0.y) * inv0);
     }
     {
         const int t = rB / HP, h = hg * HP + (rB % HP);
         *reinterpret_cast<unsigned*>(&P.attn_out[(size_t)(b * W + t) * KO + (size_t)h * DV + dim]) =
-            pack_bf16((o[ki][2] + pa1.x) * inv1, (o[ki][3] + pa1.y) * inv1);
+            pack_bf16((okp[2] + pa1.x) * inv1, (okp[3] + pa1.y) * inv1);
     }
 }
 
@@ -1628,6 +1701,7 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
     uint64_t* xgo = kt_seen + 1;               // x may be read (x producer: row flags seen or griddepcontrol.wait returned) -> W producer's rest
     uint64_t* slot_ready = xgo + 1;            // MEGA_GWARP: the K / V window slots are in smem (math tid 0 after mega_gathers' barrier)
     uint64_t* gath_full = slot_ready + 1;      // MEGA_GWARP: the gather warp's K / V rows landed (32 lanes' cp.async arrivals + 1 for its zero rows)
+    uint64_t* qrel = gath_full + 1;            // MEGA_OPW_LATE: this CTA's qkv flag released (W producer) -> o_proj weight producer
     unsigned* s_epoch = reinterpret_cast<unsigned*>(smem + MG_OFF_MISC);
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int c = blockIdx.x;
@@ -1642,7 +1716,7 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
         BSTAMP(0);
         for (int i = 0; i < NS; ++i) { mbar_init(&wfull[i], 1); mbar_init(&bfull[i], 1); mbar_init(&sempty[i], NW); }
         for (int i = 0; i < GNS_OTH; ++i) { mbar_init(&gfull[i], 2); mbar_init(&gempty[i], 4); }   // gfull: W producer + x producer
-        mbar_init(gdone, NW); mbar_init(xg_full, 1); mbar_init(ep_bar, 1); mbar_init(sx_full, 1); mbar_init(qready, NW); mbar_init(kt_seen, NKT - NS); mbar_init(xgo, 1); mbar_init(slot_ready, 1); mbar_init(gath_full, 33 * (MEGA_GWARP ? MEGA_GWARP : 1));
+        mbar_init(gdone, NW); mbar_init(xg_full, 1); mbar_init(ep_bar, 1); mbar_init(sx_full, 1); mbar_init(qready, NW); mbar_init(kt_seen, NKT - NS); mbar_init(xgo, 1); mbar_init(slot_ready, 1); mbar_init(gath_full, 33 * (MEGA_GWARP ? MEGA_GWARP : 1)); mbar_init(qrel, 1);
         mbar_init(att_in, 1); mbar_init(att_done, 1); mbar_init(xfull, 1); mbar_init(xm_full, 1); mbar_init(xo_full, 1); mbar_init(bgo, 1);
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         mbar_expect(xfull, COLS * M * 4);
@@ -1679,12 +1753,13 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
             }
 #endif
             // MEGA_ATT_EARLY_W: attention CTAs too take stages 0..7 right after their GEMM (only stages 8..12 hold their attention scratch)
-            if (qonly) {} else if (att && (MEGA_LL || !MEGA_ATT_EARLY_W)) mbar_wait(att_in, 0); else mbar_wait(gdone, 0);
+            if (qonly) {} else if (att && (MEGA_LL || !MEGA_ATT_EARLY_W)) mbar_wait(att_in, 0); else mbar_wait((MEGA_OPW_LATE && !MEGA_LL) ? qrel : gdone, 0);
             for (int kt = 0; kt < NKT && !qonly; ++kt) {
                 const int s = kt % NS;
                 if (att && kt == NS0_ATT) mbar_wait(att_done, 0);
                 if (kt >= NS) mbar_wait(&sempty[s], ((kt / NS) - 1) & 1);
                 if (kt >= BLK_WD) mbar_wait(&wfull[(kt - BLK_WD) % NS], ((kt - BLK_WD) / NS) & 1);
+                if (MEGA_OPW_PACE && !MEGA_OPW_LATE && !att && kt >= 1 && kt < NS && !mbar_test(qrel, 0)) mbar_wait(&wfull[kt - 1], 0);
                 issue_w(kt);
             }
         } else if (lane == 1 && !qonly) {
@@ -1768,10 +1843,13 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
             // the CTA's qkv-ready flag: released by THIS thread (no outstanding memory operations of its own -- the math threads that stored
             // the rows also issued cp.async gathers / the CTA has o_proj weight TMAs in flight, which a release fence there would wait for);
             // cumulative over the math warps' stores through the qready mbarrier (arrive = release.cta, wait = acquire.cta)
-            mbar_wait(ep_bar, 0);
-            mbar_wait(qready, 0);
-            st_release_gpu(&P.qflags[c * FLAG_STRIDE], s_epoch[0]);
-            if (P.dbg) P.dbg[blockIdx.x * NDBG + 9] = gtimer();
+            if (!(MEGA_REL_EARLY && att)) {   // MEGA_REL_EARLY: attention CTAs release from math tid 0
+                mbar_wait(ep_bar, 0);
+                mbar_wait(qready, 0);
+                st_release_gpu(&P.qflags[c * FLAG_STRIDE], s_epoch[0]);
+                if (P.dbg) P.dbg[blockIdx.x * NDBG + 9] = gtimer();
+            }
+            if (MEGA_OPW_LATE || MEGA_OPW_PACE) mbar_arrive(qrel);
 #endif
         }
         __syncwarp();
@@ -2030,7 +2108,7 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
 #endif
             if (P.dbg && (tid & 127) == 0) { P.dbg[blockIdx.x * NDBG + 27 + g] = cw; P.dbg[blockIdx.x * NDBG + 29] = clock64() - c0; }
 #if MEGA_LATE_GATHER && !MEGA_MID_GATHER && !MEGA_GWARP
-            if (att) { named_bar_sync(1, NMATH); mega_gather_issue<WINDOW>(P, smem, h); }   // every unit consumed: the ring is dead
+            if (att && !MEGA_REL_EARLY) { named_bar_sync(1, NMATH); mega_gather_issue<WINDOW>(P, smem, h); }   // every unit consumed: the ring is dead
 #endif
             // warpgroup 1 -> smem -> warpgroup 0 (fixed order: wg 0 + wg 1)
             // the warpgroup-1 partial [64 rows][32 tok] fp32 lives in the attention-tile halves of o_proj stages 0 / 1 (rows 0..31 / 32..63): the
@@ -2103,6 +2181,17 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
 #endif
         mbar_wait(ep_bar, 0);   // also orders the math warps after the o_proj producer's griddepcontrol.wait
         named_bar_sync(1, NMATH);
+#if MEGA_REL_EARLY && !MEGA_LL
+        if (att) {
+            // every math thread's row stores precede the barrier above -> one gpu-scope release (cumulative) by tid 0, issued while this SM has no
+            // load in flight (the GEMM ring is drained, the o_proj weights start only after att_in; MEGA_EARLY_KV: the gathers landed long ago),
+            // THEN (late gathers) the K / V window gathers
+            if (tid == 0) { st_release_gpu(&P.qflags[c * FLAG_STRIDE], s_epoch[0]); if (P.dbg) P.dbg[blockIdx.x * NDBG + 9] = gtimer(); }
+#if MEGA_LATE_GATHER && !MEGA_MID_GATHER && !MEGA_GWARP
+            mega_gather_issue<WINDOW>(P, smem, h);
+#endif
+        }
+#endif
 #if MEGA_LL
         {
             // LL messages: thread (t, j) of the first 192 writes {rows 6 j .. 6 j + 5 of token t, epoch}; lanes 2k / 2k + 1 = messages 2k', 2k' + 1
@@ -2125,6 +2214,9 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
 #endif
         if (att) {
             // the row groups this attention CTA reads: both CTAs (K halves finalize different rows) of each group
+#if MEGA_PRELOAD
+            const MegaPre mpre = mega_att_pre(P, pb, phg, h);   // inputs of earlier kernels: in flight during the poll
+#endif
 #if MEGA_LL
             mega_ll_gather(P, smem, pb, phg, h, s_epoch[0]);
 #else
@@ -2143,7 +2235,10 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
             named_bar_sync(1, NMATH);
 #endif
             if (tid == 0) BSTAMP(10);
-            mega_attention<WINDOW>(P, smem, pb, phg, h, att_in, xm_full, xo_full, gath_full);
+#if !MEGA_PRELOAD
+            const MegaPre mpre = mega_att_pre(P, pb, phg, h);
+#endif
+            mega_attention<WINDOW>(P, smem, pb, phg, h, att_in, xm_full, xo_full, gath_full, mpre);
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             named_bar_sync(1, NMATH);
             if (tid == 0) {
@@ -2154,10 +2249,10 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
             // next SWA layer's K / V window rows: the L2 prefetch moves to the kernel end (it delayed this CTA's attention-flag poll by
             // ~0.5 us); the slot list is copied out of the attention scratch (the late o_proj weight TMAs overwrite it after att_done)
 #if MEGA_KVPF_END
-            if (P.nkc && phg == 0 && tid < 80) reinterpret_cast<int*>(smem + MG_OFF_XG)[tid] = attention_ks_slots(smem)[tid];
+            if (P.nkc && phg == 0 && tid < 80) reinterpret_cast<int*>(smem + MG_OFF_XG)[tid] = mega_att(smem).s_slot[tid];
 #else
             if (P.nkc && phg == 0) {   // right after the release (as attn_block_kernel)
-                const int* s_slot = attention_ks_slots(smem);
+                const int* s_slot = mega_att(smem).s_slot;
                 const int NR = h ? (144 - 64) : 64;
                 for (int i = tid; i < NR * 5; i += NMATH) {
                     const int lr = i / 5, part = i - lr * 5;
@@ -2317,7 +2412,7 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
     if constexpr (FUSED && R_MATH) asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     cluster_sync_relaxed();
     if constexpr (FUSED && R_MATH) {
-        constexpr int MG_NBAR = 3 * NS + 6 + 2 * GNS_OTH + 9;   // wfull, bfull, sempty | att_in .. bgo | gfull, gempty | gdone .. gath_full
+        constexpr int MG_NBAR = 3 * NS + 6 + 2 * GNS_OTH + 10;   // wfull, bfull, sempty | att_in .. bgo | gfull, gempty | gdone .. qrel
         static_assert(MG_NBAR * 8 <= MG_OFF_MISC - MG_OFF_BAR, "mega barrier region");
         if (tid < MG_NBAR) asm volatile("mbarrier.inval.shared::cta.b64 [%0];" :: "r"(sa(wfull + tid)) : "memory");
     }

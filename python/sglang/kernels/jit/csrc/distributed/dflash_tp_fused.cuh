@@ -694,6 +694,8 @@ struct ArgmaxParams {
   int rank;
   int n;
   int group;            // > 1: output row r reads logits row (r / (group-1)) * group + 1 + r % (group-1) (skip block pos 0)
+  int64_t* cand;        // goal12-glue (group > 1, optional): verify candidates [blocks, group]: cand[b, 1 + j] = out of
+  const int64_t* cand_src;  //   row (b, j), cand[b, 0] = cand_src[b * group] (the block's bonus id)
 };
 
 __device__ __forceinline__ int ordered_key(float v) {
@@ -805,6 +807,11 @@ __global__ void __launch_bounds__(THREADS) argmax_ag_kernel(const __grid_constan
       if (s_pk[s] > k || (s_pk[s] == k && s_pi[s] < i)) { k = s_pk[s]; i = s_pi[s]; }
     p.out[t] = static_cast<int64_t>(i);
     p.calls[t] = call + 1;
+    if (p.cand != nullptr) {
+      const int b = t / (p.group - 1), jj = t % (p.group - 1);
+      p.cand[static_cast<int64_t>(b) * p.group + 1 + jj] = static_cast<int64_t>(i);
+      if (jj == 0) p.cand[static_cast<int64_t>(b) * p.group] = p.cand_src[static_cast<int64_t>(b) * p.group];
+    }
   }
   device::PDLTriggerSecondary<kUsePDL>();
 }
@@ -823,6 +830,10 @@ struct EmbedParams {
   int64_t end[R];
   int rank;
   int M;
+  int local;                  // goal12-glue: weight is the FULL (replicated) table, start/end[rank] = [0, vocab): every
+                              // rank gathers its rows locally (no pushes, no receive polling, counters untouched)
+  int early;                  // goal12-glue: trigger the PDL secondary at entry (its pre-wait weight streaming overlaps
+                              // this kernel; the secondary's griddepcontrol.wait still orders every read of our output)
 };
 
 template <bool kUsePDL>
@@ -830,6 +841,7 @@ __global__ void __launch_bounds__(THREADS) embed_ag_kernel(const __grid_constant
   const int t = blockIdx.x;
   const int tid = threadIdx.x;
   device::PDLWaitPrimary<kUsePDL>();
+  if (p.early) device::PDLTriggerSecondary<kUsePDL>();
   if (t >= p.M) {
     device::PDLTriggerSecondary<kUsePDL>();
     return;
@@ -855,10 +867,12 @@ __global__ void __launch_bounds__(THREADS) embed_ag_kernel(const __grid_constant
       const int v = j * THREADS + tid;
       const uint4 d = dv[j];
       const uint4 m = make_uint4(nz(d.x), nz(d.y), nz(d.z), nz(d.w));
+      if (!p.local) {
 #pragma unroll 1
-      for (int di = 0; di < R - 1; ++di) {
-        const int q = di + (di >= p.rank);
-        st_v4(p.peer[q] + EM_OFF + (static_cast<int64_t>(phase) * MAXT + t) * EM_SLOT + v * 16, m);
+        for (int di = 0; di < R - 1; ++di) {
+          const int q = di + (di >= p.rank);
+          st_v4(p.peer[q] + EM_OFF + (static_cast<int64_t>(phase) * MAXT + t) * EM_SLOT + v * 16, m);
+        }
       }
     }
 #pragma unroll
@@ -897,7 +911,7 @@ __global__ void __launch_bounds__(THREADS) embed_ag_kernel(const __grid_constant
   }
   __syncthreads();
   device::PDLTriggerSecondary<kUsePDL>();
-  if (tid == 0 && owner >= 0) p.calls[t] = call + 1;
+  if (tid == 0 && owner >= 0 && !p.local) p.calls[t] = call + 1;
 }
 
 // ---- embedding (owner push, as embed_ag_kernel) + the first decoder layer's input RMSNorm + group-128 fp8 quant in one
@@ -922,6 +936,7 @@ __global__ void __launch_bounds__(THREADS) embed_nq_kernel(const __grid_constant
   __shared__ __align__(16) float s_v[H];
   __shared__ float s_w2[2];
   device::PDLWaitPrimary<kUsePDL>();
+  if (p.early) device::PDLTriggerSecondary<kUsePDL>();
   if (t >= p.M) {
     device::PDLTriggerSecondary<kUsePDL>();
     return;
@@ -946,12 +961,15 @@ __global__ void __launch_bounds__(THREADS) embed_nq_kernel(const __grid_constant
 #pragma unroll
     for (int j = 0; j < PER; ++j) d[j] = *reinterpret_cast<const uint4*>(src + (j * THREADS + tid) * 8);
 #pragma unroll
-    for (int j = 0; j < PER; ++j) {
-      const uint4 m = make_uint4(nz(d[j].x), nz(d[j].y), nz(d[j].z), nz(d[j].w));
+    if (!p.local) {
+#pragma unroll
+      for (int j = 0; j < PER; ++j) {
+        const uint4 m = make_uint4(nz(d[j].x), nz(d[j].y), nz(d[j].z), nz(d[j].w));
 #pragma unroll 1
-      for (int di = 0; di < R - 1; ++di) {
-        const int qq = di + (di >= p.rank);
-        st_v4(p.peer[qq] + EM_OFF + (static_cast<int64_t>(phase) * MAXT + t) * EM_SLOT + (j * THREADS + tid) * 16, m);
+        for (int di = 0; di < R - 1; ++di) {
+          const int qq = di + (di >= p.rank);
+          st_v4(p.peer[qq] + EM_OFF + (static_cast<int64_t>(phase) * MAXT + t) * EM_SLOT + (j * THREADS + tid) * 16, m);
+        }
       }
     }
   } else if (owner >= 0) {
@@ -1039,7 +1057,7 @@ __global__ void __launch_bounds__(THREADS) embed_nq_kernel(const __grid_constant
   }
   __syncthreads();
   device::PDLTriggerSecondary<kUsePDL>();
-  if (tid == 0 && owner >= 0) p.calls[t] = call + 1;
+  if (tid == 0 && owner >= 0 && !p.local) p.calls[t] = call + 1;
 }
 
 }  // namespace dflash_tp
@@ -1110,7 +1128,9 @@ struct DFlashTPFused {
       tvm::ffi::TensorView peers,
       int64_t vocab_start,
       int64_t rank,
-      int64_t group) {
+      int64_t group,
+      int64_t cand,
+      int64_t cand_src) {
     using namespace host;
     using namespace dflash_tp;
     const int rows = static_cast<int>(logits.size(0));
@@ -1129,6 +1149,9 @@ struct DFlashTPFused {
     prm.rank = static_cast<int>(rank);
     prm.n = n;
     prm.group = static_cast<int>(group);
+    RuntimeCheck(cand == 0 || (group > 1 && cand_src != 0));
+    prm.cand = reinterpret_cast<int64_t*>(cand);
+    prm.cand_src = reinterpret_cast<const int64_t*>(cand_src);
     if (logits.dtype().bits == 16) {
       LaunchKernel(dim3(MAXT), dim3(THREADS), logits.device()).enable_pdl(kUsePDL)(argmax_ag_kernel<__nv_bfloat16, kUsePDL>, prm);
     } else {
@@ -1146,13 +1169,16 @@ struct DFlashTPFused {
       tvm::ffi::TensorView calls,
       tvm::ffi::TensorView peers,
       tvm::ffi::TensorView ranges,
-      int64_t rank) {
+      int64_t rank,
+      int64_t local) {
     using namespace host;
     using namespace dflash_tp;
     const int M = static_cast<int>(ids.size(0));
     RuntimeCheck(M >= 1 && M <= MAXT && weight.size(1) == H && weight.stride(0) == H && out.size(1) == H);
     RuntimeCheck(out.size(0) == 1 || out.stride(0) == H);
     EmbedParams prm{};
+    prm.local = (local & 1) != 0 ? 1 : 0;
+    prm.early = (local & 2) != 0 ? 1 : 0;
     prm.ids = ids.data_ptr();
     prm.ids64 = ids.dtype().bits == 64 ? 1 : 0;
     prm.weight = static_cast<const __nv_bfloat16*>(weight.data_ptr());
@@ -1185,7 +1211,8 @@ struct DFlashTPFused {
       tvm::ffi::TensorView calls,
       tvm::ffi::TensorView peers,
       tvm::ffi::TensorView ranges,
-      int64_t rank) {
+      int64_t rank,
+      int64_t local) {
     using namespace host;
     using namespace dflash_tp;
     const int M = static_cast<int>(ids.size(0));
@@ -1195,6 +1222,8 @@ struct DFlashTPFused {
     RuntimeCheck(out_scale.ndim() == 2 && out_scale.size(0) == H / 128 && out_scale.stride(1) == 1 && out_scale.stride(0) >= M);
     RuntimeCheck(gamma.numel() == H);
     EmbedNQParams prm{};
+    prm.e.local = (local & 1) != 0 ? 1 : 0;
+    prm.e.early = (local & 2) != 0 ? 1 : 0;
     prm.e.ids = ids.data_ptr();
     prm.e.ids64 = ids.dtype().bits == 64 ? 1 : 0;
     prm.e.weight = static_cast<const __nv_bfloat16*>(weight.data_ptr());
