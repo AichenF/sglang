@@ -51,6 +51,9 @@ class Scratch:
         # goal11 mega (qkv GEMM as phase 0): the qkv rows [32][3392] bf16 and one ready flag per CTA (epoch-tagged, no reset)
         self.qout = torch.zeros(32, 3392, dtype=torch.bfloat16, device=device)
         self.qflags = torch.zeros(128 * 32, dtype=torch.int32, device=device)
+        # qkv-only launches (FA layers) release their flags with a fixed epoch (dummy_work): they get their own flag lines so a
+        # SWA megakernel launch polling ``qflags`` for epoch work[2] + 1 can never match a stale qkv-only release after wraparound
+        self.qflags_qkv = torch.zeros(128 * 32, dtype=torch.int32, device=device)
         self.qll = torch.zeros(32 * 128 * 6 * 4, dtype=torch.int32, device=device)   # LL messages {6 bf16, epoch} [32 tok][128 CTA][6]
         self.dummy_work = torch.zeros(8, dtype=torch.int32, device=device)   # qkv-only launches: epoch source (their flags are not polled)
 
@@ -183,7 +186,7 @@ def run_mega(
 def run_qkv(x, x_scale, qwmap, qsw, out, scratch: Scratch, pdl=True, qpre=0, dbg=None, xflags=None, xwork=None):
     """FA layers: the megakernel's qkv GEMM alone -> out bf16 [32][3392] (x / x_scale = the norm-next (fp8, column-major scales) pair)."""
     ext().attn_block_qkv(
-        x, x_scale.t(), qwmap, qsw, out, scratch.qflags, scratch.dummy_work, int(qpre), int(bool(pdl)),
+        x, x_scale.t(), qwmap, qsw, out, scratch.qflags_qkv, scratch.dummy_work, int(qpre), int(bool(pdl)),
         dbg if dbg is not None else _EMPTY_I64.setdefault(str(x.device), torch.empty(0, dtype=torch.int64, device=x.device)),
         xflags if xflags is not None else _empty_i32(x.device),
         xwork if xwork is not None else _empty_i32(x.device),
