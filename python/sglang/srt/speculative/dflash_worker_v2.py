@@ -3646,11 +3646,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 tr._g12_early_sig = sig[:-1]
             else:
                 tr._g12_early_sig = None
-        self._g12_steps = getattr(self, "_g12_steps", 0) + 1
-        self._g12_early_n = getattr(self, "_g12_early_n", 0) + (g12_early is not None)
-        if self._g12_steps % 128 == 0 and get_parallel().tp_rank == 0:
-            logger.info("goal12 glue stats: %d decode steps, %d verify-early; step_prep %s", self._g12_steps,
-                        self._g12_early_n, step_prep.stats())
 
         with (
             torch.inference_mode(),

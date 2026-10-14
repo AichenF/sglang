@@ -145,5 +145,4 @@ def run(qkv, cos_sin, positions, locations, k_cache, v_cache, heads_per_cta=16):
         k_cache.shape[0],
         num_warps=4,
         enable_fp_fusion=False,
-        debug=True,
     )
