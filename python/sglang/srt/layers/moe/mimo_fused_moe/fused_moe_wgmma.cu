@@ -4813,93 +4813,6 @@ __device__ __forceinline__ void fc2_consumer(const Params& P, unsigned epoch, ui
         }
     }
 
-    // Exact M32 BF16 output: six BF16 values + epoch per LL packet. Keep the
-    // physical FP32-path pitches and all rank slots; only the active packet
-    // count changes. Each local partial rounds once before rank-ordered FP32
-    // accumulation. The legacy FP32-output path below keeps its precision.
-    if constexpr (EXACT_M == 32 && PARTS == 1) {
-        static_assert(NT == 32 && PARTS == 1);
-        if (P.out_bf16) {
-            constexpr int BMSG = (128 + 5) / 6, TPR = N_FC2_TILES / 8;
-            constexpr int H = N_FC2_TILES / TPR, TPS = NT / H;
-            constexpr int NMSG = NT * BMSG;
-            const int owner = tile / TPR, lt = tile % TPR;
-            uint4* dst = P.rs_bufs[owner] +
-                ((size_t)((P.my_rank * N_FC2_PARTS_MAX) * TPR + lt) * NT) * MSG_PER_TOK;
-            for (int i = tid; i < NMSG; i += NCONS) {
-                const int tok = i / BMSG, j = i - tok * BMSG;
-                const float* p = out_s + tok * HST_STRIDE + 6 * j;
-                const uint32_t x = pack_bf16x2_rn(p[0], p[1]);
-                // The final packet has only rows126/127, never read padding.
-                const uint32_t y = j < BMSG - 1 ? pack_bf16x2_rn(p[2], p[3]) : 0u;
-                const uint32_t z = j < BMSG - 1 ? pack_bf16x2_rn(p[4], p[5]) : 0u;
-                st_ll(dst + tok * MSG_PER_TOK + j, make_uint4(x, y, z, epoch));
-            }
-            if (tid == 0) STAMP(P, 3);
-            {
-                const int olt = blockIdx.x / H, slice = blockIdx.x % H;  // codespell:ignore
-                const int rtile = P.my_rank * TPR + olt, t0 = slice * TPS;  // codespell:ignore
-                const uint4* rs_me = P.rs_bufs[P.my_rank];
-                for (int i = tid; i < TPS * BMSG; i += NCONS) {
-                    const int tok = t0 + i / BMSG, j = i - (i / BMSG) * BMSG;
-                    uint4 m[8];
-                    unsigned pending = 0xffu;
-                    do {
-#pragma unroll
-                        for (int d = 0; d < 8; ++d)
-                            if (pending & (1u << d))
-                                m[d] = ld_ll(rs_me +
-                                    ((size_t)((d * N_FC2_PARTS_MAX) * TPR + olt) * NT + tok) * MSG_PER_TOK + j);  // codespell:ignore
-#pragma unroll
-                        for (int d = 0; d < 8; ++d)
-                            if ((pending & (1u << d)) && m[d].w == epoch) pending &= ~(1u << d);
-                    } while (pending);
-                    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f, a4 = 0.f, a5 = 0.f;
-#pragma unroll
-                    for (int d = 0; d < 8; ++d) {
-                        a0 += bf16lo(m[d].x); a1 += bf16hi(m[d].x);
-                        a2 += bf16lo(m[d].y); a3 += bf16hi(m[d].y);
-                        a4 += bf16lo(m[d].z); a5 += bf16hi(m[d].z);
-                    }
-                    const uint4 mo = make_uint4(pack_bf16x2_rn(a0, a1), pack_bf16x2_rn(a2, a3),
-                                               pack_bf16x2_rn(a4, a5), epoch);
-                    for (int d = 0; d < 8; ++d)
-                        st_ll(P.ag_bufs[d] + ((size_t)rtile * NT + tok) * MSG_PER_TOK + j, mo);
-                }
-            }
-            if (tid == 0) STAMP(P, 4);
-            {
-                constexpr int MAXMSG = (NMSG + NCONS - 1) / NCONS;
-                const uint4* ag_me = P.ag_bufs[P.my_rank] + (size_t)tile * NT * MSG_PER_TOK;
-                uint4 m[MAXMSG];
-                unsigned pending = 0;
-#pragma unroll
-                for (int k = 0; k < MAXMSG; ++k)
-                    if (tid + k * NCONS < NMSG) pending |= 1u << k;
-                do {
-#pragma unroll
-                    for (int k = 0; k < MAXMSG; ++k)
-                        if (pending & (1u << k)) {
-                            const int i = tid + k * NCONS, tok = i / BMSG, j = i - tok * BMSG;
-                            m[k] = ld_ll(ag_me + tok * MSG_PER_TOK + j);
-                        }
-#pragma unroll
-                    for (int k = 0; k < MAXMSG; ++k)
-                        if ((pending & (1u << k)) && m[k].w == epoch) {
-                            const int i = tid + k * NCONS, tok = i / BMSG, j = i - tok * BMSG;
-                            const size_t off = (size_t)tok * DIM + tile * 128 + 6 * j;
-                            uint32_t* o = reinterpret_cast<uint32_t*>(P.out_bf16 + off);
-                            o[0] = m[k].x;
-                            if (j < BMSG - 1) { o[1] = m[k].y; o[2] = m[k].z; }
-                            pending &= ~(1u << k);
-                        }
-                } while (pending);
-            }
-            if (tid == 0) STAMP(P, 5);
-            return;
-        }
-    }
-
     // ---- two-phase LL all-reduce over the 128-row tile ----
     // Polling is batched (all sources / all of a thread's messages in flight at once) so the
     // cost is one memory round trip per batch, not one per message per source.
@@ -5525,13 +5438,7 @@ static void fill_common_and_launch(Params& P, int M,
     // M_pad and the all-reduce polling window compile-time constants throughout the inlined prologue/FC1/FC2 path.
     if (M == M_pad && ndev == 8 && grid == 132) {
         if (M == 24 && parts == 2) { launch<24, 2, 24>(P, grid, stream); return; }
-        if (M == 32 && parts == 1) {
-            // The BF16 full operator uses96 FC2 CTAs on the same132-CTA
-            // grid. Keep the legacy FP32-output operator's original split.
-            if (P.out_bf16) launch<32, 2, 32>(P, grid, stream);
-            else launch<32, 1, 32>(P, grid, stream);
-            return;
-        }
+        if (M == 32 && parts == 1) { launch<32, 2, 32>(P, grid, stream); return; }   // 96 FC2 CTAs on the same 132-CTA grid
         if (M == 48 && parts == 3) { launch<48, 3, 48>(P, grid, stream); return; }
         if (M == 64 && parts == 2) { launch<64, 2, 64>(P, grid, stream); return; }
     }
@@ -5545,25 +5452,6 @@ static void fill_common_and_launch(Params& P, int M,
         case 64: launch_parts<64>(P, grid, stream); break;
         default: TORCH_CHECK(false, "unsupported M_pad");
     }
-}
-
-// Legacy entry point: routing (union_experts + gate_w) and the quantized activation given by the host; fp32 out.
-void fused_moe(torch::Tensor x_fp8, torch::Tensor x_scale, torch::Tensor fc1_w, torch::Tensor fc1_s, torch::Tensor fc1_s2,
-               torch::Tensor fc2_w, torch::Tensor fc2_s, torch::Tensor fc2_s2,
-               torch::Tensor union_experts, torch::Tensor gate_w, torch::Tensor h_buf, torch::Tensor cs_buf, torch::Tensor h_flags,
-               torch::Tensor rs_ptrs, torch::Tensor ag_ptrs, int64_t my_rank, int64_t ndev, int64_t epoch, torch::Tensor out, int64_t n_fc1,
-               torch::Tensor dbg, int64_t mode, torch::Tensor work, int64_t reserve, int64_t parts, torch::Tensor part_flags) {
-    (void)epoch;   // the tag comes from work[2]
-    const int M = (int)x_fp8.size(0), U = (int)union_experts.size(0);
-    TORCH_CHECK(U >= 1 && U <= MAXU, "U must be in [1, 384]");
-    Params P{};
-    P.pre_routed = 1;
-    P.xq_buf = x_fp8.data_ptr<uint8_t>(); P.xs_buf = x_scale.data_ptr<float>();
-    P.union_experts = union_experts.data_ptr<int>(); P.gate_w = gate_w.data_ptr<float>(); P.U = U;
-    P.out_f32 = out.data_ptr<float>(); P.out_bf16 = nullptr;
-    P.n_exp = NEXP;
-    set_weights(P, fc1_w, fc1_s, fc1_s2, fc2_w, fc2_s, fc2_s2);
-    fill_common_and_launch(P, M, h_buf, cs_buf, h_flags, rs_ptrs, ag_ptrs, my_rank, ndev, n_fc1, dbg, mode, work, reserve, parts, part_flags);
 }
 
 // Complete path: bf16 hidden + residual -> RMSNorm -> router/top-8 -> MoE -> all-reduce -> bf16 out (+ bf16 residual_out).
@@ -5695,7 +5583,6 @@ void fused_moe_full_tp(torch::Tensor partial, torch::Tensor residual, torch::Ten
 }  // namespace fmoe
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("fused_moe", &fmoe::fused_moe);
     m.def("fused_moe_full", &fmoe::fused_moe_full);
     m.def("fused_moe_full_tp", &fmoe::fused_moe_full_tp);
     m.attr("INPUT_TP") = (int)FMOE_INPUT_TP;

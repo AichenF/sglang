@@ -1,8 +1,8 @@
 """Host side for fused_moe_wgmma.cu: the JIT build, per-rank state (staging buffers, flags, P2P all-reduce
 buffers, prologue scratch) and the launchers (`run_fused_full` = complete path from bf16 hidden/residual,
-`run_fused_full_tp` = exact-M32 TP8 entry with the input all-reduce in the prologue, `run_fused` = legacy
-pre-routed path). The kernel consumes the SGLang Humming MoE layer's weight tensors in place. Reference
-implementations and test helpers live in benchmark/kernels/mimo_fused_moe/.
+`run_fused_full_tp` = exact-M32 TP8 entry with the input all-reduce in the prologue). The kernel consumes the
+SGLang Humming MoE layer's weight tensors in place. Reference implementations and test helpers live in
+benchmark/kernels/mimo_fused_moe/.
 
 Kernel weight format (= layer.w13_weight / w13_weight_scale / w13_weight_scale_2 and w2_* after SGLang's prepare_humming_moe_layer):
   w:  int32 [E][K/32][4R]  Humming weight_repack_nk order (see fused_moe_wgmma.cu, "Weight layout")
@@ -237,63 +237,6 @@ def default_n_fc1(device, parts=1):
     return (
         torch.cuda.get_device_properties(device).multi_processor_count
         - N_FC2_TILES * parts
-    )
-
-
-def run_fused(
-    state,
-    x_fp8,
-    x_scale,
-    w,
-    union_experts,
-    gate_w,
-    out,
-    my_rank,
-    ndev,
-    epoch,
-    n_fc1=None,
-    dbg=None,
-    mode=0,
-    reserve=-1,
-    parts=None,
-):
-    """Legacy pre-routed path. w = dict(fc1_w, fc1_s, fc1_s2, fc2_w, fc2_s, fc2_s2) (prep_fc1/prep_fc2 or humming_layer_weights)."""
-    if parts is None:
-        parts = default_parts(x_fp8.shape[0])
-    if n_fc1 is None:
-        n_fc1 = default_n_fc1(state.device, parts)
-    if dbg is None:
-        dev = str(state.device)
-        if dev not in _EMPTY:
-            _EMPTY[dev] = torch.empty(0, dtype=torch.int64, device=state.device)
-        dbg = _EMPTY[dev]
-    ext().fused_moe(
-        x_fp8.view(torch.uint8),
-        x_scale,
-        w["fc1_w"],
-        w["fc1_s"],
-        w["fc1_s2"],
-        w["fc2_w"],
-        w["fc2_s"],
-        w["fc2_s2"],
-        union_experts,
-        gate_w,
-        state.h_buf,
-        state.cs_buf,
-        state.h_flags,
-        state.rs_ptrs,
-        state.ag_ptrs,
-        my_rank,
-        ndev,
-        epoch,
-        out,
-        n_fc1,
-        dbg,
-        mode,
-        state.work,
-        reserve,
-        parts,
-        state.part_flags,
     )
 
 
