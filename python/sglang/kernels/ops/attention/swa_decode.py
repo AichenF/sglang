@@ -187,6 +187,15 @@ def swa_decode_attention(
         and q.stride(0) % 8 == 0
         and q.stride(1) % 8 == 0
         and q.data_ptr() % 16 == 0
+        # The CUDA kernel hard-codes the cache row strides (192 / 128 elements),
+        # row-contiguous page-table rows and fp32 sinks.
+        and dqk == 192
+        and dv == 128
+        and k2.stride(0) == 192
+        and v2.stride(0) == 128
+        and page_table.stride(1) == 1
+        and page_table.stride(0) == page_table.shape[1]
+        and (sinks is None or sinks.dtype == torch.float32)
     ):
         _mma_module().swa_decode_mma(
             q, k2, v2, page_table, cache_seqlens,

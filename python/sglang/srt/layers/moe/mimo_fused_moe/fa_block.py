@@ -210,6 +210,9 @@ class FaBlock:
         ):
             _log_once("fb_backend", "fallback: backend (local %s, page %s)", lab is not None, backend.page_size)
             return None
+        if any(t.shape[0] * t.stride(0) * t.element_size() >= (1 << 32) for t in (keys, values)):
+            _log_once("fb_kv4g", "fallback: KV cache larger than 4 GB (the kernel uses 32-bit cache offsets)")
+            return None
         page_table = md.page_table
         seqlens = md.cache_seqlens_int32
         if (

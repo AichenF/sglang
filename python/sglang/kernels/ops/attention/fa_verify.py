@@ -41,6 +41,12 @@ def _num_sms(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
+@cache_once
+def _is_sm90(device_index: int) -> bool:
+    # wgmma / TMA kernel: built for sm_90a only
+    return torch.cuda.get_device_capability(device_index) == (9, 0)
+
+
 _NO_ROPE = {}
 
 
@@ -74,6 +80,8 @@ def can_use_fa_verify(*, q, forward_mode, num_kv_heads, num_q_heads, head_dim, v
     if window_size[0] >= 0 or window_size[1] >= 0:
         return False
     if q.dtype != torch.bfloat16 or q.stride(-1) != 1:
+        return False
+    if not q.is_cuda or not _is_sm90(q.device.index if q.device.index is not None else torch.cuda.current_device()):
         return False
     # Plain bf16 attention only: no sinks / descales / score mods / block-scale factors.
     if kwargs:

@@ -486,8 +486,7 @@ class BlkLayer:
             or xs.dtype != torch.float32
             or tuple(xs.shape) != (32, 48)
             or xs.stride(0) != 1
-            or xs.stride(1) % 4 != 0
-            or xs.stride(1) < 32
+            or xs.stride(1) != 32
             or xs.data_ptr() % 16 != 0
         ):
             _log_once("mega_fb_x", "mega fallback: x %s %s %s scale %s %s %s", xq.dtype, tuple(xq.shape), xq.stride(), xs.dtype,
