@@ -511,6 +511,10 @@ class KVCacheConfigurator:
         # from one byte buffer, then return. Gated to the target worker
         # (req_to_token_pool is None); supports hybrid Mamba and hybrid SWA (not DSV4).
         if get_memory().enable_unified_memory and req_to_token_pool is None:
+            if envs.SGLANG_FULL_ATTENTION_KV_FP8.get() and not self.is_draft_worker:
+                raise ValueError(
+                    "SGLANG_FULL_ATTENTION_KV_FP8 does not support unified memory"
+                )
             reject_out_of_tree_path(
                 current_platform,
                 subsystem="the unified memory pool (--enable-unified-memory)",
@@ -1813,11 +1817,37 @@ class KVCacheConfigurator:
             if self.draft_swa_full_capacity
             else swa_max_total_num_tokens
         )
+        full_kv_dtype = None
+        if envs.SGLANG_FULL_ATTENTION_KV_FP8.get() and not self.is_draft_worker:
+            if get_model().quantization_param_path is not None:
+                raise ValueError(
+                    "SGLANG_FULL_ATTENTION_KV_FP8 does not support quantization_param_path"
+                )
+            if attention_backends() != ("fa3", "fa3"):
+                raise ValueError(
+                    "SGLANG_FULL_ATTENTION_KV_FP8 requires fa3 for prefill and decode"
+                )
+            if get_disagg().disaggregation_mode != "null":
+                raise ValueError(
+                    "SGLANG_FULL_ATTENTION_KV_FP8 does not support disaggregation"
+                )
+            if (
+                getattr(self.model_config.hf_text_config, "model_type", None) != "mimo_v2"
+                or self.kv_cache_dtype != torch.bfloat16
+                or self.pool_page_size != 1
+                or torch.device(self.device).type != "cuda"
+                or envs.SGLANG_USE_HND_KVCACHE.get()
+            ):
+                raise ValueError(
+                    "SGLANG_FULL_ATTENTION_KV_FP8 requires supported BF16 NHD/page1 CUDA pools"
+                )
+            full_kv_dtype = torch.float8_e4m3fn
         token_to_kv_pool = SWAKVPool(
             size=full_max_total_num_tokens,
             size_swa=size_swa,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
+            full_kv_dtype=full_kv_dtype,
             post_capture_active=self.post_capture_kv_active,
             head_num=self.model_config.get_num_kv_heads(
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size

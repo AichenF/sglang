@@ -1077,6 +1077,7 @@ class Envs:
     # FlashInfer, FlashMLA, and TRT-LLM
     # ===================================================================
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
+    SGLANG_FULL_ATTENTION_KV_FP8 = EnvBool(False)
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
