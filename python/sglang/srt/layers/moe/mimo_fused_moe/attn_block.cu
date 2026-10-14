@@ -748,10 +748,7 @@ struct MegaParams : Params {
     const float* qsw;                  // weight block scales [27][48] fp32
     __nv_bfloat16* qout;               // [32][3392] bf16 qkv (written by phase 0, read by the attention CTAs after the flags)
     unsigned* qflags;                  // [128] qkv-rows-ready flags (epoch), one per 128-B line
-    uint4* qll;                        // unused (null)
     int qsx_ld, qpre;                  // qpre: weight units TMA-issued before griddepcontrol.wait (<= ring stages)
-    const unsigned* xflags;            // unused (null)
-    const int* xwork;                  // unused (null)
 };
 
 __device__ __forceinline__ uint64_t desc_lo(uint32_t lo, uint32_t hi) { uint64_t d; asm("mov.b64 %0, {%1, %2};" : "=l"(d) : "r"(lo), "r"(hi)); return d; }

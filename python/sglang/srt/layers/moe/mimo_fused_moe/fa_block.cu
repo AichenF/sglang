@@ -92,7 +92,7 @@ constexpr int MODE_DBG_QLATE_SHIFT = 16;                 // diagnostics: mode bi
 constexpr float LOG2E = 1.4426950408889634f;
 
 struct Params {
-    CUtensorMap tm_pt;                 // page table [NREQ][pt_width] int32: box {64, 1} (one tile's entries), OOB -> 0
+    CUtensorMap tm_pt;                 // page table [NREQ][S] int32: box {64, 1} (one tile's entries), OOB -> 0
     CUtensorMap tm_w;                  // o_proj weight [6144][2048] bf16: box {64, 96}, SWIZZLE_128B
     CUtensorMap tm_a;                  // combined attention output [32][2048] bf16: box {64, 32}, SWIZZLE_128B
     const __nv_bfloat16* qkv;          // [32][3392] un-rotated qkv rows (the previous kernel's output)
@@ -102,7 +102,6 @@ struct Params {
     __nv_bfloat16* kc;                 // key cache rows (192 elements, stride ks)
     __nv_bfloat16* vc;                 // value cache rows (128 elements, stride vs)
     long long ks, vs;
-    const int* pt;                     // [NREQ][pt_stride] page table (page size 1)
     const int* seqlens;                // [NREQ] (include the 8 verify tokens)
     float* part_o;                     // [NREQ * ROWS][NSPLIT][DV] fp32 normalized split partials
     float* part_lse;                   // [NREQ * ROWS][NSPLIT] fp32 log2-domain LSE (-inf: empty split)
@@ -113,7 +112,7 @@ struct Params {
     uint4* peer[TP_NDEV];              // fused MoE prologue IPC buffers (IN_RS at message 0)
     const int* work;                   // fused MoE work counters: epoch = work[2] + 1
     unsigned long long* dbg;           // optional [NCTA][32] globaltimer stamps
-    int pt_stride, pt_width, my_rank, mode;
+    int my_rank, mode;
     float scale_log2;                  // sm_scale * log2(e)
 };
 
@@ -915,7 +914,7 @@ static torch::Tensor make_map(const void* base, int64_t rows, int64_t row_stride
     TORCH_CHECK(r == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed: ", (int)r);
     return out;
 }
-// page table [NREQ][S] int32 (row stride pt_stride elements) -> map with box {64, 1}, no swizzle, OOB elements read as 0
+// page table [NREQ][S] int32 (row stride pt.stride(0) elements) -> map with box {64, 1}, no swizzle, OOB elements read as 0
 static void make_ptmap(CUtensorMap* out, const torch::Tensor& pt) {
     const cuuint64_t dims[2] = {(cuuint64_t)pt.size(1), (cuuint64_t)pt.size(0)};
     const cuuint64_t strides[1] = {(cuuint64_t)pt.stride(0) * 4};
@@ -969,7 +968,6 @@ void fa_block(torch::Tensor qkv, torch::Tensor cos_sin, torch::Tensor positions,
     P.positions = positions.data_ptr(); P.loc = loc.data_ptr();
     P.kc = reinterpret_cast<__nv_bfloat16*>(kc.data_ptr()); P.vc = reinterpret_cast<__nv_bfloat16*>(vc.data_ptr());
     P.ks = kc.stride(0); P.vs = vc.stride(0);
-    P.pt = pt.data_ptr<int>(); P.pt_stride = (int)pt.stride(0); P.pt_width = (int)pt.size(1);
     make_ptmap(&P.tm_pt, pt);
     P.seqlens = seqlens.data_ptr<int>();
     P.part_o = part_o.data_ptr<float>(); P.part_lse = part_lse.data_ptr<float>();
