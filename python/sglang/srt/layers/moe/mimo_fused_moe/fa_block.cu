@@ -164,7 +164,16 @@ __device__ __forceinline__ void cluster_sync_relaxed() { asm volatile("barrier.c
 __device__ __forceinline__ void st_async_v2(uint32_t addr, float a, float b, uint32_t bar) {
     asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v2.f32 [%0], {%1, %2}, [%3];" :: "r"(addr), "f"(a), "f"(b), "r"(bar) : "memory");
 }
+#ifndef FAB_STAMPS
+#define FAB_STAMPS 0   // 1: diagnostics build -- per-CTA globaltimer stamps (+ the SM id) into P.dbg ([NCTA][32] int64, fa_block.py's
+#endif                 //    SGLANG_MIMO_FA2_STAMP_DIR, build with FAB_NVCC_FLAGS=-DFAB_STAMPS=1); 0: compiled out
+#if FAB_STAMPS
 #define BSTAMP(k) do { if (P.dbg) P.dbg[blockIdx.x * 32 + (k)] = gtimer(); } while (0)
+#define SMSTAMP(k) do { if (P.dbg) { unsigned sm_; asm volatile("mov.u32 %0, %%smid;" : "=r"(sm_)); P.dbg[blockIdx.x * 32 + (k)] = sm_; } } while (0)
+#else
+#define BSTAMP(k) do {} while (0)
+#define SMSTAMP(k) do {} while (0)
+#endif
 
 // bf16x2 RoPE pieces with the rounding of the mimo_rope_kv Triton kernel: lo = fma.rn(x, c, -mul.rn(y, s)), hi = fma.rn(y, c, mul.rn(x, s))
 __device__ __forceinline__ uint32_t bf2_mul(uint32_t a, uint32_t b) { uint32_t r; asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b)); return r; }
@@ -266,7 +275,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) fa_block_kernel(const __grid_cons
     const int h = (int)cluster_rank();
     if (tid == 0) {
         BSTAMP(0);
-        if (P.dbg) { unsigned sm_; asm volatile("mov.u32 %0, %%smid;" : "=r"(sm_)); P.dbg[blockIdx.x * 32 + 13] = sm_; }
+        SMSTAMP(13);
 #pragma unroll
         for (int s = 0; s < STAGES; ++s) { mbar_init(kv_full + s * 8, 128); mbar_init(kv_empty + s * 8, 256); }
         for (int i = 0; i < NKT; ++i) mbar_init(wfull + i * 8, 1);
@@ -970,6 +979,7 @@ void fa_block(torch::Tensor qkv, torch::Tensor cos_sin, torch::Tensor positions,
     P.partial = reinterpret_cast<__nv_bfloat16*>(partial.data_ptr());
     for (int d = 0; d < TP_NDEV; ++d) P.peer[d] = reinterpret_cast<uint4*>(peers.data_ptr<int64_t>()[d]);
     P.work = work.data_ptr<int>();
+    TORCH_CHECK(FAB_STAMPS || dbg.numel() == 0, "dbg stamps need a FAB_NVCC_FLAGS=-DFAB_STAMPS=1 build");
     P.dbg = dbg.numel() >= (int64_t)NCTA * 32 ? reinterpret_cast<unsigned long long*>(dbg.data_ptr()) : nullptr;
     P.my_rank = (int)my_rank;
     int md = (int)mode & ~(MODE_POS64 | MODE_LOC64);
@@ -1002,6 +1012,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("NOP") = fab::NOP;
     m.attr("NSPLIT") = fab::NSPLIT;
     m.attr("SMEM_ALLOC") = fab::SMEM_ALLOC;
+    m.attr("FAB_STAMPS") = FAB_STAMPS;
     m.attr("NW_EARLY") = fab::NW_EARLY;
     m.attr("MODE_FULL_LOCAL") = fab::MODE_FULL_LOCAL;
     m.attr("MODE_NO_PUSH") = fab::MODE_NO_PUSH;

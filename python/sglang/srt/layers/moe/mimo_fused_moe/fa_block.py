@@ -98,8 +98,9 @@ def enabled() -> bool:
     return os.environ.get("SGLANG_MIMO_FA2", "1") == "1"
 
 
-# Diagnostics (off unless set): per-layer in-kernel globaltimer stamps [132][32]. Creating <dir>/dump.<n> (the fused MoE / blk stamp-dump
-# trigger, same dir) makes every rank write <dir>/fa2_stamps_rank<r>_<n>.pt = {layer_id: int64 [132 * 32]} of the last replay.
+# Diagnostics (off unless set): per-layer in-kernel globaltimer stamps [132][32]. The stamps are compiled in only by a diagnostics build
+# (FAB_NVCC_FLAGS=-DFAB_STAMPS=1; without it the directory is ignored). Creating <dir>/dump.<n> (the fused MoE / blk stamp-dump trigger,
+# same dir) makes every rank write <dir>/fa2_stamps_rank<r>_<n>.pt = {layer_id: int64 [132 * 32]} of the last replay.
 _STAMP_DIR = os.environ.get("SGLANG_MIMO_FA2_STAMP_DIR", "")
 _stamp_layers = []
 _stamp_thread = None
@@ -142,7 +143,9 @@ class FaBlock:
         self.pdl = os.environ.get("SGLANG_MIMO_FA2_PDL", "1") == "1"
         self.scratch = _scratch(w.device)
         self.dbg = None
-        if _STAMP_DIR:
+        if _STAMP_DIR and not getattr(ext(), "FAB_STAMPS", 0):
+            _log_once("stamps", "SGLANG_MIMO_FA2_STAMP_DIR ignored: the stamps need a FAB_NVCC_FLAGS=-DFAB_STAMPS=1 build")
+        elif _STAMP_DIR:
             global _stamp_thread
             self.dbg = torch.zeros(ext().NCTA * 32, dtype=torch.int64, device=w.device)
             _stamp_layers.append((decoder_layer.layer_id, self.dbg))
