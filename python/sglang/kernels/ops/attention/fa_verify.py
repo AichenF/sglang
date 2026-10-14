@@ -20,7 +20,7 @@ _W = 8
 _HQ = 16
 _D = 192
 _DV = 128
-_STAGES = int(os.environ.get("SGLANG_FA_VERIFY_STAGES", "4"))
+_STAGES = int(os.environ.get("SGLANG_FA_VERIFY_STAGES", "4"))  # KV ring depth: 4 or 5
 _PDL = os.environ.get("SGLANG_FA_VERIFY_PDL", "1") == "1"
 _NSPLIT_ENV = int(os.environ.get("SGLANG_FA_VERIFY_NSPLIT", "0"))
 _INTERLEAVE = int(os.environ.get("SGLANG_FA_VERIFY_INTERLEAVE", "1"))
@@ -43,20 +43,8 @@ def _num_sms(device_index: int) -> int:
 
 @cache_once
 def _is_sm90(device_index: int) -> bool:
-    # wgmma / TMA kernel: built for sm_90a only
+    # wgmma kernel: built for sm_90a only
     return torch.cuda.get_device_capability(device_index) == (9, 0)
-
-
-_NO_ROPE = {}
-
-
-def _no_rope(device):
-    key = str(device)
-    t = _NO_ROPE.get(key)
-    if t is None:
-        t = torch.empty((0,), dtype=torch.int64, device=device)
-        _NO_ROPE[key] = t
-    return t
 
 
 def pick_nsplit(bs: int, device: torch.device) -> int:
@@ -91,10 +79,7 @@ def can_use_fa_verify(*, q, forward_mode, num_kv_heads, num_q_heads, head_dim, v
 
 def fa_verify_attention(q, k_cache, v_cache, page_table, cache_seqlens, *, sm_scale: float, out=None,
                         nsplit: int | None = None, stages: int | None = None, use_pdl: bool | None = None,
-                        interleave: int | None = None, rope=None):
-    """rope = (cos_sin [max_pos, 64] bf16, positions [M] int32/int64): RoPE + KV-cache store of the new tokens are
-    fused (q must then be the UN-rotated q slice of the contiguous fused qkv rows [M, 16*192 + 192 + 128], and the
-    cache slots of the new tokens are the page-table entries of positions cache_seqlens - 8 .. cache_seqlens - 1)."""
+                        interleave: int | None = None):
     """q: [M, 16, 192] (row/head strided view ok); k_cache [slots, ..., 192]; v_cache [slots, ..., 128];
     page_table [bs, pages] int32 (page_size 1); cache_seqlens [bs] int32 (includes the 8 verify tokens)."""
     m, hq, d = q.shape
@@ -116,7 +101,5 @@ def fa_verify_attention(q, k_cache, v_cache, page_table, cache_seqlens, *, sm_sc
         ns, float(sm_scale), stages if stages is not None else _STAGES,
         int(_PDL if use_pdl is None else use_pdl),
         int(_INTERLEAVE if interleave is None else interleave),
-        rope[0] if rope is not None else _no_rope(q.device),
-        rope[1] if rope is not None else _no_rope(q.device),
     )
     return out
