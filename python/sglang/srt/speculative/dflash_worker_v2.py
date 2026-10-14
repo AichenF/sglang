@@ -189,6 +189,10 @@ class _DflashDraftSampler:
             except Exception as e:
                 logger.warning("DFLASH draft fp8 LM head disabled: %s", e)
                 self._fp8_head = None
+        # goal12-glue (SGLANG_G12_VERIFY_EARLY): the fused argmax also writes the verify candidates into the target
+        # runner's static input_ids (g12_cand); g12_cand_bs = the draft graph sizes captured that way
+        self.g12_cand = None
+        self.g12_cand_bs = set()
         # fused shard argmax + 16-B pair multimem all-gather + select
         # (one Triton reduce, one symm-mem gather, one tiny select) instead of
         # torch.max + two NCCL all-gathers + argmax + gather.
@@ -247,7 +251,22 @@ class _DflashDraftSampler:
             hs = hidden_states
             if hs.dtype != self.weight.dtype:
                 hs = hs.to(self.weight.dtype)
-            fused.argmax(self._logits(hs), self.out, self.org_vocab_start, group=self.block_size)
+            cand = self.g12_cand
+            n_tok = int(hidden_states.shape[0])
+            use_cand = (
+                cand is not None
+                and input_ids is not None
+                and input_ids.dtype == torch.int64
+                and input_ids.is_contiguous()
+                and int(input_ids.numel()) >= n_tok
+                and int(cand.numel()) >= n_tok
+            )
+            fused.argmax(
+                self._logits(hs), self.out, self.org_vocab_start, group=self.block_size,
+                cand=cand if use_cand else None, cand_src=input_ids if use_cand else None,
+            )
+            if use_cand and torch.cuda.is_current_stream_capturing():
+                self.g12_cand_bs.add(bs)
             return
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :].reshape(
             -1, hidden_states.shape[-1]
@@ -587,6 +606,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._maybe_merge_trained_mask_embedding()
         self._cache_full_embed_weight()
+        self._g12_init_slope_diag()
         if get_parallel().tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
@@ -1084,6 +1104,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+        # goal12-glue: after both KV pools are sized (the replica comes out of the non-static reserve, the KV budget is
+        # unchanged) and before the target graphs are captured
+        self._g12_init_embed_replica()
 
     def init_attention_backends(self):
         with (
@@ -1163,9 +1186,23 @@ class DFlashWorkerV2(BaseSpecWorker):
                             # replay prep instead (it reads the bonus column + the sampler output directly)
                             if not step_prep.enabled():
                                 self.draft_model_runner.capture_tail_hooks.append(self._draft_tokens_capture_hook)
+                    self._g12_init_verify_early()
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
+            if get_parallel().tp_rank == 0:
+                # goal12-glue: the process-wide input-buffer pool aliases same-sized static inputs of the draft and the
+                # target runners -> any prep of one runner concurrent with the other's graph races on them
+                try:
+                    tb = self._target_worker.model_runner.decode_cuda_graph_runner.buffers
+                    db = self.draft_model_runner.decode_cuda_graph_runner.buffers
+                    logger.info(
+                        "goal12 static input aliasing draft/target: %s",
+                        {k: getattr(tb, k).data_ptr() == getattr(db, k).data_ptr()
+                         for k in ("input_ids", "positions", "out_cache_loc", "req_pool_indices", "seq_lens")},
+                    )
+                except Exception as e:
+                    logger.info("goal12 static input aliasing check failed: %r", e)
 
     def _prewarm_batch_size(self, block_size: int) -> int:
         """Largest batch the non-greedy verify path can see in one step."""
@@ -1867,6 +1904,128 @@ class DFlashWorkerV2(BaseSpecWorker):
             logger.info(
                 "DFLASH cached full embed on GPU for dp attention: shape=%s",
                 list(self._full_embed_gpu.shape),
+            )
+
+    def _g12_init_embed_replica(self) -> None:
+        """goal12-glue (SGLANG_G12_EMBED_LOCAL): replicate the full target embedding table on this rank so the TP8
+        fused step-start embeddings (embed_nq of the verify, embed_ag of the draft block) gather locally instead of
+        exchanging rows over NVLink. Collective over the TP group (every rank runs __init__ at the same point)."""
+        if not envs.SGLANG_G12_EMBED_LOCAL.get() or get_parallel().attn_dp_enabled or _is_npu or not is_cuda():
+            return
+        if not envs.SGLANG_DFLASH_TP_EMBED.get():
+            return
+        tp_group = get_parallel().tp_group
+        tp_size = int(tp_group.world_size)
+        if tp_size != 8:
+            return
+        target_model = self._target_worker.model_runner.model
+        emb = unwrap_lora_layer(target_model.get_input_embeddings())
+        w = getattr(emb, "weight", None)
+        shard = getattr(emb, "shard_indices", None)
+        if (
+            w is None
+            or shard is None
+            or w.dtype != torch.bfloat16
+            or w.dim() != 2
+            or int(w.shape[1]) != 6144
+            or int(shard.added_vocab_start_index) != int(shard.added_vocab_end_index)
+        ):
+            return
+        rank = int(tp_group.rank_in_group)
+        num_org = int(shard.num_org_elements)
+        starts = [0] * tp_size
+        nums = [0] * tp_size
+        for r in range(tp_size):
+            si = emb._get_indices(
+                emb.num_embeddings_padded, emb.org_vocab_size_padded, emb.num_embeddings, emb.org_vocab_size, r, tp_size
+            )
+            starts[r] = int(si.org_vocab_start_index)
+            nums[r] = int(si.org_vocab_end_index) - int(si.org_vocab_start_index)
+        vocab = sum(nums)
+        if nums[rank] != num_org or any(starts[r] != sum(nums[:r]) for r in range(tp_size)):
+            logger.warning("goal12 embed replica: unexpected shard layout %s / %s; disabled", starts, nums)
+            return
+        shard_t = w.data[:num_org].contiguous()
+        if all(n == num_org for n in nums):
+            full = torch.empty((vocab, w.shape[1]), dtype=w.dtype, device=w.device)
+            dist.all_gather_into_tensor(full, shard_t, group=tp_group.device_group)
+        else:
+            parts = [torch.empty((n, w.shape[1]), dtype=w.dtype, device=w.device) for n in nums]
+            dist.all_gather(parts, shard_t, group=tp_group.device_group)
+            full = torch.cat(parts, dim=0)
+            del parts
+        del shard_t
+        if not torch.equal(full[starts[rank] : starts[rank] + num_org], w.data[:num_org]):
+            raise RuntimeError("goal12 embed replica: own shard mismatch")
+        ranges = torch.zeros(2 * tp_size, dtype=torch.int64)
+        ranges[tp_size + rank] = vocab
+        emb._g12_full_weight = full
+        emb._g12_local_ranges = ranges
+        # online weight updates would leave the replica (and the graphs reading it) stale: let the updater reject them
+        emb._derived_weight_cache_error = (
+            "Online weight updates are not supported while the replicated embedding table (goal12 "
+            "SGLANG_G12_EMBED_LOCAL=1) is active: it is not refreshed by in-place weight loads. Restart with "
+            "SGLANG_G12_EMBED_LOCAL=0 to use online weight updates."
+        )
+        if rank == 0:
+            logger.info(
+                "goal12 embed replica: full table %s (%.2f GB/rank) -> local embed_nq / embed_ag",
+                tuple(full.shape), full.numel() * full.element_size() / 1e9,
+            )
+
+    def _g12_init_verify_early(self) -> None:
+        """goal12-glue (SGLANG_G12_VERIFY_EARLY): point the draft sampler's candidate write at the target runner's static
+        input_ids (before the draft graphs are captured)."""
+        self._g12_cand_buf = None
+        if not envs.SGLANG_G12_VERIFY_EARLY.get() or not step_prep.enabled() or self._draft_sampler is None:
+            return
+        if self._is_domino or self.selector is not None or self.lilicorr is not None or self._need_mamba_verify_commit:
+            return
+        tr = getattr(self._target_worker.model_runner, "decode_cuda_graph_runner", None)
+        buf = getattr(getattr(tr, "buffers", None), "input_ids", None)
+        if buf is None or buf.dtype != torch.int64 or not buf.is_contiguous() or buf.dim() != 1:
+            logger.warning("goal12 verify-early: no usable target static input_ids; disabled")
+            return
+        self._g12_cand_buf = buf
+        self._draft_sampler.g12_cand = buf
+        if get_parallel().tp_rank == 0:
+            logger.info("goal12 verify-early: draft argmax writes the verify candidates into the target input_ids %s",
+                        tuple(buf.shape))
+
+    def _g12_verify_early_ok(self, batch, bs: int) -> bool:
+        buf = getattr(self, "_g12_cand_buf", None)
+        return (
+            buf is not None
+            and bs in self._draft_sampler.g12_cand_bs
+            and int(buf.numel()) >= bs * int(self.block_size)
+            and self._step_prep_bs_ok(bs)
+            and not batch.has_grammar
+            and not self._need_mamba_verify_commit
+            and not get_parallel().attn_dp_enabled
+            and not batch.is_extend_in_batch
+            and SIMULATE_ACC_LEN <= 0
+        )
+
+    def _g12_init_slope_diag(self) -> None:
+        """goal12-glue diagnostics: per-step k empty eager kernels / k single-node graph launches after the accept."""
+        self._g12_slope_eager = int(envs.SGLANG_G12_SLOPE_EAGER.get())
+        self._g12_slope_graph = int(envs.SGLANG_G12_SLOPE_GRAPH.get())
+        self._g12_slope_buf = None
+        self._g12_slope_g = None
+        if self._g12_slope_eager <= 0 and self._g12_slope_graph <= 0:
+            return
+        self._g12_slope_buf = torch.zeros(4, dtype=torch.int32, device=self.device)
+        if self._g12_slope_graph > 0:
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                self._g12_slope_buf.zero_()
+            torch.cuda.synchronize()
+            self._g12_slope_g = g
+        if get_parallel().tp_rank == 0:
+            logger.info(
+                "goal12 slope diag: %d eager + %d graph launches per decode step", self._g12_slope_eager,
+                self._g12_slope_graph,
             )
 
     def _resolve_mask_token_id(
@@ -3457,6 +3616,33 @@ class DFlashWorkerV2(BaseSpecWorker):
         use_gt = gt_buf is not None and bs <= int(gt_buf.shape[0])
         draft_tokens = (gt_buf if use_gt else self._draft_block_tokens_buf)[:bs]
 
+        # goal12-glue (SGLANG_G12_VERIFY_EARLY): plan the target verify now; its replay prep is held and launched with
+        # the draft's (one kernel), the draft graph's argmax writes the candidates into the target's static input_ids
+        g12_early = None
+        if sp_defer and step_prep.is_recording() and self._g12_verify_early_ok(batch, bs):
+            cand_view = self._g12_cand_buf[: bs * block_size].view(bs, block_size)
+            step_prep.group_begin()
+            g12_early = self._prepare_verify_forward(
+                batch=batch,
+                draft_tokens=cand_view,
+                positions=positions,
+                verify_out_cache_loc=verify_out_cache_loc,
+                draft_input=draft_input,
+                block_size=block_size,
+            )
+            draft_tokens = cand_view
+            tr = self._target_worker.model_runner.decode_cuda_graph_runner
+            sig = getattr(tr, "_sp_plan_sig", None)
+            if g12_early[1] and sig is not None and step_prep.held_self_copy(self._g12_cand_buf):
+                tr._g12_early_sig = sig[:-1]
+            else:
+                tr._g12_early_sig = None
+        self._g12_steps = getattr(self, "_g12_steps", 0) + 1
+        self._g12_early_n = getattr(self, "_g12_early_n", 0) + (g12_early is not None)
+        if self._g12_steps % 128 == 0 and get_parallel().tp_rank == 0:
+            logger.info("goal12 glue stats: %d decode steps, %d verify-early; step_prep %s", self._g12_steps,
+                        self._g12_early_n, step_prep.stats())
+
         with (
             torch.inference_mode(),
             draft_tp_context(self.draft_owns_attention),
@@ -3584,7 +3770,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                     lm_head=lm_head,
                 ).view(bs, int(self.block_size) - 1)
 
-        tokens_in_graph = (
+        if g12_early is not None and not draft_out.can_run_graph:
+            # the draft ran eagerly: no in-graph candidate write -> stage them into the static buffer now
+            draft_tokens[:, 0].copy_(block_ids[:, 0])
+            draft_tokens[:, 1:].copy_(draft_next)
+        tokens_in_graph = g12_early is not None or (
             use_gt
             and self._draft_sampler is not None
             and draft_out.can_run_graph
@@ -3614,14 +3804,17 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # --- 2) Target verify.
         sampling_info = batch.sampling_info
-        verify_forward_batch, verify_decode_graph, seq_lens_pre_verify = self._prepare_verify_forward(
-            batch=batch,
-            draft_tokens=draft_tokens,
-            positions=positions,
-            verify_out_cache_loc=verify_out_cache_loc,
-            draft_input=draft_input,
-            block_size=block_size,
-        )
+        if g12_early is not None:
+            verify_forward_batch, verify_decode_graph, seq_lens_pre_verify = g12_early
+        else:
+            verify_forward_batch, verify_decode_graph, seq_lens_pre_verify = self._prepare_verify_forward(
+                batch=batch,
+                draft_tokens=draft_tokens,
+                positions=positions,
+                verify_out_cache_loc=verify_out_cache_loc,
+                draft_input=draft_input,
+                block_size=block_size,
+            )
         if step_prep.pending() or step_prep.is_recording():
             step_prep.flush("verify (after prepare)")  # paths that did not reach an eligible load_batch
 
@@ -3711,6 +3904,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             bs=bs,
             target_predict=target_predict_fast,
         )
+
+        if self._g12_slope_buf is not None:
+            for _ in range(self._g12_slope_eager):
+                self._g12_slope_buf.zero_()
+            for _ in range(self._g12_slope_graph):
+                self._g12_slope_g.replay()
 
         if SIMULATE_ACC_LEN > 0:
             if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):

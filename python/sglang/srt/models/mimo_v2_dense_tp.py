@@ -370,6 +370,11 @@ def embed_norm_next(model, input_ids: torch.Tensor, forward_batch) -> Optional[t
     xq = torch.empty(M, H, dtype=torch.float8_e4m3fn, device=dev)
     xs = torch.empty(H // 128, M, dtype=torch.float32, device=dev)
     ln = layer0.input_layernorm
-    st.embed_nq(input_ids, emb.weight, out, emb._fused_embed_ranges, ln.weight, ln.variance_epsilon, xq, xs)
+    full = getattr(emb, "_g12_full_weight", None)
+    if full is not None:
+        # goal12-glue: replicated table -> local gather + norm + quant (no owner push / receive polling)
+        st.embed_nq(input_ids, full, out, emb._g12_local_ranges, ln.weight, ln.variance_epsilon, xq, xs, local=True)
+    else:
+        st.embed_nq(input_ids, emb.weight, out, emb._fused_embed_ranges, ln.weight, ln.variance_epsilon, xq, xs)
     out._fmoe_norm_next = Handoff(layer0.layer_id, out, xq, xs.t())
     return out

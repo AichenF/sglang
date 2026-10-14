@@ -506,6 +506,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # input_ids / positions copies are still current (no other load_batch / replay since)
         self._sp_ok = bool(model_runner.spec_algorithm.is_dflash_family())
         self._sp_plan_sig = None
+        self._g12_early_sig = None
 
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
@@ -1364,7 +1365,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
             sp_sig, self._sp_plan_sig = self._sp_plan_sig, None
-            if sp_sig is None or sp_sig != self._sp_sig(forward_batch):
+            # goal12-glue (SGLANG_G12_VERIFY_EARLY): planned before the draft forward; the draft's prep writes the same
+            # positions and the draft graph writes the candidates into input_ids, so the generation bump in between is
+            # expected (the worker sets this only when the planned input_ids copy was a self-copy of the static buffer)
+            early, self._g12_early_sig = self._g12_early_sig, None
+            cur_sig = self._sp_sig(forward_batch)
+            if early is not None and cur_sig is not None and early == cur_sig[:-1]:
+                pass
+            elif sp_sig is None or sp_sig != cur_sig:
                 self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
                 self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
