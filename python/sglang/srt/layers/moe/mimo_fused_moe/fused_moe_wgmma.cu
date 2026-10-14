@@ -5404,18 +5404,17 @@ static void fill_common_and_launch(Params& P, int M,
     P.parts = (int)parts;
     P.reserve = (int)reserve;   // < 0: computed on device from the union size (see fc1_role); >= 0: explicit item count
     TORCH_CHECK(work.numel() >= 4, "work counters must have 4 ints (front item queue, completion, epoch, back item queue)");
-    static int sms_cache[16] = {0};
     int dev = 0; cudaGetDevice(&dev);
-    if (sms_cache[dev] == 0) cudaDeviceGetAttribute(&sms_cache[dev], cudaDevAttrMultiProcessorCount, dev);
+    int n_sm = 0; cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount, dev);   // any device id (no fixed-size cache)
     int grid;
     if (parts == 3) {   // mixed: the whole grid does fc2; n3 = grid - 96 tiles get 3 parts
-        grid = sms_cache[dev];
+        grid = n_sm;
         TORCH_CHECK(grid > 2 * N_FC2_TILES && grid <= 3 * N_FC2_TILES && grid >= N_FC2_TILES / (int)ndev, "mixed parts need 97..144 SMs");
     } else {
         TORCH_CHECK(n_fc1 >= 1, "need at least one fc1-only CTA");
         grid = (int)n_fc1 + N_FC2_TILES * (int)parts;
     }
-    TORCH_CHECK(grid <= sms_cache[dev], "grid must be co-resident (1 CTA/SM): n_fc1 + 48*parts <= #SMs (CTAs spin-wait on each other)");
+    TORCH_CHECK(grid <= n_sm, "grid must be co-resident (1 CTA/SM): n_fc1 + 48*parts <= #SMs (CTAs spin-wait on each other)");
 #if !defined(FMOE_PHASE_STAMPS)
     TORCH_CHECK(!P.dbg, "phase stamps require a separate build with -DFMOE_PHASE_STAMPS");
 #endif

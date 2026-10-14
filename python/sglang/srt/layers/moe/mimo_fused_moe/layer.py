@@ -391,18 +391,15 @@ class MiMoFusedMoE:
         # by default (measured faster). Same before full-attention layers whose qkv_proj runs through the megakernel's GEMM
         # (SGLANG_MIMO_MEGA_FA, also preloaded).
         pf_default = "o"
-        try:
-            from sglang.srt.layers.moe.mimo_fused_moe.attn_block import mega_enabled, mega_fa_enabled
+        from sglang.srt.layers.moe.mimo_fused_moe.attn_block import mega_enabled, mega_fa_enabled
 
-            if (
-                mega_enabled()
-                and nxt is not None
-                and int(os.environ.get("SGLANG_MIMO_MEGA_QPRE", "16")) > 0
-                and (nxt.is_swa_layer() or mega_fa_enabled())
-            ):
-                pf_default = ""
-        except Exception:
-            pass
+        if (
+            mega_enabled()
+            and nxt is not None
+            and int(os.environ.get("SGLANG_MIMO_MEGA_QPRE", "16")) > 0
+            and (nxt.is_swa_layer() or mega_fa_enabled())
+        ):
+            pf_default = ""
         pf_mode = os.environ.get("SGLANG_MIMO_FUSED_MOE_PREFETCH", pf_default)
         pf_hint = os.environ.get("SGLANG_MIMO_FUSED_MOE_PREFETCH_HINT", "o")
         if pf_mode and nxt is not None and getattr(F.ext(), "TAIL_PREFETCH", 0):
