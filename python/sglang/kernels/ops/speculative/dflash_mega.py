@@ -1,4 +1,4 @@
-"""DFlash draft megakernel (csrc/distributed/dflash_mega.cuh), goal11-draft.
+"""DFlash draft megakernel (csrc/distributed/dflash_mega.cuh).
 
 All 5 draft decoder layers (TP8, M = 32 rows = 4 requests x 8 block tokens) plus the layer-0 input norm/quant and the
 final norm in ONE persistent kernel (15 clusters x 8 CTAs). Shares the IPC receive buffers and per-token call counters
@@ -46,11 +46,12 @@ def _src_hash() -> str:
 
 
 @functools.lru_cache(maxsize=None)
-def _module(use_pdl: bool, extra: str = ""):
+def _module(use_pdl: bool):
     from sglang.kernels.jit.utils import cuda_stubs_dir, load_jit, make_cpp_args
 
     args = make_cpp_args(use_pdl)
-    flags = ["-O3"] + [f for f in (extra or os.environ.get("DM_NVCC_FLAGS", "")).split() if f]
+    # DM_NVCC_FLAGS: development builds only (e.g. -DDM_STAMPS=1 for the `stamps` timing buffer)
+    flags = ["-O3"] + [f for f in os.environ.get("DM_NVCC_FLAGS", "").split() if f]
     return load_jit(
         "dflash_mega_" + _src_hash(),
         *args,
@@ -65,10 +66,6 @@ def _module(use_pdl: bool, extra: str = ""):
         extra_cuda_cflags=flags,
         extra_ldflags=[f"-L{cuda_stubs_dir()}", "-lcuda"],
     )
-
-
-def _use_pdl() -> bool:
-    return os.environ.get("SGLANG_DFLASH_MEGA_PDL", "0") == "1"
 
 
 def _assign(n_tiles: int, caps: List[int], order: Optional[List[int]] = None) -> List[List[int]]:
@@ -99,7 +96,7 @@ def default_plan() -> Dict[str, object]:
     plan["qkv"] = [[q, []] for q in qkv]
     # o_proj / down: 2 k-groups per cluster
     # <= 4 tiles (2 slabs) per k-group everywhere: the phase lasts as long as its slowest group (slab boundaries ~1 us)
-    gcaps = [int(x) for x in os.environ.get("SGLANG_DFLASH_MEGA_OCAPS", "").split(",") if x] or ([4] * (2 * NCL))
+    gcaps = [4] * (2 * NCL)
     for name, n in (("o", O_TILES), ("dn", DN_TILES)):
         groups = _assign(n, gcaps)
         plan[name] = [[groups[2 * c], groups[2 * c + 1]] for c in range(NCL)]
@@ -139,6 +136,9 @@ class DFlashMegaState:
       q_norm, k_norm          -- bf16 [128]
       sinks                   -- [16] bf16/fp32 or None
       k_cache, v_cache        -- bf16 [slots, 1, 128]
+
+    plan / stamps / nl / look are test and tuning hooks: a custom work plan, a globaltimer stamp buffer (recorded by a
+    -DDM_STAMPS=1 build only), fewer layers, and weight units L2-prefetched ahead of the ring (default 0).
     """
 
     def __init__(
@@ -160,14 +160,15 @@ class DFlashMegaState:
         self.tp = tp_state
         self.device = final_norm.device
         dev = self.device
-        self.mod = _module(_use_pdl())
+        # launched without PDL: the PDL variant (DFlashMega<true>) was not stable
+        self.mod = _module(False)
         self.layers = layers  # keep the tensors alive
         self.final_norm = final_norm
         self.cos_sin_cache = cos_sin_cache
         self.maps = torch.zeros((NL * 4 + 2) * 128, dtype=torch.uint8, device=dev)
         self.xq = torch.zeros(2 * MT * H, dtype=torch.uint8, device=dev)
         self.xs = torch.zeros(2 * MT, dtype=torch.float32, device=dev)
-        self.qkv = torch.zeros(2, MT, 2304, dtype=torch.bfloat16, device=dev)
+        self.qkv = torch.zeros(MT, 2304, dtype=torch.bfloat16, device=dev)
         self.att = torch.zeros(MT, 2048, dtype=torch.bfloat16, device=dev)
         self.act = torch.zeros(MT, 2048, dtype=torch.bfloat16, device=dev)
         self.amax = torch.zeros(2 * 2 * NL * MT, dtype=torch.int32, device=dev)
@@ -217,7 +218,7 @@ class DFlashMegaState:
         assert cos_sin_cache.dtype in (torch.float32, torch.bfloat16)
         ivals = torch.tensor(
             [tp_state.rank, cos_sin_cache.stride(0), int(cos_sin_cache.dtype == torch.float32), sink_f32, self.kv_stride, nl,
-             int(os.environ.get("SGLANG_DFLASH_MEGA_LOOK", "0")) if look is None else int(look)],
+             0 if look is None else int(look)],
             dtype=torch.int64,
         )
         fvals = torch.tensor([eps, qk_eps, v_scale, sm_scale], dtype=torch.float32)

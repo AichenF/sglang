@@ -1,4 +1,4 @@
-// DFlash draft megakernel (goal11-draft): the 5 decoder layers of the MiMo-V2.6 DFlash draft at TP8 for M = 32 rows
+// DFlash draft megakernel: the 5 decoder layers of the MiMo-V2.6 DFlash draft at TP8 for M = 32 rows
 // (4 requests x 8 block tokens) in ONE persistent kernel, plus the layer-0 input RMSNorm/quant and the final norm.
 //
 // Per layer (per rank): x (fp8, per-token scale) -> qkv GEMM (2304 x 6144 fp8, per-channel scale) -> q/k RMSNorm + RoPE
@@ -35,35 +35,12 @@
 #include <cstdint>
 #include <cstring>
 
-#ifndef DM_PACE
-#define DM_PACE 0
-#endif
-#ifndef DM_LL_QKV
-#define DM_LL_QKV 0
-#endif
 #ifndef DM_SC_FENCE
 #define DM_SC_FENCE 1
 #endif
 #ifndef DM_STAMPS
 #define DM_STAMPS 0
 #endif
-#ifndef DM_THREADS
-#define DM_THREADS 320
-#endif
-#ifndef DM_REG_LO
-#define DM_REG_LO 112
-#endif
-#ifndef DM_REG_HI
-#define DM_REG_HI 200
-#endif
-#ifndef DM_NO_ATT
-#define DM_NO_ATT 0
-#endif
-#ifndef DM_QUIET
-#define DM_QUIET 0  // 1 (goal12): the weight producer does not TMA-issue units of the phases after a release point (qkv rows, gate_up act) of
-#endif              // its CTA until that release retired -- it L2-prefetches them meanwhile. The release fence (MEMBAR) waits for the SM's
-                    // in-flight HBM loads (~+0.3 us per 12 KB, ub/handoff.cu); the next phase's units were issued 2-4 us before these
-                    // releases (lab stamps: qkv-rows release med 1.79 / max 2.82 us, gate_up release med 1.28 / max 2.82 us)
 
 namespace sglang {
 namespace dflash_mega {
@@ -85,7 +62,7 @@ constexpr int CS = 8;
 constexpr int NCL = 15;
 constexpr int GRID = NCL * CS;  // 120
 constexpr int NCT = 256;        // compute threads (warps 0-7)
-constexpr int THREADS = DM_THREADS;  // 384: warpgroup 2 = producer + gather (+ 2 idle warps), registers moved by setmaxnreg
+constexpr int THREADS = 320;    // warps 0-7 compute, warp 8 weight producer, warp 9 KV gather
 constexpr int NATT = 8;   // clusters 0..7: attention
 constexpr int AR0 = 8;    // clusters 8..11: all-reduce token CTAs
 constexpr int SLAB = 16384;
@@ -154,7 +131,7 @@ struct Params {
   float eps, qk_eps, v_scale, sm_scale;
   uint8_t* xq;              // [2][MT][H] e4m3
   float* xs;                // [2][MT]
-  __nv_bfloat16* qkv;       // [2][MT][QKV_N] (layer-parity double buffer; DM_LL_QKV: Lamport-marked words)
+  __nv_bfloat16* qkv;       // [MT][QKV_N]
   __nv_bfloat16* att;       // [MT][2048]
   __nv_bfloat16* act;       // [MT][INTER]
   unsigned* amax;           // [2 parity][2 kind][NL][MT]
@@ -280,11 +257,6 @@ DEV uint4 ldcg_v4(const void* p) {
   asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
   return v;
 }
-DEV unsigned ldcg_u32(const void* p) {
-  unsigned v;
-  asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(v) : "l"(p));
-  return v;
-}
 DEV void st_v4(void* p, uint4 v) {
   asm volatile("st.global.v4.u32 [%0], {%1, %2, %3, %4};" ::"l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
 }
@@ -302,15 +274,6 @@ DEV uint2 ld_vol_v2(const void* p) {
   return v;
 }
 DEV uint32_t nz(uint32_t w) { return w == 0u ? 0x80000000u : w; }  // +0.0 -> -0.0 (Lamport arrival marker)
-DEV uint32_t unz(uint32_t w) { return w == 0x80000000u ? 0u : w; }
-// poll a Lamport-marked 16-byte vector until every word has arrived, then drop the markers
-DEV uint4 poll_ll_v4(const void* p) {
-  uint4 v;
-  do {
-    v = ld_vol_v4(p);
-  } while (v.x == 0u || v.y == 0u || v.z == 0u || v.w == 0u);
-  return make_uint4(unz(v.x), unz(v.y), unz(v.z), unz(v.w));
-}
 DEV float bf_lo(uint32_t w) { return __uint_as_float(w << 16); }
 DEV float bf_hi(uint32_t w) { return __uint_as_float(w & 0xFFFF0000u); }
 DEV uint32_t pack_bf2(float lo, float hi) {
@@ -482,18 +445,7 @@ DEV void producer(const Params& p, Smem& s, int c, int rank) {
   UIt pf = ld;
   bool vpf = vld;
   uint32_t pfi = 0, pu = 0, slot = 0, wpar = 1;  // wpar: parity of the empty phase to wait for (from the 2nd lap)
-  const uint32_t pace = static_cast<uint32_t>(DM_PACE);
-  uint32_t qslot = 0, qpar = 0;  // the unit issued `pace` units ago
   while (vld) {
-    if (pace > 0 && pu >= pace) {
-      // pacing: at most `pace` units in flight per CTA (a whole-grid ring refill at a phase end floods the memory
-      // queues exactly while the latency-bound handoffs run)
-      mbar_wait(&s.full[qslot], qpar);
-      if (++qslot == nslot) {
-        qslot = 0;
-        qpar ^= 1u;
-      }
-    }
     if (pu >= nslot) {
       const uint32_t par = wpar;
       // the ring is full: pull the next units into L2 while the consumers drain it, then block (suspending
@@ -505,26 +457,6 @@ DEV void producer(const Params& p, Smem& s, int c, int rank) {
       }
       mbar_wait(&s.empty[slot], par);
     }
-#if DM_QUIET
-    {
-      // releases of this CTA before unit (l, ph): qkv rows (if it has qkv tiles) after phase QKV, gate_up act after phase GU, per layer
-      // DM_QUIET 2: attention CTAs do not hold their o_proj units (they must be in flight BEFORE the attention phase: issued at the qkv
-      // release they queued the attention's Q / combine loads, lab +1 us per layer); the down units are held on every CTA
-      const int hq = p.plan.n[PH_QKV][c][0] > 0 ? 1 : 0;
-      const bool hold_o = !(DM_QUIET >= 2 && c < NATT);
-      const int need = ld.l * (hq + 1) + (ld.ph >= PH_DN ? hq + 1 : (ld.ph >= PH_O && hold_o ? hq : 0));
-      volatile int* relc = s.misc + 2;
-      if (*relc < need) {
-        UIt q = ld;
-        bool vq = true;
-        for (uint32_t i = 0; i < nslot && vq; ++i) {   // the held units into L2 (prefetches are not waited for by the release fence)
-          uit_issue(p, q, true, nullptr, nullptr, 0);
-          vq = uit_next(p, c, rank, q);
-        }
-        while (*relc < need) __nanosleep(64);
-      }
-    }
-#endif
     if (ld.sl == 0 && ld.u == 0 && ld.ph != PH_QKV) dstamp(p, ld.l, 60 + ld.ph);
     const int t1 = (2 * ld.sl + 1 < ld.nt) ? 1 : 0;
     mbar_expect_tx(&s.full[slot], (1 + t1) * TILEB);
@@ -1033,26 +965,15 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
 #pragma unroll
       for (int j = 0; j < 4; ++j)
         w[j] = pack_bf2(v[2 * j] * s.red[k * 16 + 2 * j] * sxv, v[2 * j + 1] * s.red[k * 16 + 2 * j + 1] * sxv);
-#if DM_LL_QKV
-      // data = flag: Lamport-marked words into this layer's parity buffer; the other parity (read by the previous layer,
-      // written by the next one -- by this same thread) is cleared now
-      const unsigned gl = E * 5u + static_cast<unsigned>(l);
-      st_v4(p.qkv + (static_cast<int64_t>(gl & 1u) * MT + t) * QKV_N + n0, make_uint4(nz(w[0]), nz(w[1]), nz(w[2]), nz(w[3])));
-      st_v4(p.qkv + (static_cast<int64_t>((gl + 1u) & 1u) * MT + t) * QKV_N + n0, make_uint4(0u, 0u, 0u, 0u));
-#else
       *reinterpret_cast<uint4*>(p.qkv + t * QKV_N + n0) = make_uint4(w[0], w[1], w[2], w[3]);
-#endif
     }
-#if !DM_LL_QKV
     if (ctid == 0) dstamp(p, l, 120);
     bar_sync(1, NCT);
     if (ctid == 0) {
       dstamp(p, l, 121);
       for (int k = 0; k < nt; ++k) red_release(p.cnt + C_QKV + tl[k], 1u);
       dstamp(p, l, 122);
-      if (DM_QUIET && nt > 0) { volatile int* relc = s.misc + 2; *relc = *relc + 1; }   // -> the producer's held units
     }
-#endif
   } else if constexpr (PH == PH_GU) {
     for (int i = ctid; i < nt * MT; i += NCT) {
       const int k = i >> 5, t = i & 31;
@@ -1088,7 +1009,6 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
         __threadfence();  // the warp's amax atomics before the release
         red_release(p.cnt + C_ACT, 1u);
         dstamp(p, l, 126);
-        if (DM_QUIET) { volatile int* relc = s.misc + 2; *relc = *relc + 1; }
       }
     }
   } else {
@@ -1198,14 +1118,12 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
                                  : __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(LP.sinks)[h]);
     s.red[32 + ctid - 32] = v;
   }
-#if !DM_LL_QKV
   // wait for this head half's q tiles + the k / v tiles
   if (ctid >= 64 && ctid < 84) {
     const int i = ctid - 64;
     const int tile = i < 16 ? 16 * hg + i : 16 + i;
     wait_ge(p.cnt + C_QKV + tile, (E * 5u + static_cast<unsigned>(l) + 1u) * 8u);
   }
-#endif
   bar_sync(1, NCT);
   if (ctid == 0) dstamp(p, l, 56);
   // q rows (token-major: row = t * 8 + h) and the block's new k / v rows (warps 0 / 1) -> normalized + rotated
@@ -1218,17 +1136,6 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
     const bool kvw = (warp < 2) && (need || store);
     const int tk = lane >> 2;
     uint4 xq[4], xk[4];
-#if DM_LL_QKV
-    if (ctid == 0) dstamp(p, l, 123);
-    const __nv_bfloat16* qbuf = p.qkv + static_cast<int64_t>((E * 5u + static_cast<unsigned>(l)) & 1u) * MT * QKV_N;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) xq[i] = poll_ll_v4(qbuf + (BLK * b + t) * QKV_N + (8 * hg + h) * HD + qq * 32 + i * 8);
-    if (kvw) {
-#pragma unroll
-      for (int i = 0; i < 4; ++i)
-        xk[i] = poll_ll_v4(qbuf + (BLK * b + tk) * QKV_N + (warp == 0 ? NHQ : NHQ + 1) * HD + qq * 32 + i * 8);
-    }
-#else
     const __nv_bfloat16* qsrc = p.qkv + (BLK * b + t) * QKV_N + (8 * hg + h) * HD + qq * 32;
 #pragma unroll
     for (int i = 0; i < 4; ++i) xq[i] = ldcg_v4(qsrc + i * 8);
@@ -1237,7 +1144,6 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
 #pragma unroll
       for (int i = 0; i < 4; ++i) xk[i] = ldcg_v4(ksrc + i * 8);
     }
-#endif
     if (ctid == 0) {
       asm volatile("" ::"r"(xq[0].x), "r"(xq[3].w));
       dstamp(p, l, 124);
@@ -1531,19 +1437,13 @@ __global__ void __launch_bounds__(THREADS, 1) dflash_mega_kernel(const __grid_co
     mbar_init(s.kvempty, 1);
     mbar_init(s.combbar, 1);
     mbar_init(s.combok, CS);
-    s.misc[2] = 0;   // DM_QUIET release counter
+    s.misc[2] = 0;   // no reader; kept so the generated code stays unchanged
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
   __syncthreads();
   cluster_sync_all();
-  if constexpr (THREADS == 384) {
-    if (warp >= 8) {
-      asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(DM_REG_LO) : "memory");
-    } else {
-      asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" ::"n"(DM_REG_HI) : "memory");
-    }
-  }
   if (warp >= 10) {
+    // no such warp at 320 threads; the empty branch is kept because removing it changes the generated code
   } else if (warp == 8) {
     // weights do not depend on the previous kernel: start streaming before griddepcontrol.wait
     if (lane == 0) producer(p, s, c, rank);
@@ -1583,9 +1483,7 @@ __global__ void __launch_bounds__(THREADS, 1) dflash_mega_kernel(const __grid_co
       for (int l = 0; l < p.nl; ++l) {
         gemm<PH_QKV>(p, s, l, c, rank, ctid, E, cslot, cpar, gph, xph);
         if (ctid == 0) stamp(p, 1 + 8 * l);
-#if !DM_NO_ATT
         if (is_att) attention(p, s, l, c, rank, ctid, E);
-#endif
         if (ctid == 0) stamp(p, 2 + 8 * l);
         gemm<PH_O>(p, s, l, c, rank, ctid, E, cslot, cpar, gph, xph);
         if (ctid == 0) stamp(p, 3 + 8 * l);
