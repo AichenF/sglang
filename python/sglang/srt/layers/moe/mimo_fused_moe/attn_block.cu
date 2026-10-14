@@ -119,8 +119,18 @@ __device__ __forceinline__ void st_ll(uint4* p, uint4 v) { asm volatile("st.rela
 __device__ __forceinline__ void named_bar_sync(int id, int n) { asm volatile("bar.sync %0, %1;" :: "r"(id), "r"(n) : "memory"); }
 __device__ __forceinline__ unsigned long long gtimer() { unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t) :: "memory"); return t; }
 constexpr int NDBG = 32;
+#ifndef BLK_STAMPS
+#define BLK_STAMPS 0   // 1: diagnostics build -- per-CTA globaltimer / clock64 stamps into P.dbg ([NCTA][NDBG] int64, attn_block.py's
+#endif                 //    SGLANG_MIMO_BLK_STAMP_DIR, build with BLK_NVCC_FLAGS=-DBLK_STAMPS=1); 0: compiled out
+#if BLK_STAMPS
 #define BSTAMP(k) do { if (P.dbg) P.dbg[blockIdx.x * NDBG + (k)] = gtimer(); } while (0)
-#define CSTAMP(k) do { if (P.dbg && (P.mode & MODE_DBG_ATTONLY)) { long long ck_; asm volatile("mov.u64 %0, %%clock64;" : "=l"(ck_) :: "memory"); P.dbg[blockIdx.x * NDBG + (k)] = ck_; } } while (0)
+#define CLKSTAMP(k) do { if (P.dbg) { long long ck_; asm volatile("mov.u64 %0, %%clock64;" : "=l"(ck_) :: "memory"); P.dbg[blockIdx.x * NDBG + (k)] = ck_; } } while (0)
+#define CSTAMP(k) do { if (P.mode & MODE_DBG_ATTONLY) CLKSTAMP(k); } while (0)
+#else
+#define BSTAMP(k) do {} while (0)
+#define CLKSTAMP(k) do {} while (0)
+#define CSTAMP(k) do {} while (0)
+#endif
 __device__ __forceinline__ void griddep_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 // exp2 / reciprocal as --use_fast_math emits them (ex2.approx.ftz / rcp.approx.ftz): the same instructions whether or not the translation
 // unit is built with fast math
@@ -604,7 +614,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) attn_block_kernel(const __grid_co
             const unsigned ph = (kt / NS) & 1;
             if (!dbg_now) mbar_wait(&wfull[s], ph);
             if (!dbg_nob) mbar_wait(&bfull[s], ph);
-            if (kt == 0 && tid == 0) { BSTAMP(3); if (P.dbg && !att) { long long ck; asm volatile("mov.u64 %0, %%clock64;" : "=l"(ck)); P.dbg[blockIdx.x * NDBG + 24] = ck; } }
+            if (kt == 0 && tid == 0) { BSTAMP(3); if (!att) CLKSTAMP(24); }
             wg_fence();
 #pragma unroll
             for (int j = 0; j < KT / 16; ++j)
@@ -619,7 +629,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) attn_block_kernel(const __grid_co
         for (int a = 1; a < NACC; ++a)
 #pragma unroll
             for (int i = 0; i < 16; ++i) d[0][i] += d[a][i];
-        if (tid == 0) { BSTAMP(4); if (P.dbg && !att) { long long ck; asm volatile("mov.u64 %0, %%clock64;" : "=l"(ck)); P.dbg[blockIdx.x * NDBG + 25] = ck; } }   // all MMAs of this CTA done
+        if (tid == 0) { BSTAMP(4); if (!att) CLKSTAMP(25); }   // all MMAs of this CTA done
         // pair exchange: the rows the PARTNER finalizes go to its OFF_X by st.async (complete_tx on its xfull); my own rows stay in registers
         const int row = 64 * g + 16 * (warp & 3) + (lane >> 2);   // rows row, row + 8 of d[0][4i + 0/1], d[0][4i + 2/3]; tokens 8i + 2 (lane & 3) (+1)
         const int prow0 = COLS * (h ^ 1);
@@ -1191,7 +1201,7 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
                 mbar_wait(ep_bar, 0);
                 mbar_wait(qready, 0);
                 st_release_gpu(&P.qflags[c * FLAG_STRIDE], s_epoch[0]);
-                if (P.dbg) P.dbg[blockIdx.x * NDBG + 9] = gtimer();
+                BSTAMP(9);
             }
         }
         __syncwarp();
@@ -1204,7 +1214,7 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
             const int kb0 = h * QKH, rot = ((p * MEGA_ROT) % (QKH / 2)) * 2;
             const bool nox = P.mode & MODE_DBG_GNOX;
             griddep_wait();
-            if (P.dbg) P.dbg[blockIdx.x * NDBG + 7] = gtimer();
+            BSTAMP(7);
             mbar_expect(sx_full, QKH * M * 4);
             bulk_g2s(smem + MG_OFF_SX, P.qsx + (size_t)kb0 * P.qsx_ld, QKH * M * 4, sx_full);
             int s = 0, lp = 0;
@@ -1244,7 +1254,8 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
             // software pipeline over this warpgroup's unit PAIRS (warpgroup g: units 4 q + 2 g, 4 q + 2 g + 1, q = 0..5): one fence / commit /
             // wait per two k-blocks (the per-iteration warpgroup sync + barrier overhead was ~4x the m64n32k32 time); the group of pair q is in
             // flight while pair q - 1 is promoted (acc += partial * sw * sx in unit order: the per-thread summation order is unchanged)
-            long long cw = 0, c0 = clock64();
+            long long cw = 0, c0 = 0;   // BLK_STAMPS: cycles waiting for GEMM stages / in the GEMM loop
+            if constexpr (BLK_STAMPS) c0 = clock64();
             const uint32_t sbase = sa(smem) & 0x3FFFF;
             // pair stages: warpgroup g's pairs j = g, g + 2, .. live in pair stages j % (gns / 2) (always the same warpgroup: gns / 2 even)
             const int nps = gns / 2;
@@ -1255,9 +1266,10 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
                 (void)i;
                 const int s0 = ps_, p0 = pp_;
                 ps_ += 2; if (ps_ >= nps) { ps_ -= nps; pp_ ^= 1; }
-                const long long ca = clock64();
+                long long ca = 0;
+                if constexpr (BLK_STAMPS) ca = clock64();
                 mbar_wait(&gfull[s0], p0);
-                cw += clock64() - ca;
+                if constexpr (BLK_STAMPS) cw += clock64() - ca;
                 // descriptor = {(addr >> 4) & 0x3FFF | 1 << 16, SBO 64 | swizzle 128B}: the k32 steps only add 2 to the low word (no carry)
                 const uint32_t lo0 = ((sbase + s0 * 2 * G_ST) >> 4) | (1u << 16), lo1 = lo0 + (wsp >> 4);
                 constexpr uint32_t HI = (1024 >> 4) | (1u << 30), XA = (2 * G_W) >> 4;
@@ -1303,7 +1315,7 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
             }
             wg_wait<0>();
             finish(4 * (NPAIR - 1) + 2 * g, tB0, tB1);
-            if (P.dbg && (tid & 127) == 0) { P.dbg[blockIdx.x * NDBG + 27 + g] = cw; P.dbg[blockIdx.x * NDBG + 29] = clock64() - c0; }
+            if constexpr (BLK_STAMPS) { if (P.dbg && (tid & 127) == 0) { P.dbg[blockIdx.x * NDBG + 27 + g] = cw; P.dbg[blockIdx.x * NDBG + 29] = clock64() - c0; } }
             // warpgroup 1 -> smem -> warpgroup 0 (fixed order: wg 0 + wg 1)
             // the warpgroup-1 partial [64 rows][32 tok] fp32 lives in the attention-tile halves of o_proj stages 0 / 1 (rows 0..31 / 32..63): the
             // o_proj WEIGHT TMAs may start right after the loops (gdone), the attention tiles land there only after every attention flag
@@ -1368,7 +1380,7 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
             // every math thread's row stores precede the barrier above -> one gpu-scope release (cumulative) by tid 0 BEFORE the attention
             // CTA's K / V and o_proj traffic, issued while this SM has no load in flight (the GEMM ring is drained, the o_proj weights start
             // only after att_in, the K / V gathers landed long ago): the release fence (MEMBAR.ALL.GPU) waits for the SM's in-flight loads
-            if (tid == 0) { st_release_gpu(&P.qflags[c * FLAG_STRIDE], s_epoch[0]); if (P.dbg) P.dbg[blockIdx.x * NDBG + 9] = gtimer(); }
+            if (tid == 0) { st_release_gpu(&P.qflags[c * FLAG_STRIDE], s_epoch[0]); BSTAMP(9); }
         }
         if (att) {
             // the row groups this attention CTA reads: both CTAs (K halves finalize different rows) of each group
@@ -1618,6 +1630,7 @@ void attn_block_swa(torch::Tensor qkv, torch::Tensor cos_sin, torch::Tensor posi
     P.partial = reinterpret_cast<__nv_bfloat16*>(partial.data_ptr());
     for (int d = 0; d < TP_NDEV; ++d) P.peer[d] = reinterpret_cast<uint4*>(peers.data_ptr<int64_t>()[d]);
     P.work = work.data_ptr<int>();
+    TORCH_CHECK(BLK_STAMPS || dbg.numel() == 0, "dbg stamps need a BLK_NVCC_FLAGS=-DBLK_STAMPS=1 build");
     P.dbg = dbg.numel() >= (int64_t)NCTA * NDBG ? reinterpret_cast<unsigned long long*>(dbg.data_ptr()) : nullptr;
     P.slot_cache = slot_cache.numel() >= NREQ * 144 ? slot_cache.data_ptr<int>() : nullptr;
     if (nkc.numel() > 0) {
@@ -1733,6 +1746,7 @@ void attn_block_mega(torch::Tensor x, torch::Tensor x_scale_t, torch::Tensor qwm
     P.partial = reinterpret_cast<__nv_bfloat16*>(partial.data_ptr());
     for (int d = 0; d < TP_NDEV; ++d) P.peer[d] = reinterpret_cast<uint4*>(peers.data_ptr<int64_t>()[d]);
     P.work = work.data_ptr<int>();
+    TORCH_CHECK(BLK_STAMPS || dbg.numel() == 0, "dbg stamps need a BLK_NVCC_FLAGS=-DBLK_STAMPS=1 build");
     P.dbg = dbg.numel() >= (int64_t)NCTA * NDBG ? reinterpret_cast<unsigned long long*>(dbg.data_ptr()) : nullptr;
     P.slot_cache = slot_cache.numel() >= NREQ * 144 ? slot_cache.data_ptr<int>() : nullptr;
     if (nkc.numel() > 0) {
@@ -1780,6 +1794,7 @@ void attn_block_qkv(torch::Tensor x, torch::Tensor x_scale_t, torch::Tensor qwma
     P.qflags = reinterpret_cast<unsigned*>(qflags.data_ptr());
     P.qpre = (int)std::max<int64_t>(0, std::min<int64_t>(qpre, GNS_OTH));
     P.work = work.data_ptr<int>();
+    TORCH_CHECK(BLK_STAMPS || dbg.numel() == 0, "dbg stamps need a BLK_NVCC_FLAGS=-DBLK_STAMPS=1 build");
     P.dbg = dbg.numel() >= (int64_t)NCTA * NDBG ? reinterpret_cast<unsigned long long*>(dbg.data_ptr()) : nullptr;
     P.mode = MODE_QKV_ONLY;
     launch_mega_t<129>(P, at::cuda::getCurrentCUDAStream(), pdl != 0);
@@ -1797,6 +1812,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("NCTA") = blk::NCTA;
     m.attr("NATT") = blk::NATT;
     m.attr("SMEM_ALLOC") = blk::SMEM_ALLOC;
+    m.attr("BLK_STAMPS") = BLK_STAMPS;
     m.attr("MODE_FULL_LOCAL") = blk::MODE_FULL_LOCAL;
     m.attr("MODE_NO_PUSH") = blk::MODE_NO_PUSH;
     m.attr("MODE_DBG_NOW") = blk::MODE_DBG_NOW;

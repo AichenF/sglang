@@ -209,9 +209,9 @@ _SCRATCH = {}
 _logged = set()
 
 
-# Diagnostics (off unless set): per-layer in-kernel globaltimer stamps [NCTA][32] (kernel built with them always; only the pointer is
-# runtime). Creating <dir>/dump.<n> (the fused MoE stamp-dump trigger, same dir) makes every rank write <dir>/blk_stamps_rank<r>_<n>.pt =
-# {layer_id: int64 [NCTA * 32]} of the last replay.
+# Diagnostics (off unless set): per-layer in-kernel globaltimer stamps [NCTA][32]. The stamps are compiled in only by a diagnostics build
+# (BLK_NVCC_FLAGS=-DBLK_STAMPS=1; without it the directory is ignored). Creating <dir>/dump.<n> (the fused MoE stamp-dump trigger, same
+# dir) makes every rank write <dir>/blk_stamps_rank<r>_<n>.pt = {layer_id: int64 [NCTA * 32]} of the last replay.
 _STAMP_DIR = os.environ.get("SGLANG_MIMO_BLK_STAMP_DIR", "")
 _stamp_layers = []
 _stamp_thread = None
@@ -306,7 +306,9 @@ class BlkLayer:
         if mega_enabled():
             self._init_mega(attn)
         self.dbg = None
-        if _STAMP_DIR:
+        if _STAMP_DIR and not getattr(ext(), "BLK_STAMPS", 0):
+            _log_once("stamps", "SGLANG_MIMO_BLK_STAMP_DIR ignored: the stamps need a BLK_NVCC_FLAGS=-DBLK_STAMPS=1 build")
+        elif _STAMP_DIR:
             global _stamp_thread
             self.dbg = torch.zeros(128 * 32, dtype=torch.int64, device=w.device)
             _stamp_layers.append((decoder_layer.layer_id, self.dbg))
