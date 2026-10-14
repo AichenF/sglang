@@ -302,8 +302,8 @@ def bidir_decode_attention(
     wl, wr = int(window_size[0]), int(window_size[1])
     has_win = wl >= 0 or wr >= 0
     if block_n is None:
-        # windowed draft (V2.6, ~1k keys per request): 32-key tiles measured fastest on H200
-        # (7.6 vs 8.9 us at B4 x 8 rows x 16 heads); full-context keeps the original 64
+        # windowed draft (~1k keys per request): 32-key tiles measured fastest on H200 at batch 4 x 8 rows x
+        # 16 heads; full-context keeps the original 64
         block_n = 32 if has_win else _BLOCK_N
     sink_arg = sinks if sinks is not None else q
     _bidir_decode_kernel[(bs, head_groups, nsplit)](
