@@ -1,4 +1,4 @@
-// goal11 "fa2": the full-attention layers' tail of MiMo-V2.x at TP8, M = 32 (4 requests x 8 verify tokens), sm_90a, in ONE kernel:
+// The full-attention layers' tail of MiMo-V2.x at TP8, M = 32 (4 requests x 8 verify tokens), sm_90a, in ONE kernel:
 //   RoPE (Q in registers; the 8 new K/V rows built from the qkv rows straight into the KV stage that holds them, and stored to the cache)
 //   + split-KV verify attention (fa_verify_decode.cuh's CTA: cp.async gather producer warpgroup, 2 wgmma consumer warpgroups)
 //   + the split combine (in-kernel, fa_verify_combine_kernel's arithmetic: bitwise the same attention output)
@@ -66,14 +66,14 @@ constexpr int OFF_MS = OFF_PT + PTR * BN * 4;         // stash (until the combin
 static_assert(OFF_MS + MS_BYTES <= OFF_KV && OFF_MS + MS_BYTES <= OFF_W + (NW_EARLY + 1) * WT_BYTES && OFF_MS % 128 == 0, "page-table ring / stash");
 
 #ifndef FAB_KV_EVF
-#define FAB_KV_EVF 1       // 1: KV gathers carry an L2 evict_first policy (lab: -1 us; the KV stream is read once)
+#define FAB_KV_EVF 1       // 1: KV gathers carry an L2 evict_first policy (the KV stream is read once)
 #endif
 #ifndef FAB_DISCARD
 #define FAB_DISCARD 1      // 1: the combine discards (L2, no write-back) the 8.6 MB of split partials it consumed: dead data that otherwise
 #endif                     // gets written back to HBM during the next kernel (the fused MoE's FC1 ramp)
 #ifndef FAB_WD
-#define FAB_WD 2           // W k-tiles in flight per CTA after its attention (pacing: unpaced, the early finishers' W stream delayed the
-                           // late CTAs' KV by ~3 us; 1: same, 4: +1.2 us)
+#define FAB_WD 2           // W k-tiles in flight per CTA after its attention (pacing: unpaced, the early finishers' W stream delays the
+                           // late CTAs' KV; 1 is no better, 4 measured slower)
 #endif
 constexpr int SMEM_ALLOC = SMEM_TOP + 1024;
 static_assert(OFF_X + COLS * M * 4 <= SMEM_TOP && OFF_KV % 1024 == 0 && OFF_A % 1024 == 0 && SMEM_ALLOC <= 232448 && NW_EARLY >= 0, "fab smem");
@@ -87,7 +87,7 @@ __device__ __forceinline__ size_t tp_rs_idx(int src, int t, int k, int m) {
 }
 constexpr int MODE_POS64 = 1, MODE_LOC64 = 2, MODE_FULL_LOCAL = 4, MODE_NO_PUSH = 8, MODE_ATT_ONLY = 16;
 constexpr int MODE_DBG_NOPOLL = 32, MODE_DBG_NOW = 64;   // diagnostics (wrong results): no combine-flag polls / no W loads
-constexpr int MODE_DBG_QLATE_SHIFT = 16;                 // diagnostics (goal12 P3 bound): mode bits 16..25 = Q delay in 16-ns units -- the consumer
+constexpr int MODE_DBG_QLATE_SHIFT = 16;                 // diagnostics: mode bits 16..25 = Q delay in 16-ns units -- the consumer
                                                          // warpgroups wait until (CTA entry + delay) after griddepcontrol.wait (KV producer unaffected)
 constexpr float LOG2E = 1.4426950408889634f;
 
@@ -199,7 +199,7 @@ __device__ __forceinline__ uint64_t desc_sw128(uint32_t addr, uint32_t lbo, uint
 }
 __device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) { uint32_t u; asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(u) : "f"(hi), "f"(lo)); return u; }
 
-// ---- fa_verify_decode.cuh's wgmma wrappers (claude_tmp/goal11/attn/kern/gen_wgmma.py)
+// ---- fa_verify_decode.cuh's wgmma wrappers
 __device__ __forceinline__ void wgmma_m64n64k16_rs_kmaj(float (&d)[32], const uint32_t (&a)[4], uint64_t desc, int scale_d) {
     asm volatile(
         "{\n.reg .pred p;\n"
@@ -284,8 +284,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) fa_block_kernel(const __grid_cons
     // Tiles [0, nr) hold at least one OLD key (keys < new_key0), interleaved over the 33 CTAs of the request (tile = sp + i * NSPLIT: they
     // sweep the KV together -> DRAM page locality); keys >= new_key0 are masked. The 8 new keys (the verify tokens) are never gathered: every
     // combine CTA computes their contribution to its own 4 rows from a stash (RoPE'd K, V of the qkv rows) as a 34th split, and stores them to
-    // the cache. (Gathering them needs the rows in the cache first: a cross-thread fence that waited ~3 us behind the SM's in-flight loads; a
-    // "mini tile" in one split per request made those 4 CTAs the stragglers in situ, +2.6..3.9 us.)
+    // the cache. (Gathering them needs the rows in the cache first: a cross-thread fence that waits behind the SM's in-flight loads; a
+    // "mini tile" in one split per request made those 4 CTAs the stragglers.)
     const int new_key0 = seqlen - W;
     const int nr = new_key0 > 0 ? (new_key0 + BN - 1) / BN : 0;
     const int ntile_cta = max(0, (nr - sp + NSPLIT - 1) / NSPLIT);
@@ -409,7 +409,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) fa_block_kernel(const __grid_cons
         const unsigned long long qlate = (unsigned long long)((P.mode >> MODE_DBG_QLATE_SHIFT) & 0x3ff) * 16ull;
         const unsigned long long t_ent = qlate ? gtimer() : 0ull;
         // Inputs written by EARLIER kernels (positions, cos_sin, loc) are loaded before griddepcontrol.wait -- while this SM has no KV in
-        // flight yet -- so that after the wait only the qkv rows remain: one load level (loads queue behind the producer's copies, ~4-5 us
+        // flight yet -- so that after the wait only the qkv rows remain: one load level (loads queue behind the producer's copies: several us
         // per round trip once ~160 KB per SM are in flight).
         const bool pos64 = P.mode & MODE_POS64;
         const long long pos = ld_idx(P.positions, b * W + tok, pos64);
@@ -428,7 +428,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) fa_block_kernel(const __grid_cons
         const int b2 = c / 32, tokc = (c % 32) / 4, hgc = c % 4;
         long long slotc = 0;
         // one copy per consumer warp (lane 0, warp k = token k): a single thread issuing all of them (8 dependent position loads + 17 bulk
-        // ops) delayed its warp's Q -- and so the warpgroup's first QK -- by ~1.8 us in situ. The tx count may go negative before the expect.
+        // ops) delayed its warp's Q -- and so the warpgroup's first QK. The tx count may go negative before the expect.
         if (opj && lane == 0) {
             if (tok == 0) mbar_expect(ms_full, MS_TX);
             const long long pk = ld_idx(P.positions, b2 * W + tok, pos64);

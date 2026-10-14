@@ -1,4 +1,4 @@
-"""goal11 "fa2": fused tail of the MiMo-V2 full-attention (FA) layers at exact M = 32 (4 x 8 verify tokens), TP8 (fa_block.cu):
+"""Fused tail of the MiMo-V2 full-attention (FA) layers at exact M = 32 (4 x 8 verify tokens), TP8 (fa_block.cu):
 RoPE + new-K/V cache store + split-KV verify attention + split combine + o_proj + the push of the o_proj partial into the fused MoE
 kernel's entry reduce-scatter buffers -- one kernel instead of mimo_rope_kv + fa_verify + fa_verify_combine + nvjet o_proj. The fused MoE
 launch that follows must run with ``PREPUSHED_MODE`` (it then skips its own entry push), exactly like blk's fused SWA block."""
@@ -23,8 +23,8 @@ def ext():
     global _ext
     if _ext is None:
         extra = os.environ.get("FAB_NVCC_FLAGS", "").split()
-        # the extension name carries a hash of the source (+ flags): torch's JIT rebuild is mtime-based and E2E runs of different snapshots
-        # share one TORCH_EXTENSIONS_DIR (mega's stale-binary lesson)
+        # the extension name carries a hash of the source (+ flags): torch's JIT rebuild is mtime-based and different source trees may
+        # share one TORCH_EXTENSIONS_DIR (an older-mtime source would otherwise silently load another version's binary)
         with open(os.path.join(HERE, "fa_block.cu"), "rb") as f:
             src_hash = hashlib.sha1(f.read()).hexdigest()[:12]
         name = "mimo_fa_block_" + src_hash + ("_" + "".join(ch if ch.isalnum() else "_" for ch in "".join(extra)) if extra else "")
@@ -73,14 +73,28 @@ _SCRATCH = {}
 _logged = set()
 
 
-def _log_once(key, msg, *args):
-    if key not in _logged:
-        _logged.add(key)
+def _rank0() -> bool:
+    try:
+        import torch.distributed as dist
+
+        return not dist.is_initialized() or dist.get_rank() == 0
+    except Exception:
+        return True
+
+
+def _log_once(key, msg, *args, info=False):
+    """Log once per process: fallbacks as warnings, the 'enabled' / 'running' notices (info=True) at INFO level on rank 0 only."""
+    if key in _logged:
+        return
+    _logged.add(key)
+    if not info:
         logger.warning("MiMo fa2: " + msg, *args)
+    elif _rank0():
+        logger.info("MiMo fa2: " + msg, *args)
 
 
 def enabled() -> bool:
-    # default ON since the E2E validation on 333 (judge B4:65536, parity 4/4 every run; see GOAL11_FA2_NOTES.md); SGLANG_MIMO_FA2=0 = off
+    # default ON; SGLANG_MIMO_FA2=0 = off
     return os.environ.get("SGLANG_MIMO_FA2", "1") == "1"
 
 
@@ -182,7 +196,7 @@ class FaBlock:
                 return None
             fb = FaBlock(decoder_layer, shared, push)
             object.__setattr__(decoder_layer, "_fa2", fb)
-            _log_once("created", "fused full-attention tail enabled (first: layer %d)", decoder_layer.layer_id)
+            _log_once("created", "fused full-attention tail enabled (first: layer %d)", decoder_layer.layer_id, info=True)
         return fb
 
     def run(self, attn, qkv, positions, forward_batch):
@@ -239,5 +253,5 @@ class FaBlock:
             st.state.work, st.rank, self.sm_scale, 0 if self.push else ext().MODE_FULL_LOCAL, self.pdl, dbg=self.dbg)
         if self.push:
             partial._blk_prepushed = True
-        _log_once("ran", "fused full-attention tail running (layer %d)", layer.layer_id)
+        _log_once("ran", "fused full-attention tail running (layer %d)", layer.layer_id, info=True)
         return partial

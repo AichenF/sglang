@@ -111,7 +111,6 @@ __device__ __forceinline__ void tma_load_2d_nohint(void* dst, const CUtensorMap*
                  :: "r"(sa(dst)), "l"(reinterpret_cast<uint64_t>(map)), "r"(c0), "r"(c1), "r"(sa(bar)) : "memory");
 }
 __device__ __forceinline__ void cp16(void* dst, const void* src) { asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(sa(dst)), "l"(src) : "memory"); }
-__device__ __forceinline__ void cp_arrive_noinc(uint64_t* b) { asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" :: "r"(sa(b)) : "memory"); }
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
 __device__ __forceinline__ void cp_wait_all() { asm volatile("cp.async.wait_all;" ::: "memory"); }
 __device__ __forceinline__ unsigned ld_acquire_gpu(const unsigned* p) { unsigned v; asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory"); return v; }
@@ -511,7 +510,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) attn_block_kernel(const __grid_co
         } else if (lane == 1) {
             // lane 1: the attention k-tiles. FA mode: all of them after griddepcontrol.wait (the fa3 output is the previous kernel's).
             // SWA mode: the math warps poll the attention flags (one flag per thread: per-lane sequential polling costs one round trip per
-            // flag, ub/flag.cu) and issue k-tiles 0..NS-1 themselves; this lane issues NS.. as stages free up, after bgo.
+            // flag) and issue k-tiles 0..NS-1 themselves; this lane issues NS.. as stages free up, after bgo.
             asm volatile("prefetch.tensormap [%0];" :: "l"(reinterpret_cast<uint64_t>(&P.tm_a)) : "memory");
             int kt0 = NKT;
             if (ext_attn) {
@@ -595,7 +594,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) attn_block_kernel(const __grid_co
         // D[96 (+32) weight rows][32 tokens] += W[rows][k] * A[tok][k]: warpgroup g takes rows 64g .. 64g + 63
         const int g = warp >> 2;
         // fully unrolled (stage / phase / descriptor offsets are compile-time): with ~100 address instructions per k-tile per warp the
-        // HGMMA issue serialized behind them (6.5 K vs 3.3 K cycles for the same 128 m64n32k16 in ub/wgl2.cu)
+        // HGMMA issue serialized behind them (about twice the cycles)
         const uint32_t sbase = sa(smem);
         const uint64_t dA0 = desc_sw128(sbase + g * 64 * 128), dB0 = desc_sw128(sbase + WT_BYTES);
         const bool dbg_now = P.mode & MODE_DBG_NOW, dbg_nob = P.mode & MODE_DBG_NOB;

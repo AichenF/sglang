@@ -1,4 +1,4 @@
-"""goal11 "blk": fused MiMo-V2 SWA target-verify attention block (attn_block.cu) -- RoPE + KV store + sliding-window attention +
+"""Fused MiMo-V2 SWA target-verify attention block (attn_block.cu) -- RoPE + KV store + sliding-window attention +
 o_proj + the push of the o_proj partial into the fused MoE kernel's entry reduce-scatter buffers, for exact M = 32 (4 x 8 verify
 tokens) at TP8. The fused MoE launch that follows must run with ``PREPUSHED_MODE`` (it then skips its own entry push)."""
 
@@ -20,8 +20,8 @@ def ext():
     global _ext
     if _ext is None:
         extra = os.environ.get("BLK_NVCC_FLAGS", "").split()
-        # the extension name carries a hash of the source: torch's JIT build decides by file mtimes (ninja), and E2E runs of different
-        # snapshots share one TORCH_EXTENSIONS_DIR -- an older-mtime source would otherwise silently load another version's binary
+        # the extension name carries a hash of the source: torch's JIT build decides by file mtimes (ninja), and different source trees
+        # may share one TORCH_EXTENSIONS_DIR -- an older-mtime source would otherwise silently load another version's binary
         import hashlib
 
         with open(os.path.join(HERE, "attn_block.cu"), "rb") as f:
@@ -48,7 +48,7 @@ class Scratch:
         self.amap = ext().make_amap(self.attn_out)
         self.slots = torch.zeros(4 * 144, dtype=torch.int32, device=device)   # per-forward key-row slot cache (first SWA layer writes)
         self.slots_writer = None   # layer_id of the SWA layer that writes it
-        # goal11 mega (qkv GEMM as phase 0): the qkv rows [32][3392] bf16 and one ready flag per CTA (epoch-tagged, no reset)
+        # attention megakernel (qkv GEMM as phase 0): the qkv rows [32][3392] bf16 and one ready flag per CTA (epoch-tagged, no reset)
         self.qout = torch.zeros(32, 3392, dtype=torch.bfloat16, device=device)
         self.qflags = torch.zeros(128 * 32, dtype=torch.int32, device=device)
         # qkv-only launches (FA layers) release their flags with a fixed epoch (dummy_work): they get their own flag lines so a
@@ -231,20 +231,33 @@ def _stamp_watcher(rank):
         time.sleep(0.2)
 
 
-def _log_once(key, msg, *args):
-    if key not in _logged:
-        _logged.add(key)
+def _rank0() -> bool:
+    try:
+        import torch.distributed as dist
+
+        return not dist.is_initialized() or dist.get_rank() == 0
+    except Exception:
+        return True
+
+
+def _log_once(key, msg, *args, info=False):
+    """Log once per process: fallbacks as warnings, the 'enabled' / 'running' notices (info=True) at INFO level on rank 0 only."""
+    if key in _logged:
+        return
+    _logged.add(key)
+    if not info:
         logger.warning("MiMo blk: " + msg, *args)
+    elif _rank0():
+        logger.info("MiMo blk: " + msg, *args)
 
 
 def enabled() -> bool:
-    # default ON since the E2E validation of b36a7316bc on top of combo3 (g11b_c3b_on/off: -0.23 ms/step, parity 4/4); SGLANG_MIMO_BLK=0 = off
+    # default ON; SGLANG_MIMO_BLK=0 = off
     return os.environ.get("SGLANG_MIMO_BLK", "1") == "1"
 
 
 def mega_enabled() -> bool:
-    # goal11 mega: the qkv_proj GEMM runs as phase 0 of the fused SWA block (attn_block_mega); SGLANG_MIMO_MEGA=0 = blk's separate GEMM.
-    # Default ON since the E2E validation of 0d2aa1c6ea (g11m_m12: 10.573 / 10.568 vs knob off 11.164 / 11.060 ms, parity 4/4).
+    # the qkv_proj GEMM runs as phase 0 of the fused SWA block (attn_block_mega); default ON, SGLANG_MIMO_MEGA=0 = blk's separate GEMM
     return os.environ.get("SGLANG_MIMO_MEGA", "1") == "1"
 
 
@@ -270,7 +283,7 @@ class BlkLayer:
         if sinks is not None:
             self.sinks = sinks.data if sinks.dtype == torch.float32 else sinks.data.float().contiguous()
             if sinks.dtype != torch.float32:
-                _log_once("sinks", "attention_sink_bias is %s, using an fp32 copy", sinks.dtype)
+                _log_once("sinks", "attention_sink_bias is %s, using an fp32 copy", sinks.dtype, info=True)
         self.fmoe = fused_moe
         self.window = int(attn.attn.sliding_window_size) + 1
         self.sm_scale = float(attn.attn.scaling)
@@ -328,7 +341,7 @@ class BlkLayer:
         self.qsw = sc
         self.qwmap = ext().make_qwmap(w.data)
         self.qpre = int(os.environ.get("SGLANG_MIMO_MEGA_QPRE", "16"))
-        _log_once("mega_on", "attention megakernel enabled (qkv GEMM phase 0, qpre %d)", self.qpre)
+        _log_once("mega_on", "attention megakernel enabled (qkv GEMM phase 0, qpre %d)", self.qpre, info=True)
 
     @staticmethod
     def ready(decoder_layer, forward_batch, m):
@@ -358,7 +371,8 @@ class BlkLayer:
                 return None
             blk = BlkLayer(decoder_layer, fmoe)
             object.__setattr__(decoder_layer, "_blk", blk)
-            _log_once("created", "fused attention block enabled (SWA layers, first: layer %d, window %d)", decoder_layer.layer_id, blk.window)
+            _log_once("created", "fused attention block enabled (SWA layers, first: layer %d, window %d)", decoder_layer.layer_id, blk.window,
+                      info=True)
         return blk
 
     def run(self, attn, qkv, positions, forward_batch):
@@ -433,7 +447,7 @@ class BlkLayer:
             nkv=self._next_kv(backend, keys, values),
         )
         partial._blk_prepushed = True
-        _log_once("ran_swa", "fused SWA attention block running (layer %d)", layer.layer_id)
+        _log_once("ran_swa", "fused SWA attention block running (layer %d)", layer.layer_id, info=True)
         return partial
 
     def run_mega(self, attn, x, positions, forward_batch):
@@ -524,7 +538,7 @@ class BlkLayer:
             qpre=self.qpre,
         )
         partial._blk_prepushed = True
-        _log_once("ran_mega", "attention megakernel running (layer %d)", layer.layer_id)
+        _log_once("ran_mega", "attention megakernel running (layer %d)", layer.layer_id, info=True)
         return partial
 
     def _next_kv(self, backend, keys, values):
@@ -606,7 +620,7 @@ class MegaQkv:
                 return None
             mq = MegaQkv(attn)
             object.__setattr__(attn, "_mega_qkv", mq)
-            _log_once("mega_fa_" + str(mq.ok), "FA-layer qkv GEMM via the megakernel: %s", mq.ok)
+            _log_once("mega_fa_" + str(mq.ok), "FA-layer qkv GEMM via the megakernel: %s", mq.ok, info=True)
         return mq if mq.ok else None
 
     def run(self, x):
