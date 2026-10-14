@@ -53,9 +53,9 @@ _shared: Optional[_SharedRankState] = None
 # FMOE_NVCC_FLAGS=-DFMOE_PHASE_STAMPS. Creating <dir>/dump.<n> makes every rank write
 # <dir>/stamps_rank<r>_<n>.pt = {layer_id: int64 [MAXM, grid * NSTAMP]} (last replay per layer and token count M, row M-1).
 _STAMP_DIR = os.environ.get("SGLANG_MIMO_FUSED_MOE_STAMP_DIR", "")
-# goal11 layer (FMOE_PDL_ENTRY builds): a prepushed launch (the attention kernel already pushed the reduce-scatter messages) is PDL-launched
-# (mode bit 29): the MoE CTAs land as the attention kernel's CTAs exit and run their entry code while that grid drains, then
-# griddepcontrol.wait. SGLANG_MIMO_MOE_PDL=0 disables it.
+# FMOE_PDL_ENTRY builds (the default): a prepushed launch (the attention kernel already pushed the reduce-scatter messages) is
+# PDL-launched (mode bit 29): the MoE CTAs land as the attention kernel's CTAs exit and run their entry code while that grid
+# drains, then griddepcontrol.wait. SGLANG_MIMO_MOE_PDL=0 disables it.
 _PDL_ENTRY = [None]
 
 
@@ -155,7 +155,7 @@ class _SharedRankState:
                     ptrs.append(peer.value)
             all_ptrs.append(ptrs)
         self.state.link_ptrs(all_ptrs[0], all_ptrs[1])
-        # kernels built with -DFMOE_INPUT_TP=1 absorb the input TP all-reduce into their prologue over one more IPC
+        # FMOE_INPUT_TP builds (the default) absorb the input TP all-reduce into the kernel prologue over one more IPC
         # buffer per rank (reduce-scatter / all-gather LL messages + this rank's router-partial and top-8 regions).
         self.input_tp = (
             bool(getattr(F.ext(), "INPUT_TP", 0))
@@ -179,16 +179,6 @@ class _SharedRankState:
                     peer = lib.cudaIpcOpenMemHandle(type(handle).from_buffer_copy(h))
                     ptrs.append(peer.value)
             self.state.link_pro_ptrs(ptrs, ptr.value)
-        if os.environ.get("SGLANG_MIMO_FUSED_MOE_DG_PDL", "0") == "1":
-            # Follow-on: launch DeepGEMM with programmatic dependent launch so the qkv GEMM that now directly follows the
-            # fused MoE kernel (FMOE_LATE_TRIGGER primary) hides its launch gap. Global deep_gemm setting; opt-in.
-            try:
-                import deep_gemm
-
-                deep_gemm.set_pdl(True)
-                log_info_on_rank0(logger, "MiMo fused MoE: deep_gemm.set_pdl(True)")
-            except Exception as e:  # never fatal
-                logger.warning(f"MiMo fused MoE: deep_gemm.set_pdl failed: {e}")
         # SGLANG_MIMO_FUSED_MOE_L2_SETASIDE_MB = N raises the L2 persisting set-aside (cudaLimitPersistingL2CacheSize, default
         # 11.25 MB on H200, max 37.5) so the kernel's L2::evict_last prefetch of the next layer's o_proj weight (25.2 MB) is fully protected
         # until the o_proj GEMM reads it ~30 us later. Device-wide, set once per process (= per rank).
@@ -261,9 +251,9 @@ def take_norm_next_handoff(handoff, hidden_states, forward_batch, capture_gather
     stream.write(handoff.residual_new)
     if capture_gathered is not None:
         # the residual the skipped prepare would have written and captured (aux hidden state for DFLASH); the buffer is
-        # rewritten every step, so the accumulator copies it.
-        # goal11-glue: residual_new is a fixed buffer only this handoff's producer rewrites (next forward) -> the packer
-        # may defer the copy (capture_stable) and pack every deferred capture in one launch
+        # rewritten every step, so the accumulator copies it. residual_new is a fixed buffer that only this handoff's
+        # producer rewrites (next forward), so the packer may defer the copy (capture_stable) and pack every deferred
+        # capture in one launch.
         cap = getattr(capture_gathered, "capture_stable", None)
         if cap is not None:
             cap(handoff.residual_new)
@@ -389,17 +379,17 @@ class MiMoFusedMoE:
         self.eps = float(config.layernorm_epsilon)
         self.max_tokens = min(F.MAXM, int(envs.SGLANG_MIMO_FUSED_MOE_MAX_TOKENS.get()))
         self.ffn_plan = decoder_layer.ffn_boundary.plan
-        # SGLANG_MIMO_FUSED_MOE_PREFETCH = comma list of {qkv, o}: the kernel (built with -DFMOE_TAIL_PREFETCH=1..3) L2-prefetches the
-        # NEXT layer's qkv_proj weight (+ block scales) and/or o_proj weight in its TP tail. Cache hint only: no dependency, no bit change.
+        # SGLANG_MIMO_FUSED_MOE_PREFETCH = comma list of {qkv, o}: the kernel (FMOE_TAIL_PREFETCH builds, the default) L2-prefetches
+        # the NEXT layer's qkv_proj weight (+ block scales) and/or o_proj weight in its TP tail. Cache hint only: no dependency, no bit change.
         # The weights are their final (post process_weights_after_loading) tensors here: try_create runs at the first forward.
         # SGLANG_MIMO_FUSED_MOE_PREFETCH_HINT = comma list of {qkv, o}: those ranges are prefetched with an L2::evict_last hint (the o_proj
         # weight is read ~30 us later, after the qkv weight stream and attention have passed through L2).
         self.pf = None
         nxt = getattr(decoder_layer, "_mimo_next_layer", None)
-        # goal11 mega: when the next layer runs the attention megakernel (SWA layer), its CTAs preload the qkv weights into smem under this
-        # kernel's tail instead (SGLANG_MIMO_MEGA_QPRE) and stream o_proj from HBM later -> no o_proj tail prefetch there by default
-        # (E2E g11m_m7_spnopf: 10.626 vs 10.884 ms with both in the tail). Same before full-attention layers when their qkv_proj runs
-        # through the megakernel's GEMM (SGLANG_MIMO_MEGA_FA, also preloaded): FA period 190.7 vs 192.6 us with the o_proj prefetch kept.
+        # When the next layer runs the attention megakernel (SWA layer), its CTAs preload the qkv weights into smem under this
+        # kernel's tail instead (SGLANG_MIMO_MEGA_QPRE) and stream o_proj from HBM later, so there is no o_proj tail prefetch there
+        # by default (measured faster). Same before full-attention layers whose qkv_proj runs through the megakernel's GEMM
+        # (SGLANG_MIMO_MEGA_FA, also preloaded).
         pf_default = "o"
         try:
             from sglang.srt.layers.moe.mimo_fused_moe.attn_block import mega_enabled, mega_fa_enabled
@@ -714,7 +704,7 @@ class MiMoFusedMoE:
                 router_w_bf16=self.router_w,
                 bias=self.bias,
             )
-            # goal11 blk: the attention-block kernel already pushed the reduce-scatter messages of this launch (mode bit 30)
+            # the attention-block kernel already pushed the reduce-scatter messages of this launch (mode bit 30)
             prepushed = getattr(hidden_states, "_blk_prepushed", False)
             F.run_fused_full_tp(
                 self.shared.state,
