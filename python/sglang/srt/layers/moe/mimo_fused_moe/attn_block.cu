@@ -1640,27 +1640,6 @@ void attn_block_swa(torch::Tensor qkv, torch::Tensor cos_sin, torch::Tensor posi
     else TORCH_CHECK(false, "window must be 128 or 129");
 }
 
-// FA layers: o_proj of an attention output computed by the previous kernel (fa3 combine) + the reduce-scatter push. attn: contiguous
-// bf16 [32][2048]; amap = make_amap(attn) (the caller rebuilds it whenever attn moves; CUDA-graph replays keep the captured address).
-void attn_block_ext(torch::Tensor attn, torch::Tensor partial, torch::Tensor wmap, torch::Tensor amap, torch::Tensor peers, torch::Tensor work,
-                    int64_t my_rank, int64_t mode, int64_t pdl, torch::Tensor dbg) {
-    TORCH_CHECK(attn.scalar_type() == torch::kBFloat16 && attn.numel() == (int64_t)M * KO && attn.is_contiguous(), "attn [32][2048] bf16");
-    TORCH_CHECK(partial.numel() >= (int64_t)M * DIM && partial.scalar_type() == torch::kBFloat16, "partial");
-    TORCH_CHECK(wmap.device().is_cpu() && wmap.numel() == sizeof(CUtensorMap) && amap.device().is_cpu() && amap.numel() == sizeof(CUtensorMap), "maps");
-    TORCH_CHECK(peers.device().is_cpu() && peers.scalar_type() == torch::kInt64 && peers.numel() == TP_NDEV, "peers CPU int64[8]");
-    TORCH_CHECK(work.scalar_type() == torch::kInt32 && work.numel() >= 4, "work");
-    Params P{};
-    std::memcpy(&P.tm_w, wmap.data_ptr(), sizeof(CUtensorMap));
-    std::memcpy(&P.tm_a, amap.data_ptr(), sizeof(CUtensorMap));
-    P.partial = reinterpret_cast<__nv_bfloat16*>(partial.data_ptr());
-    for (int d = 0; d < TP_NDEV; ++d) P.peer[d] = reinterpret_cast<uint4*>(peers.data_ptr<int64_t>()[d]);
-    P.work = work.data_ptr<int>();
-    P.dbg = dbg.numel() >= (int64_t)NCTA * NDBG ? reinterpret_cast<unsigned long long*>(dbg.data_ptr()) : nullptr;
-    P.my_rank = (int)my_rank;
-    P.mode = ((int)mode & ~(MODE_POS64 | MODE_LOC64 | MODE_SINK)) | MODE_EXT_ATTN;
-    launch_t<129>(P, at::cuda::getCurrentCUDAStream(), pdl != 0);
-}
-
 // ------------------------------------------------------------------------------------------------------------------ mega host
 // fp8 row-major [rows][cols] viewed as 3D {128 (k in block), rows, cols / 128 (k-block, stride 128 B)} -> box {128, box_rows, 2}:
 // two consecutive k-blocks land as two [box_rows][128] SWIZZLE_128B tiles back to back
@@ -1813,7 +1792,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("attn_block_swa", &blk::attn_block_swa);
     m.def("make_wmap", &blk::make_wmap);
     m.def("make_amap", &blk::make_amap);
-    m.def("attn_block_ext", &blk::attn_block_ext);
     m.def("attn_block_mega", &blk::attn_block_mega);
     m.def("attn_block_qkv", &blk::attn_block_qkv);
     m.def("make_qwmap", &blk::make_qwmap);

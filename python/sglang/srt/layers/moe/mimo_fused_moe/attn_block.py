@@ -185,15 +185,6 @@ def run_qkv(x, x_scale, qwmap, qsw, out, scratch: Scratch, pdl=True, qpre=0, dbg
     )
 
 
-def run_ext(attn, partial, wmap, peers_cpu, work, my_rank, mode=0, pdl=False, dbg=None):
-    """FA layers: o_proj of `attn` (contiguous bf16 [32][2048], the fa3 output) + the fused MoE entry reduce-scatter push."""
-    amap = ext().make_amap(attn)
-    ext().attn_block_ext(
-        attn, partial, wmap, amap, peers_cpu, work, int(my_rank), int(mode), int(bool(pdl)),
-        dbg if dbg is not None else _EMPTY_I64.setdefault(str(attn.device), torch.empty(0, dtype=torch.int64, device=attn.device)),
-    )
-
-
 _EMPTY = {}
 _EMPTY_I64 = {}
 _EMPTY_BF16 = {}
@@ -267,6 +258,8 @@ def _scratch(device) -> Scratch:
 class BlkLayer:
     """The fused attention-block path of one SWA MiMoV2DecoderLayer (created lazily, outside CUDA-graph capture)."""
 
+    kind = "swa"
+
     def __init__(self, decoder_layer, fused_moe):
         attn = decoder_layer.self_attn
         w = attn.o_proj.weight
@@ -279,13 +272,12 @@ class BlkLayer:
             if sinks.dtype != torch.float32:
                 _log_once("sinks", "attention_sink_bias is %s, using an fp32 copy", sinks.dtype)
         self.fmoe = fused_moe
-        self.kind = "swa" if decoder_layer.is_swa_layer() else "fa"
         self.window = int(attn.attn.sliding_window_size) + 1
         self.sm_scale = float(attn.attn.scaling)
         self.pdl = os.environ.get("SGLANG_MIMO_BLK_PDL", "1") == "1"
         self.scratch = _scratch(w.device)
         self.slot_mode = 0
-        if self.kind == "swa" and os.environ.get("SGLANG_MIMO_BLK_SLOTS", "1") == "1":
+        if os.environ.get("SGLANG_MIMO_BLK_SLOTS", "1") == "1":
             if self.scratch.slots_writer is None:
                 self.scratch.slots_writer = decoder_layer.layer_id   # created in layer order: the first SWA layer of every forward
             self.slot_mode = ext().MODE_SLOTS_WRITE if self.scratch.slots_writer == decoder_layer.layer_id else ext().MODE_SLOTS_READ
@@ -298,7 +290,7 @@ class BlkLayer:
                 break
             nxt = getattr(nxt, "_mimo_next_layer", None)
         self.qwmap = None
-        if self.kind == "swa" and mega_enabled():
+        if mega_enabled():
             self._init_mega(attn)
         self.dbg = None
         if _STAMP_DIR:
@@ -342,9 +334,7 @@ class BlkLayer:
     def ready(decoder_layer, forward_batch, m):
         """The BlkLayer to run this forward's attention with (the MoE kernel then runs prepushed), or None. Deterministic in the
         shapes / config, so every TP rank takes the same decision."""
-        if not enabled() or m != 32:
-            return None
-        if not decoder_layer.is_swa_layer() and os.environ.get("SGLANG_MIMO_BLK_FA", "0") != "1":   # FA mode: no in-situ gain yet
+        if not enabled() or m != 32 or not decoder_layer.is_swa_layer():
             return None
         fmoe = getattr(decoder_layer, "_fused_moe", None)
         if fmoe is None or not fmoe.shared.input_tp or fmoe.router_w.dtype != torch.bfloat16:
@@ -368,7 +358,7 @@ class BlkLayer:
                 return None
             blk = BlkLayer(decoder_layer, fmoe)
             object.__setattr__(decoder_layer, "_blk", blk)
-            _log_once("created_" + blk.kind, "fused attention block enabled (%s layers, first: layer %d, window %d)", blk.kind, decoder_layer.layer_id, blk.window)
+            _log_once("created", "fused attention block enabled (SWA layers, first: layer %d, window %d)", decoder_layer.layer_id, blk.window)
         return blk
 
     def run(self, attn, qkv, positions, forward_batch):
@@ -548,22 +538,6 @@ class BlkLayer:
         if nk.shape != keys.shape or nv.shape != values.shape or nk.stride() != keys.stride() or nv.stride() != values.stride():
             return None
         return nk, nv
-
-    def run_fa(self, attn_output):
-        """FA layers: o_proj of the fa3 output + the reduce-scatter push; None when the output layout does not fit."""
-        if self.kind != "fa" or attn_output.dtype != torch.bfloat16 or attn_output.numel() != 32 * 2048:
-            _log_once("fb_fa", "fallback (FA): attention output %s %s", attn_output.dtype, tuple(attn_output.shape))
-            return None
-        a = attn_output.reshape(32, 2048)
-        if not a.is_contiguous() or a.data_ptr() % 16:
-            _log_once("fb_fa2", "fallback (FA): attention output not contiguous / aligned")
-            return None
-        partial = torch.empty(32, 6144, dtype=torch.bfloat16, device=a.device)
-        st = self.fmoe.shared
-        run_ext(a, partial, self.wmap, st.state.pro_cpu, st.state.work, st.rank, 0, self.pdl, dbg=self.dbg)
-        partial._blk_prepushed = True
-        _log_once("ran_fa", "fused FA o_proj + push running")
-        return partial
 
 
 def mega_fa_enabled() -> bool:
