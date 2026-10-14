@@ -101,9 +101,6 @@ constexpr int PROD_WARP = NCONS / 32;    // warp 16
 // below that 104 is spill-free and the producer warp (fc1 gather + fc2 flag polling) gets 64 instead of 32.
 template <int NT> struct RegSplit { static constexpr int consumer = (NT >= 64) ? 112 : 104; static constexpr int producer = (NT >= 64) ? 32 : 64; };
 constexpr int NSTAGE1 = 6;
-#ifndef FMOE_MIXED_WIDTH
-#define FMOE_MIXED_WIDTH 0               // 1: hot experts (> 8 tokens) of a two-wave load stream once as N16 tasks on the last CTAs
-#endif
 #ifndef FMOE_ROUTER_BF16
 #define FMOE_ROUTER_BF16 1               // 1: router GEMM on a bf16 copy of the router weight (the fp32 checkpoint weight rounded ONCE, RNE,
 #endif                                   //    = SGLang mimo_v2 MoEGate after commit 3b7633d: bf16 parameter, bf16 x bf16 -> fp32 GEMM); one
@@ -305,9 +302,6 @@ constexpr int PREFILL_B3 = FC1_PUB_OFFLOAD ? 96 : 128;   // FMOE_FC2_PREFILL's p
 #define FMOE_S_ABL 0                     // goal11 sched DIAGNOSTIC ablations (outputs wrong, never in production): bit 0 FC2 weight+offset TMA skipped,
 #endif                                   //    bit 1 FC2 h copy skipped, bit 2 FC2 consumer dequant skipped, bit 3 FC1 weight TMA skipped, bit 4 FC2 consumer
                                          //    pipeline-only (wait full -> release, no compute), bit 5 FC2 stage released right after the kb1 dequant
-#ifndef FMOE_S_TRACE
-#define FMOE_S_TRACE 0                   // goal11 sched: stamps builds only -- per-stage clock64 trace of the FC1 / FC2 rings (NSTAMP 2048, slots >= 28)
-#endif
 #ifndef FMOE_S_BPF
 #define FMOE_S_BPF 0                     // goal11 sched: N > 0 (exact-M32 N8 token-task FC1): at an FC1 item boundary, the moment the consumers
 #endif                                   //    release the previous item's last stage (= their epilogue starts, HBM idles), the weight lane
@@ -400,9 +394,6 @@ constexpr int PREFILL_B3 = FC1_PUB_OFFLOAD ? 96 : 128;   // FMOE_FC2_PREFILL's p
 #define FMOE_ROUTER_POLL_FIRST 0         // 1 (cp.async router prologue): warp 0 issues none of the ~6200 prologue cp.asyncs and polls the rstd messages from
 #endif                                   //    kernel start, instead of queueing its first poll behind the CTA's own copies (gathered 2.8 us for a 1.6-us message).
                                          //    Probe: gathered 2.99 (the polls queue behind the other 19 warps' copies just the same), publish 5.10 vs 5.20 -> off
-#ifndef FMOE_TASK_TABLE_FUSED
-#define FMOE_TASK_TABLE_FUSED 1          // 1: the token-task table's cross-warp scan (warp 0 serial pass + barrier, ~0.3 us on the tables -> tile0 chain) is
-#endif                                   //    folded into the table-writing pass (every thread sums the 8 warp totals itself); identical tables
 #ifndef FMOE_EARLY_FENCE_HOIST
 #define FMOE_EARLY_FENCE_HOIST 1         // 1: the fence.proxy.async that precedes the early first-tile TMAs is executed by every thread right after the
 #endif                                   //    union tables' barrier (their ring-region writes are the ones it orders) instead of by the issuing lane after
@@ -521,11 +512,7 @@ constexpr int HST_STRIDE = 132;
 constexpr int HST_BYTES = MAXM * HST_STRIDE * 4;   // 33792
 constexpr int XS_BYTES = NKT1 * MAXM * 4;          // 12288: xp_s[kt][tig 4][j 8][2] = x_scale[tok(pos = 8j + 2tig + e)][kt] (a lane's 8 chunks are contiguous)
 constexpr int MSG_PER_TOK = 43;                    // 128 rows / 3 floats per 16-B message (last: 2 valid)
-#if defined(FMOE_PHASE_STAMPS) && FMOE_S_TRACE
-constexpr int NSTAMP = 2048;                       // FMOE_S_TRACE stamps build: 28 = clock64 at stamp 0, 64.. FC2 stage trace, 1088.. FC1 tile trace
-#else
 constexpr int NSTAMP = 28;                         // dbg globaltimer stamps per CTA (16..27: DIAG accumulators)
-#endif
 
 // Router prologue geometry: unit = (k-group kg of RKS columns, row-group rg of 64 expert rows).
 constexpr int RKG = 16;                            // k-groups
@@ -562,28 +549,6 @@ constexpr int PRO_TOPK = PRO_RP + TP_TOK_PER_RANK * RKG;                 // 2012
 constexpr int PRO_U4 = PRO_TOPK + MAXM * (TOPK / 2);                     // 201536 messages = 3224576 B
 static_assert(PRO_XAG % 2 == 0 && PRO_RPART % 2 == 0 && PRO_RP % 2 == 0 && PRO_TOPK % 2 == 0 && TP_RS_ROW % 2 == 0 && TP_AG_ROW % 2 == 0, "32-B sector alignment");
 constexpr int TP_NUNITS = 2 * NRG_MAX;             // 12 router units per rank (needs n_exp == NEXP)
-#ifndef FMOE_TP_LIN
-#define FMOE_TP_LIN 0                              // 1 (comm slice, goal11 round 2): LINEAR "router-first" prologue -- NOT bitwise vs the bf16 MoEGate
-#endif                                             //    (default 0; the routing changes on ~3 % of tokens, see below). The router logits are linear in
-                                                   //    the input partials: l_e = rstd * sum_k W[e][k] w[k] (res[k] + sum_s p_s[k]), so every rank's 96
-                                                   //    router units start AT KERNEL ENTRY on this rank's OWN o_proj partial (all 32 tokens) + the residual
-                                                   //    of its 4 owned tokens (wgmma N = 40), with no dependence on the reduce-scatter; the 16 k-group
-                                                   //    partials are reduced locally and the per-rank logit partials pushed to the token owners (59 KB per
-                                                   //    rank); the owner scales the 9-source sum by rstd (still from the reduce-scatter's p messages) and
-                                                   //    runs the unchanged stage 3. The router's critical path loses the reduce -> AG -> rstd -> normalize
-                                                   //    chain. Precision: the activation side is EXACT (w * p split into two exact bf16 planes hi + lo, fp32
-                                                   //    accumulation; no bf16 rounding of the reduced row or of the normalized row): on the s64k capture the
-                                                   //    top-8 sets equal an fp32-activation reference on 4416 / 4416 tokens, while the bf16 MoEGate (= this
-                                                   //    kernel's default bits) differs from that reference on 133 tokens (3.0 %) -> LIN routes those 3 %
-                                                   //    differently from the default kernel (one expert each). FC1 / FC2 / TP tail bits are unchanged.
-constexpr int LIN_NT = 40;                         // wgmma N: 32 tokens' partials + 4 owned tokens' residuals + 4 zero columns
-constexpr int LIN_COLS = TP_M + TP_TOK_PER_RANK;   // 36 live columns
-constexpr int LIN_NSRC = TP_NDEV + 1;              // logit sources per owned token: ranks 0..7, then the residual term
-constexpr int PRO_LZ = PRO_RPART;                  // LIN (reuses the RPART region): fp32 [96 units][36 cols][64] this rank's k-group partials (local)
-constexpr int LIN_LZF_FLOATS = RUNITS_MAX * LIN_COLS * RROWS;   //    + unsigned [96] per-unit release flags (epoch) after them
-constexpr int PRO_LZIN = PRO_LZ + RUNITS_MAX * LIN_COLS * RMSG;   // [4 owned][9 src][6 rg][22] per-source logit partials of the owned tokens
-static_assert((LIN_LZF_FLOATS + RUNITS_MAX) * 4 <= RUNITS_MAX * LIN_COLS * RMSG * 16, "LIN fp32 table + flags fit before LZIN");
-static_assert(PRO_LZIN % 2 == 0 && PRO_LZIN + TP_TOK_PER_RANK * LIN_NSRC * NRG_MAX * RMSG <= PRO_RP, "LIN regions fit in the RPART region");
 #ifndef FMOE_TP_W_DELAY_NS
 #define FMOE_TP_W_DELAY_NS 2000                    // > 0: a router CTA issues its 48-KB weight tile this long after kernel start (96 CTAs = 4.7 MB, an L2-bandwidth
 #endif                                             //    burst even when L2-resident): at t = 0 it delayed the reduce-scatter landing 1.5 -> 1.9 us (stamps3), at
@@ -596,24 +561,6 @@ static_assert(PRO_LZIN % 2 == 0 && PRO_LZIN + TP_TOK_PER_RANK * LIN_NSRC * NRG_M
 #ifndef FMOE_TP_S3_DRY
 #define FMOE_TP_S3_DRY 0                           // 1: the owner CTA runs a dry stage-3 pass (no gather, no publish) while it waits for the
 #endif                                             //    partials -- probes whether the +1.1 us stage-3 slowdown of the TP kernel is a cold-code effect
-#ifndef FMOE_TP_S3_WARM
-#define FMOE_TP_S3_WARM 0                          // 1 (comm slice, goal11): the owner CTA runs stage 3 TWICE through ONE inlined copy (a 2-trip runtime loop): pass 0
-#endif                                             //    dry (no gather -- the partial polls are skipped --, no list publish / prefetch) while it waits ~4 us for the
-                                                   //    router partials, so the real pass runs from a warm instruction cache. FMOE_TP_S3_DRY (a separate DRY=true
-                                                   //    instantiation = different PCs) could not warm anything. Same values / order in the real pass -> bitwise.
-#ifndef FMOE_TP_S4_WARM
-#define FMOE_TP_S4_WARM 0                          // 1 (comm slice, goal11): every NON-owner CTA runs stage 4 (union tables) twice through one inlined copy: pass 0 dry
-#endif                                             //    (no list / x-flag polls -- the stale previous-launch lists feed the smem tables --, no L2 prefetch, no union_out)
-                                                   //    while the owners still run stage 3, so the real pass after the top-8 hop runs warm. Bitwise (tables rebuilt).
-#ifndef FMOE_TP_RT_WARM
-#define FMOE_TP_RT_WARM 0                          // 1 (comm slice, goal11): each router CTA runs gather / normalize / router_compute twice through one inlined copy:
-#endif                                             //    pass 0 dry right at kernel start (no polls -- stale messages fill the B tile --, no cp.async wait, no psum
-                                                   //    stores (psum overlays the in-flight W tile), no RPART publish) while the reduce-scatter is still in flight,
-                                                   //    so the real pass after the all-gather runs warm. Bitwise (the real pass rewrites every tile it reads).
-#ifndef FMOE_TP_RED_WARM
-#define FMOE_TP_RED_WARM 0                         // 1 (comm slice, goal11): each token CTA runs tp_reduce_token twice through one inlined copy: pass 0 dry right after
-#endif                                             //    the barrier init (no RS polls, no all-gather / p stores) while the reduce-scatter messages are in flight,
-                                                   //    so the real reduce -> p -> AG chain (the routers' rstd input) runs warm. Bitwise.
 #ifndef FMOE_TP_ACQ_EARLY
 #define FMOE_TP_ACQ_EARLY 2                        // 2: the producer warps' tensormap acquire fences run at the start of the TP prologue instead of
 #endif                                             //    after the router phase (probe: do they land on a stage-3 barrier as the floating ~1.1 us stall?)
@@ -760,15 +707,6 @@ constexpr int TABX_PEER = TABX_PUB;                       // FMOE_INPUT_TP: uint
                                                           //    load per remote store put an L2 round trip in front of the p push and the top-8 publish); s_pub is unused in TP
 static_assert(TABX_PEER % 8 == 0 && TABX_PEER + 8 * 8 <= TAB_BYTES, "peer pointer cache fits the s_pub slot");
 static_assert(OFF_PH % 1024 == 0 && OFF_PR % 1024 == 0, "slice tiles' swizzle atoms need 1024-B alignment");
-// FMOE_TP_LIN router unit: W tile at OFF_PW (psum overlays it after the wgmmas), two exact bf16 B planes (hi, lo) of w o x, the raw
-// activation rows (32 partial rows, 4 residual rows, the norm-weight slice; 768 B each), the k-group reduction scratch over the raw rows.
-constexpr int LIN_PLANE = (RKS / 64) * LIN_NT * 128;      // 30720: [6 k64 columns][40 rows][128 B], SWIZZLE_128B atoms of 8 rows
-constexpr int OFF_LIN_B0 = OFF_PH;
-constexpr int OFF_LIN_B1 = OFF_LIN_B0 + LIN_PLANE;
-constexpr int OFF_LIN_RAW = OFF_LIN_B1 + LIN_PLANE;
-constexpr int OFF_LIN_RED = OFF_LIN_RAW;                  // [3 cols][16 kg][66] fp32, after the planes are built
-static_assert(OFF_LIN_B0 % 1024 == 0 && OFF_LIN_B1 % 1024 == 0 && RWG * RROWS * (LIN_NT + 8) * 4 <= OFF_LIN_B0, "LIN B planes aligned, psum over the W tile");
-static_assert(OFF_LIN_RAW + (LIN_COLS + 1) * RKS * 2 <= OFF_P1 && LIN_COLS * (RROWS + 1) * 4 <= (LIN_COLS + 1) * RKS * 2, "LIN raw rows / staging fit");
 static_assert(OFF_PSQ + RKG * SQ_STRIDE * 4 <= OFF_TOK, "prologue scratch inside the ring/hst/xs region");
 // psum is written after every router WG's wgmma wait + the router named barrier, when the W tile AND the in-place-normalized B tile
 // are dead (the next unit's slice/W loads are issued only after the following __syncthreads): it may cover [OFF_PW, OFF_PR).
@@ -839,10 +777,7 @@ struct Params {
     int* work;                   // [4] device counters: fc1 front item queue, CTA completion (self-resetting), epoch, fc1 back (reserve) queue
     int reserve;                 // fc1 items reserved for the fc1-only CTAs (back region of the queue); < 0 = auto (device-side)
     int parts;                   // fc2 CTAs per output tile (1 or 2; experts split by parity, partials are separate all-reduce sources)
-    unsigned long long* dbg;     // optional [grid][NSTAMP] stamps; requires FMOE_PHASE_STAMPS or FMOE_DIAG
-#if FMOE_RT_AB
-    int ab;                      // FMOE_RT_AB runtime knobs (mode >> 16)
-#endif
+    unsigned long long* dbg;     // optional [grid][NSTAMP] stamps; requires FMOE_PHASE_STAMPS
     int mode;                    // diagnostics only: 1 = fc1 consumers skip compute, 2 = producer skips x gather, 4 = fc2 CTAs exit, 8 = fc2 consumers skip compute
     int fc2_helper_capacity;      // host checked: FC2 flags64..111, disjoint from FC1 tails
     int m32_tail_scratch;         // host-checked spare h storage and FC1 partial-flag capacity
@@ -870,41 +805,20 @@ struct Params {
 #if FMOE_BLK_PREPUSH
     int rs_prepushed;                // 1: the entry reduce-scatter messages were pushed by the preceding attention-block kernel (skip tp_rs_push)
 #endif
-#ifdef FMOE_LAYER_FUSED
-    blk::MegaParams mg;              // goal11 layer (layer_fused.cu): the attention megakernel's params of the same launch (phase 1)
-#endif
 };
 static bool g_pdl_entry = false;   // FMOE_PDL_ENTRY: mode bit 29 of the current launch (host side)
-#ifdef FMOE_LAYER_FUSED
-static Params* g_moe_capture = nullptr;   // goal11 layer: while set, the INPUT_TP entry only builds its params (no launch)
-#endif
-#ifndef FMOE_S_RT
-#define FMOE_S_RT 0                      // goal11 sched diag: 1 (needs FMOE_RT_AB=1) = FMOE_S_XT / FMOE_S_EOFF are compiled in but selected at run time by
-#endif                                   //    P.ab bit 8 (XT) / bit 9 (EOFF), so their A/B shares ONE binary (no ptxas re-draw between the arms)
 __device__ __forceinline__ bool s_xt_on(const Params& P) {
-#if FMOE_S_RT && FMOE_RT_AB
-    return FMOE_S_XT && (P.ab & 256) != 0;
-#else
     (void)P; return FMOE_S_XT != 0;
-#endif
 }
 // FMOE_GP_SHIFT (lab override: P.ab bit 10 + bits 11..17 with FMOE_S_RT): capped so round 2 never exceeds round 1
 __device__ __forceinline__ int m32_gp_shift(const Params& P, int n_tasks) {
     int sh = FMOE_GP_SHIFT;
-#if FMOE_S_RT && FMOE_RT_AB
-    if (P.ab & 1024) sh = (P.ab >> 11) & 0x7f;
-#else
     (void)P;
-#endif
     const int r1 = min(max(n_tasks - 132, 0), 132), r2 = min(max(n_tasks - 264, 0), 132);
     return max(min(sh, (r1 - r2) / 2), 0);
 }
 __device__ __forceinline__ bool s_eoff_on(const Params& P) {
-#if FMOE_S_RT && FMOE_RT_AB
-    return FMOE_S_EOFF && (P.ab & 512) != 0;
-#else
     (void)P; return FMOE_S_EOFF != 0;
-#endif
 }
 
 constexpr int KS_FLAG_BASE = 256;              // part_flags index of one-wave K-split task t (legacy tails use [0,64), FC2 helpers [64,148))
@@ -912,7 +826,7 @@ constexpr int KS_PART_FLOATS = NCONS * 8;      // per task: [512 consumer thread
 
 // Keep even runtime-disabled instrumentation out of production codegen.
 // Diagnostic builds have separate extension-cache keys via FMOE_NVCC_FLAGS.
-#if defined(FMOE_PHASE_STAMPS) || defined(FMOE_DIAG)
+#if defined(FMOE_PHASE_STAMPS)
 __device__ __forceinline__ unsigned long long gtimer() { unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); return t; }
 #define STAMP(P, k) do { if ((P).dbg) (P).dbg[blockIdx.x * NSTAMP + (k)] = gtimer(); } while (0)
 // deferred stamps (comm slice): the time is kept in a register and stored later, so no store sits in the measured path (a stamp store
@@ -927,52 +841,6 @@ __device__ __forceinline__ unsigned long long gtimer() { unsigned long long t; a
 #define DSTAMP(v) do {} while (0)
 #define DSTAMP_PUT(P, k, v) do {} while (0)
 #define DCLOCK(v) do {} while (0)
-#endif
-// FMOE_STAMP_PRO (stamps builds, comm diag): the phase-build / tail stamps that reuse prologue slots 14..25 are compiled out (LSTAMP),
-// so the prologue's sub-stamps (router 14 / 19 / 15, owner 20..23, token CTAs 16..18 / 24 / 25) survive to the dump.
-#ifndef FMOE_STAMP_PRO
-#define FMOE_STAMP_PRO 0
-#endif
-#if FMOE_STAMP_PRO
-#define LSTAMP(P, k) do {} while (0)
-#else
-#define LSTAMP(P, k) STAMP(P, k)
-#endif
-// FMOE_L_DIAG (goal11 layer slice, stamps builds with FMOE_STAMP_PRO only): clock64 sub-stamps of the token CTAs' entry chain
-// (entry -> barrier init -> epoch / own partial -> RS polls -> reduce) in slots the token CTAs do not otherwise write (12, 14, 15, 19;
-// 20 / 21 / 26 are overwritten later on the 4 owner CTAs -> analyse the non-owner token CTAs). LCLKV first consumes v (scoreboard wait
-// on a pending load), then reads the clock.
-#ifndef FMOE_L_DIAG
-#define FMOE_L_DIAG 0
-#endif
-#if defined(FMOE_PHASE_STAMPS) && FMOE_L_DIAG
-#define LCLK(P, k) do { if ((P).dbg) { long long c_; asm volatile("mov.u64 %0, %%clock64;" : "=l"(c_) :: "memory"); (P).dbg[blockIdx.x * NSTAMP + (k)] = (unsigned long long)c_; } } while (0)
-#define LCLKV(P, k, v) do { if ((P).dbg) { unsigned w_; asm volatile("mov.b32 %0, %1;" : "=r"(w_) : "r"(v) : "memory"); long long c_; \
-    asm volatile("mov.u64 %0, %%clock64;" : "=l"(c_) :: "memory"); (P).dbg[blockIdx.x * NSTAMP + (k)] = (unsigned long long)c_ + (w_ == 0x7fffffffu); } } while (0)
-#else
-#define LCLK(P, k) do {} while (0)
-#define LCLKV(P, k, v) do {} while (0)
-#endif
-// FMOE_S_TRACE: FC2 stage l (< 120) event k (0 W lane issue, 1 warp-16 h issue, 2 warp-19 cs issue, 3 pair full seen, 4 pair release,
-// 5 offset lane issue, 6 pair kb1 issued, 7 pair starts its full wait); FC1 tile i = 48 n + kt (< 144) event k (0 weight lane issue,
-// 1 consumer full seen, 2 release, 3 consumer starts its full wait)
-#if defined(FMOE_PHASE_STAMPS) && FMOE_S_TRACE
-#define STRACE2(P, l, k) do { if ((P).dbg && (l) < 120) (P).dbg[blockIdx.x * NSTAMP + 64 + (l) * 8 + (k)] = clock64(); } while (0)
-#define STRACE1(P, i, k) do { if ((P).dbg && (i) < 144) (P).dbg[blockIdx.x * NSTAMP + 1088 + (i) * 4 + (k)] = clock64(); } while (0)
-#define STRACE0(P, k) do { if ((P).dbg) (P).dbg[blockIdx.x * NSTAMP + (k)] = clock64(); } while (0)
-#define STRACEE(P, n, k) do { if ((n) < 3) STRACE0(P, 1700 + 16 * (n) + (k)); } while (0)
-#define STRACEEB(P, n, k, sp) do { if ((n) < 3) STRACE0B(P, 1700 + 16 * (n) + (k), sp); } while (0)
-// STRACE0B: after a named barrier -- a dependent smem load (blocked until the barrier completes; bar.sync is DEFER_BLOCKING) is
-// consumed by a mov in front of the clock read, so the stamp is the barrier's completion, not this warp's arrival
-#define STRACE0B(P, k, sp) do { if ((P).dbg) { const int v_ = *reinterpret_cast<const volatile int*>(sp); unsigned w_; \
-    asm volatile("mov.b32 %0, %1;" : "=r"(w_) : "r"(v_)); const long long c_ = clock64(); (P).dbg[blockIdx.x * NSTAMP + (k)] = c_ + (w_ == 0x7fffffffu); } } while (0)
-#else
-#define STRACE2(P, l, k) do {} while (0)
-#define STRACE1(P, i, k) do {} while (0)
-#define STRACE0(P, k) do {} while (0)
-#define STRACE0B(P, k, sp) do {} while (0)
-#define STRACEE(P, n, k) do {} while (0)
-#define STRACEEB(P, n, k, sp) do {} while (0)
 #endif
 
 // ---------------- PTX helpers ----------------
@@ -1258,7 +1126,6 @@ __device__ __forceinline__ void fc1_pub_worker(const Params& P, unsigned epoch, 
             }
             __syncwarp();
         }
-        if (lane == 0) STRACE0(P, 35);
         __syncwarp();
         return;
     }
@@ -1292,7 +1159,6 @@ __device__ __forceinline__ void fc1_pub_worker(const Params& P, unsigned epoch, 
             } else
             publish_m32_chunk(P.h_flags, w >> 8, (w >> 4) & 1, w & 15, epoch);
         }
-        STRACE0(P, 35);   // FMOE_S_TRACE: warp 18's last FC1 publish done
     }
     __syncwarp();
 }
@@ -1385,7 +1251,7 @@ template <int PARTS> __device__ __forceinline__ int fc2_nparts_of_tile(int tile,
 // boxes, warp 18 lane 0 the offset boxes; each arrives on the stage's full barrier with its own byte count (count 3).
 template <int EXACT_M, int PARTS>
 __host__ __device__ constexpr bool fc2_split_producer() {
-    return EXACT_M == 32 && PARTS == 2 && FMOE_FC2_SPLIT_PRODUCER && FMOE_BATCH_FENCE && !FMOE_MIXED_WIDTH;
+    return EXACT_M == 32 && PARTS == 2 && FMOE_FC2_SPLIT_PRODUCER && FMOE_BATCH_FENCE;
 }
 
 // Lockstep FC2 consumer (exact M32, needs the split producer and the scale ring): see fc2_consumer.
@@ -1968,32 +1834,6 @@ __device__ __forceinline__ void dequant_slices4(const uint8_t* frag, const uint8
     }
 }
 
-#ifdef FMOE_DIAG
-// diagnostics: the dequant ALU with the fragment words taken from registers (offset loads kept, no fragment loads)
-template <int FSTRIDE, int SSTRIDE>
-__device__ __forceinline__ void dequant_slices4_noload(const uint8_t* scl, int tid128, uint32_t A[4][4]) {
-#pragma unroll
-    for (int s = 0; s < 4; ++s) {
-        const uint32_t o2 = *reinterpret_cast<const uint16_t*>(scl + s * SSTRIDE);
-        uint32_t lo_a, hi_a, lo_b, hi_b;
-        make_pools(o2 & 0xFFu, lo_a, hi_a);
-        make_pools(o2 >> 8, lo_b, hi_b);
-        const uint2 q = make_uint2(0x12345678u ^ (tid128 * 0x9E3779B1u) ^ (s * 0x01010101u), 0x9ABCDEF0u ^ (tid128 * 0x85EBCA6Bu));
-        dequant_word(q.x, lo_a, hi_a, A[s][0], A[s][2]);
-        dequant_word(q.y, lo_b, hi_b, A[s][1], A[s][3]);
-    }
-}
-// diagnostics: only the loads of the dequant (no LUT ALU)
-template <int FSTRIDE, int SSTRIDE>
-__device__ __forceinline__ void dequant_slices4_loadonly(const uint8_t* frag, const uint8_t* scl, uint32_t A[4][4]) {
-#pragma unroll
-    for (int s = 0; s < 4; ++s) {
-        const uint32_t o2 = *reinterpret_cast<const uint16_t*>(scl + s * SSTRIDE);
-        const uint2 q = *reinterpret_cast<const uint2*>(frag + s * FSTRIDE);
-        A[s][0] = q.x; A[s][1] = q.y; A[s][2] = q.x ^ o2; A[s][3] = q.y ^ o2;
-    }
-}
-#endif
 
 // Token list of union slot u from its routed-token mask (bit t set <=> token t routed to slot u),
 // ascending; pads to 64 with 0. inv[t] = position of token t (or -1).
@@ -2117,25 +1957,10 @@ __device__ __forceinline__ void stage1_token(const Params& P, unsigned epoch, in
 
 // ======================= FMOE_INPUT_TP: input all-reduce inside the prologue =======================
 // Token CTA smem during the TP prologue (the ring region is idle; the stage-3 scratch at OFF_PS is written only after stage 1):
-#ifndef FMOE_RT_AB
-#define FMOE_RT_AB 0                     // diag (comm slice): 1 = Params.ab = mode >> 16 (the host masks P.mode to 16 bits) selects runtime-only knobs, so
-#endif                                   //    A/B variants share ONE binary (no SASS re-draw): ab bits 0-1 = TP-tail reducer poll backoff 64/128/256 ns,
-                                         //    bits 2-3 = row-stage poll backoff 64/128/256 ns. 0 = no field, no code.
 #ifndef FMOE_TAIL_POLL_NS
 #define FMOE_TAIL_POLL_NS 0              // > 0 (comm slice, goal11): the TP-tail reducers back off N ns between poll rounds (both 8-source halves). During the
 #endif                                   //    tail ~96 reducer CTAs x 1024 in-flight 16-B loads + 32 row CTAs x 1536 hammer the L2 lines the NVLink ingress is
                                          //    writing while the last FC2 CTAs still stream their weights through L2. 0 = no code (production SASS unchanged).
-#ifndef FMOE_TAIL_WARM
-#define FMOE_TAIL_WARM 0                 // 1 (comm slice, goal11): the TP-tail reducer runs its post-poll code (decode, 16-source sum, bf16 pack, shuffles,
-#endif                                   //    all-gather stores) once DRY right after its own push -- no loads, zeros, the 8 stores go to its OWN rank's slot
-                                         //    with tag 0 (overwritten by the real store of the same thread; never accepted) -- so the real pass after the
-                                         //    poll runs from a warm instruction cache. Stamps: all-sources-seen -> AG stores issued took 1.48 us on the
-                                         //    critical tile's last reducer for ~60 instructions (cold i-fetch at the end of the kernel). Same PCs (a
-                                         //    2-trip runtime loop), same values and order in the real pass -> bitwise. 0 = original code (#if).
-#ifndef FMOE_TAIL_HS_T
-#define FMOE_TAIL_HS_T 1                 // 1 (comm slice, goal11): the partner half's decoded sources live TRANSPOSED in smem ([8 sources][64 (tok, j)][float4]
-#endif                                   //    instead of [64][8][float4]): the [64][8] layout puts the 32 lanes of every LDS.128 / STS.128 128 B apart = one
-                                         //    bank group (32-way conflicts, 8 + 8 instructions on the reducer's critical path). Same values, same order -> bitwise.
 #ifndef FMOE_TAIL_POLL16
 #define FMOE_TAIL_POLL16 1               // 1 = the output reduce-scatter owner polls its 16 sources in ONE round trip (a second thread polls
 #endif                                   //    sources 8..15 and parks the decoded values in smem; the owner adds them in the original order -> bitwise identical)
@@ -2157,21 +1982,10 @@ __device__ __forceinline__ size_t tp_ag_idx(int k, int t, int m) {
     if constexpr (FMOE_TP_OWNER_REDUCE) return ((size_t)(t * TP_NDEV + k) * TP_AG_ROW + m);
     else return ((size_t)(k * TP_M + t) * TP_AG_ROW + m);
 }
-#ifndef FMOE_TP_RS_PUSH_NOTOK
-#define FMOE_TP_RS_PUSH_NOTOK 0          // 1 (comm slice re-try of the goal10 arch knob, push mapping only): the 32 token CTAs -- whose next loads are the
-#endif                                   //    critical reduce-scatter polls -- issue no entry pushes; CTAs 32..131 push rows (b - 32) + 100 g (g = 0..2) from
-                                         //    warps 4..15 (224 rows). X-Stage calibration: an SM's global loads wait for its own remote bytes to drain at R/K
-                                         //    (4 KB/SM at K = 132: +0.3 us on the next poll). 0 = original mapping (#if, SASS unchanged).
 __device__ __forceinline__ void tp_rs_push(const Params& P, unsigned epoch, int grid) {
-#if FMOE_TP_RS_PUSH_NOTOK
-    const int tid = (int)threadIdx.x - TP_RS_ROW;   // warps 4..15
-    if ((int)blockIdx.x < TP_M || tid < 0 || tid >= 3 * TP_RS_ROW) return;
-    const int row = ((int)blockIdx.x - TP_M) + (grid - TP_M) * (tid / TP_RS_ROW), m = tid % TP_RS_ROW;
-#else
     const int tid = (int)threadIdx.x - 2 * TP_RS_ROW;   // warps 8..15: the mbarrier-init threads (warps 0..1) are not held up by the partial loads
     if (tid < 0 || tid >= 2 * TP_RS_ROW) return;
     const int row = (int)blockIdx.x + grid * (tid / TP_RS_ROW), m = tid % TP_RS_ROW;
-#endif
     constexpr int NROWS = (TP_NDEV - 1) * TP_M;          // 224 rows of 128 messages: (dst, token) slices, or (token, slice) of the 28 non-owned tokens
     if (row >= NROWS) return;
     int dst, t, k;
@@ -2202,14 +2016,8 @@ static_assert(OFF_TP_ACC + TP_RS_ROW * 6 * 4 <= OFF_P1 && OFF_TP_ACC % 16 == 0, 
 __device__ __forceinline__ uint4* tp_peer_buf(const Params& P, int d, unsigned dep) {   // dep == 0 at runtime, derived from a polled message: the
     return P.pro_bufs[d + (int)dep];                                                     // pointer load cannot be hoisted above the polls by ptxas
 }
-// EARLY (goal11 layer, layer_fused.cu): run by threads LAYER_EARLY_T0.. (warps 12..19) of the layer kernel while warps 0..10 finish the
-// attention block: all 8 sources come as messages (the attention phase pushes the own rank's rows into IN_RS too), the CTA's end-of-attention
-// cluster sync is waited for before the first shared-memory write, a named barrier of the 256 threads replaces __syncthreads, and the peer
-// pointers come from the params (the smem table is written by the MoE entry, later).
-constexpr int LAYER_EARLY_T0 = 384, LAYER_RED_BAR = 10;
-template <bool EARLY = false>
-__device__ __forceinline__ void tp_reduce_token(const Params& P, unsigned epoch, int t, int k, uint8_t* smem, bool dry = false) {   // this CTA reduces (token t, slice k)
-    const int tid = (int)threadIdx.x - (EARLY ? LAYER_EARLY_T0 : 0), r = P.my_rank, warp = tid >> 5, lane = tid & 31;
+__device__ __forceinline__ void tp_reduce_token(const Params& P, unsigned epoch, int t, int k, uint8_t* smem) {   // this CTA reduces (token t, slice k)
+    const int tid = (int)threadIdx.x, r = P.my_rank, warp = tid >> 5, lane = tid & 31;
     uint32_t* s_slice = reinterpret_cast<uint32_t*>(smem + OFF_TP_SLICE);   // [384] words = 768 bf16
     float* s_ss = reinterpret_cast<float*>(smem + OFF_P1);                    // [48] sixteen-element partials of this slice
     float* s_acc = reinterpret_cast<float*>(smem + OFF_TP_ACC);              // [128][6]
@@ -2226,35 +2034,13 @@ __device__ __forceinline__ void tp_reduce_token(const Params& P, unsigned epoch,
         const uint4* rp = reinterpret_cast<const uint4*>(P.residual + (size_t)t * DIM + k * TP_KS + 16 * (12 * gl + lane));
         rr0 = rp[0]; rr1 = rp[1];
     }
-    if (tid == 0) LCLK(P, 14);   // FMOE_L_DIAG: tp_reduce_token entered
-#if FMOE_PDL_ENTRY == 2
-    // FMOE_PDL_ENTRY 2: the ONLY read of the attention kernel's output in the MoE is this own-rank partial (its messages are epoch-tagged;
-    // everything else the prologue reads was written before the attention kernel's own griddepcontrol.wait) -> wait here, token CTAs only
-    if constexpr (!EARLY) asm volatile("griddepcontrol.wait;" ::: "memory");
-#endif
-    if constexpr (EARLY) {   // tid < 256 always
-        unsigned pending = 0xfu;
-        do {
-#pragma unroll
-            for (int j = 0; j < 4; ++j)
-                if (pending & (1u << j)) pm[j] = ld_ll(rs_me + tp_rs_idx(4 * g + j, t, k, m));
-#pragma unroll
-            for (int j = 0; j < 4; ++j)
-                if ((pending & (1u << j)) && pm[j].w == epoch) pending &= ~(1u << j);
-        } while (pending);
-        if (tid == 0) LCLK(P, 19);   // FMOE_L_DIAG: this thread's 4 message polls satisfied
-        asm volatile("barrier.cluster.wait.aligned;" ::: "memory");   // the attention phase of both CTAs is over: its smem is free
-        if (tid == 0) LCLK(P, 15);   // FMOE_L_DIAG (EARLY): attention phase over
-    } else
     if (tid < 2 * TP_RS_ROW) {
         const uint32_t* own = reinterpret_cast<const uint32_t*>(P.partial + (size_t)t * DIM + k * TP_KS) + 3 * m;
         const uint32_t o0 = own[0], o1 = own[1], o2 = own[2];
         unsigned pending = 0xfu;
         if ((r >> 2) == g) pending &= ~(1u << (r & 3));                       // my own contribution comes from the partial, not from a message
-        if (dry) pending = 0u;                                                  // FMOE_TP_RED_WARM pass 0: no polls
 #pragma unroll
         for (int j = 0; j < 4; ++j) pm[j] = make_uint4(o0, o1, o2, epoch);
-        if (tid == 0) LCLKV(P, 15, o0 ^ epoch);   // FMOE_L_DIAG: own partial + epoch arrived
         do {
 #pragma unroll
             for (int j = 0; j < 4; ++j)
@@ -2263,7 +2049,6 @@ __device__ __forceinline__ void tp_reduce_token(const Params& P, unsigned epoch,
             for (int j = 0; j < 4; ++j)
                 if ((pending & (1u << j)) && pm[j].w == epoch) pending &= ~(1u << j);
         } while (pending);
-        if (tid == 0) LCLK(P, 19);   // FMOE_L_DIAG: this thread's 4 message polls satisfied
     }
     if (tid < TP_RS_ROW) {   // ranks 0..3, in order
         float acc[6];
@@ -2280,9 +2065,8 @@ __device__ __forceinline__ void tp_reduce_token(const Params& P, unsigned epoch,
 #pragma unroll
         for (int q = 0; q < 6; ++q) s_acc[m * 6 + q] = acc[q];
     }
-    if constexpr (EARLY) named_bar_sync(LAYER_RED_BAR, 2 * TP_RS_ROW); else __syncthreads();
+    __syncthreads();
     if (tid == 0) STAMP(P, 16);   // TP: reduce-scatter messages of this token landed (all 7 peers)
-    if (tid == 0) LCLK(P, 21);   // FMOE_L_DIAG: clock twin of stamp 16
     (void)s_slice;
     if (gl >= 0 && gl < 4) {   // warps 4..7 (tid 128..255): += ranks 4..7 in order, one bf16 RN, then everything that depends on the reduced slice
         constexpr int TPB = 6;   // named barrier of the four reducing warps (ids 0..5 are taken by the FC1/FC2 roles)
@@ -2301,9 +2085,9 @@ __device__ __forceinline__ void tp_reduce_token(const Params& P, unsigned epoch,
         // all-gather payload is router-critical), (2) the p message to every rank, (3) the row to the other 6 peers (their stage 1, off
         // the critical path). Design A: the local routers need every token's row -> local copy first.
         uint4* const* s_peer_tab = reinterpret_cast<uint4* const*>(smem + OFF_TAB + TABX_PEER);   // the 8 prologue buffers, cached in smem at kernel entry
-        auto s_peer_at = [&](int d) -> uint4* { if constexpr (EARLY) return tp_pro<true>(P, d); else return s_peer_tab[d]; };
+        auto s_peer_at = [&](int d) -> uint4* { return s_peer_tab[d]; };
         const int own = FMOE_TP_ROUTER_TOKENS ? (t % TP_NDEV) : r;   // owner-reduce: == r (the local routers read this copy)
-        if (!dry) st_ll(s_peer_at(own) + PRO_XAG + tp_ag_idx(k, t, m), msg);
+        st_ll(s_peer_at(own) + PRO_XAG + tp_ag_idx(k, t, m), msg);
         // sum of squares of group g = 12 gl + lane (lane < 12): its 16 elements are elements 16 lane .. +15 of this warp's run, i.e. offset
         // o = 16 lane - 6 s0 (0, 2 or 4) into the 24 elements held by lanes s0 .. s0 + 3, s0 = 16 lane / 6
         const int s0 = (16 * lane) / 6, o = 16 * lane - 6 * s0;
@@ -2344,7 +2128,7 @@ __device__ __forceinline__ void tp_reduce_token(const Params& P, unsigned epoch,
                 }
                 const float p0 = __shfl_sync(0xffffffffu, pj, 0), p1 = __shfl_sync(0xffffffffu, pj, 1);
                 const uint4 pmsg = make_uint4(__float_as_uint(p0), epoch, __float_as_uint(p1), epoch);
-                if (lane < TP_NDEV && !dry) st_ll(s_peer_at(lane) + PRO_XAG + tp_ag_idx(k, t, TP_PMSG), pmsg);
+                if (lane < TP_NDEV) st_ll(s_peer_at(lane) + PRO_XAG + tp_ag_idx(k, t, TP_PMSG), pmsg);
                 if (lane == 0) STAMP(P, 17);   // TP: p message of this token issued
             }
         } else
@@ -2358,15 +2142,15 @@ __device__ __forceinline__ void tp_reduce_token(const Params& P, unsigned epoch,
 #pragma unroll
             for (int j = 0; j < SLICE_VT; ++j) p1 += pv[SLICE_VT + j];
             const uint4 pmsg = make_uint4(__float_as_uint(p0), epoch, __float_as_uint(p1), epoch);
-            if (!dry) st_ll(s_peer_at(own) + PRO_XAG + tp_ag_idx(k, t, TP_PMSG), pmsg);   // the local routers' rstd input first
+            st_ll(s_peer_at(own) + PRO_XAG + tp_ag_idx(k, t, TP_PMSG), pmsg);   // the local routers' rstd input first
 #pragma unroll
-            for (int d = 0; d < TP_NDEV; ++d) if (d != own && !dry) st_ll(s_peer_at(d) + PRO_XAG + tp_ag_idx(k, t, TP_PMSG), pmsg);
+            for (int d = 0; d < TP_NDEV; ++d) if (d != own) st_ll(s_peer_at(d) + PRO_XAG + tp_ag_idx(k, t, TP_PMSG), pmsg);
             STAMP(P, 17);   // TP: p message of this token issued
         }
         named_bar_sync(TPB, 128);
 #pragma unroll
         for (int d = 0; d < TP_NDEV; ++d) {   // all-gather of the reduced slice to the remaining ranks (32 lanes = 32 consecutive messages per destination)
-            if (d != own && !dry) st_ll(s_peer_at(d) + PRO_XAG + tp_ag_idx(k, t, m), msg);
+            if (d != own) st_ll(s_peer_at(d) + PRO_XAG + tp_ag_idx(k, t, m), msg);
         }
     }
 }
@@ -2542,7 +2326,7 @@ __device__ __forceinline__ void norm_next_row(const Params& P, unsigned epoch, u
     uint32_t* s_row = reinterpret_cast<uint32_t*>(smem + OFF_NN_ROW);
     const float* s_v = reinterpret_cast<const float*>(smem + OFF_NN_V);
     float* s_w2 = reinterpret_cast<float*>(smem + OFF_NN_W2);
-    if (tid == 0) LSTAMP(P, 16);   // row stage: entered
+    if (tid == 0) STAMP(P, 16);   // row stage: entered
     // The PDL trigger counts CTAs that called launch_dependents or exited; a row CTA no longer exits after FC1, so it triggers here (the
     // FC2 CTAs trigger after their FC2 compute as before) -- otherwise a PDL-launched successor (deep_gemm with set_pdl) would only be
     // scheduled at grid end.
@@ -2603,16 +2387,13 @@ __device__ __forceinline__ void norm_next_row(const Params& P, unsigned epoch, u
                 tiles_todo &= ~done;
             }
             if constexpr (FMOE_NN_POLL_NS > 0) { if (tiles_todo) __nanosleep(FMOE_NN_POLL_NS); }
-#if FMOE_RT_AB
-            if (tiles_todo && ((P.ab >> 2) & 3)) __nanosleep(32u << ((P.ab >> 2) & 3));
-#endif
         } while (tiles_todo);
     }
 #if FMOE_NN_WARM
     }
 #endif
     named_bar_sync(NN_BAR, NCONS);   // every tile's v in smem, residual_new / out stored
-    if (tid == 0) LSTAMP(P, 17);   // row stage: all 1056 messages landed, v computed
+    if (tid == 0) STAMP(P, 17);   // row stage: all 1056 messages landed, v computed
     // flashinfer's 64 virtual threads -- thread t' sums v^2 over columns 512 v + 8 t' + e (v 0..11, e 0..7) as ONE fma chain (vector.reduction<add>
     // with acc = 0, ordered), then the warp butterfly (xor 1, 2, 4, 8, 16) and the two warp sums are added (w0 + w1)
     if (tid < 64) {
@@ -2629,7 +2410,7 @@ __device__ __forceinline__ void norm_next_row(const Params& P, unsigned epoch, u
         if (lane == 0) s_w2[warp] = acc;
     }
     named_bar_sync(NN_BAR, NCONS);
-    if (tid == 0) LSTAMP(P, 18);   // row stage: sum of squares done
+    if (tid == 0) STAMP(P, 18);   // row stage: sum of squares done
     nn_step_b(P, smem, t, __fadd_rn(s_w2[0], s_w2[1]), w0, w1);
     if (tid == 0) STAMP(P, 5);   // row stage done (the legacy pull's stamp)
 #if FMOE_NN_WARM
@@ -2869,7 +2650,7 @@ __device__ __forceinline__ void issue_slice_loads_tp4(const Params& P, uint8_t* 
         cp_async_16(smem + OFF_PNW + threadIdx.x * 16, reinterpret_cast<const uint8_t*>(P.norm_w + kg * RKS) + threadIdx.x * 16, 16u);
     cp_async_commit();
 }
-__device__ __forceinline__ void router_gather_tp4(const Params& P, unsigned epoch, uint8_t* smem, int kg, bool dry = false) {
+__device__ __forceinline__ void router_gather_tp4(const Params& P, unsigned epoch, uint8_t* smem, int kg) {
     const int tid = threadIdx.x, r = P.my_rank;
     const uint4* xag_me = tp_pro<true>(P, r) + PRO_XAG;
     uint8_t* H = smem + OFF_PH;
@@ -2881,7 +2662,7 @@ __device__ __forceinline__ void router_gather_tp4(const Params& P, unsigned epoc
     if (tid < NH) {   // one slice message per thread -> three 4-B words into the swizzled B tile (token row lt)
         const int lt = tid / MPK, i = tid - lt * MPK, t = r + TP_NDEV * lt;
         uint4 v;
-        do { v = ld_ll(xag_me + tp_ag_idx(src, t, half * MPK + i)); } while (!dry && v.w != epoch);
+        do { v = ld_ll(xag_me + tp_ag_idx(src, t, half * MPK + i)); } while (v.w != epoch);
         const uint32_t w[3] = {v.x, v.y, v.z};
 #pragma unroll
         for (int j = 0; j < 3; ++j) {
@@ -2891,7 +2672,7 @@ __device__ __forceinline__ void router_gather_tp4(const Params& P, unsigned epoc
     } else if (tid < NH + TP_NDEV * TP_TOK_PER_RANK) {   // p messages of the 4 tokens from the 8 slices (both 8-B halves tagged)
         const int j = tid - NH, s = j / TP_TOK_PER_RANK, lt = j - s * TP_TOK_PER_RANK, t = r + TP_NDEV * lt;
         uint4 v;
-        do { v = ld_ll(xag_me + tp_ag_idx(s, t, TP_PMSG)); } while (!dry && (v.y != epoch || v.w != epoch));
+        do { v = ld_ll(xag_me + tp_ag_idx(s, t, TP_PMSG)); } while (v.y != epoch || v.w != epoch);
         sp[lt * RKG + 2 * s] = __uint_as_float(v.x); sp[lt * RKG + 2 * s + 1] = __uint_as_float(v.z);
     }
     __syncthreads();
@@ -3027,90 +2808,12 @@ __device__ __forceinline__ void router_gather_rs_tp4(const Params& P, unsigned e
     }
     __syncthreads();
 }
-#if FMOE_TP_LIN == 2
-// FMOE_TP_LIN == 2 (LIN-RS): design-B router unit (kg, rg) takes its B tile STRAIGHT from the reduce-scatter messages of its k-group for the
-// 4 owned tokens: the 8 sources are summed in fp32 (rank order, NO bf16 rounding), + residual, x norm weight, and the fp32 product is
-// split into two bf16 planes hi = bf16(x), lo = bf16(x - hi) (|error| <= 2^-16 |x|); no rstd here -- the owner scales the summed logits
-// by rstd (stage 3). Removes the token-CTA reduce -> p / slice -> router local hop from the routing chain. Not bitwise vs the bf16 MoEGate.
-constexpr int OFF_LIN_L = OFF_PH + 8192;   // lo plane, same [6][8 rows][128 B] layout as the hi plane at OFF_PH
-__device__ __forceinline__ void lin_rs_gather(const Params& P, unsigned epoch, uint8_t* smem, int kg) {
-    const int tid = threadIdx.x, r = P.my_rank;
-    constexpr int NT8 = 8, MPK = RKS / 6;   // 64 messages per (token, k-group)
-    const int k = kg >> 1, half = kg & 1;
-    uint8_t* H = smem + OFF_PH;
-    uint8_t* L = smem + OFF_LIN_L;
-    const uint8_t* R = smem + OFF_PR;
-    const uint8_t* NW = smem + OFF_PNW;
-    float* s_acc = reinterpret_cast<float*>(smem + OFF_P1);   // [256 pairs][6] partial sums of ranks 0..3
-    const uint4* rs_me = tp_pro<true>(P, r) + PRO_IN_RS;
-    const int pidx = tid & 255, lt = pidx / MPK, i = pidx - lt * MPK, m = half * MPK + i, g = (tid >> 8) & 1;
-    const int t = r + TP_NDEV * lt;
-    uint4 pm[4];
-    if (tid < 2 * 256) {
-        const uint32_t* own = reinterpret_cast<const uint32_t*>(P.partial + (size_t)t * DIM + k * TP_KS) + 3 * m;
-        const uint32_t o0 = own[0], o1 = own[1], o2 = own[2];
-        unsigned pending = 0xfu;
-        if ((r >> 2) == g) pending &= ~(1u << (r & 3));
-#pragma unroll
-        for (int j = 0; j < 4; ++j) pm[j] = make_uint4(o0, o1, o2, epoch);
-        do {
-#pragma unroll
-            for (int j = 0; j < 4; ++j)
-                if (pending & (1u << j)) pm[j] = ld_ll(rs_me + tp_rs_idx(4 * g + j, t, k, m));
-#pragma unroll
-            for (int j = 0; j < 4; ++j)
-                if ((pending & (1u << j)) && pm[j].w == epoch) pending &= ~(1u << j);
-        } while (pending);
-    }
-    if (tid < 256) {   // ranks 0..3, in order (fp32)
-        float acc[6];
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const uint32_t w[3] = {pm[j].x, pm[j].y, pm[j].z};
-#pragma unroll
-            for (int q = 0; q < 3; ++q) {
-                const float x = bf16lo(w[q]), y = bf16hi(w[q]);
-                if (j == 0) { acc[2 * q] = x; acc[2 * q + 1] = y; }
-                else { acc[2 * q] = __fadd_rn(acc[2 * q], x); acc[2 * q + 1] = __fadd_rn(acc[2 * q + 1], y); }
-            }
-        }
-#pragma unroll
-        for (int q = 0; q < 6; ++q) s_acc[pidx * 6 + q] = acc[q];
-        cp_async_wait_all();   // threads 0..191 issued the residual / norm-w slices at kernel start
-    }
-    __syncthreads();
-    if (tid == 0) STAMP(P, 16);   // TP diag (router CTA): reduce-scatter messages of its k-group landed
-    if (tid >= 256 && tid < 512) {   // += ranks 4..7 in order (fp32), + residual, x w, two exact-ish bf16 planes
-        float acc[6];
-#pragma unroll
-        for (int q = 0; q < 6; ++q) acc[q] = s_acc[pidx * 6 + q];
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const uint32_t w[3] = {pm[j].x, pm[j].y, pm[j].z};
-#pragma unroll
-            for (int q = 0; q < 3; ++q) { acc[2 * q] = __fadd_rn(acc[2 * q], bf16lo(w[q])); acc[2 * q + 1] = __fadd_rn(acc[2 * q + 1], bf16hi(w[q])); }
-        }
-#pragma unroll
-        for (int j = 0; j < 3; ++j) {
-            const int kk = 6 * i + 2 * j, c = kk >> 6, kb = (kk & 63) * 2, q = kb >> 4;
-            const int off = c * (NT8 * 128) + lt * 128 + ((q ^ lt) << 4) + (kb & 15);
-            const uint32_t rw = *reinterpret_cast<const uint32_t*>(R + off), ww = *reinterpret_cast<const uint32_t*>(NW + kk * 2);
-            const float x0 = __fmul_rn(__fadd_rn(acc[2 * j], bf16lo(rw)), bf16lo(ww)), x1 = __fmul_rn(__fadd_rn(acc[2 * j + 1], bf16hi(rw)), bf16hi(ww));
-            const uint32_t h = pack_bf16x2_rn(x0, x1);
-            *reinterpret_cast<uint32_t*>(H + off) = h;
-            *reinterpret_cast<uint32_t*>(L + off) = pack_bf16x2_rn(__fsub_rn(x0, bf16lo(h)), __fsub_rn(x1, bf16hi(h)));
-        }
-    }
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");   // generic-proxy plane stores -> wgmma (async proxy) reads
-    __syncthreads();
-}
-#endif
 // Tensor-core router GEMM for one unit: logits[64 rows][NT tokens] over this unit's 384 k, fp32 accumulate.
 // WG w handles k16 steps [6w, 6w+6); per step the fp32 weight fragment is split into 3 exact bf16 planes
 // (hi, mid, lo) and 3 wgmmas accumulate into the same fp32 D. The 4 WG partials are summed in a fixed
 // order and published as LL messages (unit, token, 22 x 3 rows).
-template <int NT, int EXACT_M = 0, bool TP = false, bool BLO = false>   // BLO (FMOE_TP_LIN == 2): + the lo B plane at OFF_PH + 8192
-__device__ __forceinline__ void router_compute(const Params& P, unsigned epoch, uint8_t* smem, int unit, int M, bool dry = false) {
+template <int NT, int EXACT_M = 0, bool TP = false>
+__device__ __forceinline__ void router_compute(const Params& P, unsigned epoch, uint8_t* smem, int unit, int M) {
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     constexpr int NR = NT / 2;
     constexpr int PSTR = NT + 8;   // padded row stride: the fragment stores become 2-way instead of 8-way bank conflicted
@@ -3162,7 +2865,6 @@ __device__ __forceinline__ void router_compute(const Params& P, unsigned epoch, 
             wg::MmaRSBF16<NT>::fma(D, A[0], desc, first ? 0 : 1);
 #pragma unroll
             for (int p = 1; p < NPLANE; ++p) wg::MmaRSBF16<NT>::fma(D, A[p], desc, 1);
-            if constexpr (BLO) wg::MmaRSBF16<NT>::fma(D, A[0], wg::make_desc_sw128(pb + 8192 + (s >> 2) * (NT * 128) + (s & 3) * 32), 1);
         };
         const int s0 = wg * RSTEPS;
         // double-buffered A: the next step's loads/splits overlap the in-flight group (statically unrolled pairs)
@@ -3178,7 +2880,7 @@ __device__ __forceinline__ void router_compute(const Params& P, unsigned epoch, 
         if (tid == 0) STAMP(P, 15);   // router MMAs done
         const int row0 = wq * 16 + g;
 #pragma unroll
-        for (int j = 0; j < NT / 8; ++j) if (!dry) {   // FMOE_TP_RT_WARM pass 0: psum overlays the (in-flight) W tile
+        for (int j = 0; j < NT / 8; ++j) {
             *reinterpret_cast<float2*>(psum + (wg * RROWS + row0) * PSTR + 8 * j + 2 * tig) = make_float2(D[4 * j], D[4 * j + 1]);
             *reinterpret_cast<float2*>(psum + (wg * RROWS + row0 + 8) * PSTR + 8 * j + 2 * tig) = make_float2(D[4 * j + 2], D[4 * j + 3]);
         }
@@ -3208,7 +2910,7 @@ __device__ __forceinline__ void router_compute(const Params& P, unsigned epoch, 
         }
         if constexpr (TP)
             s_msg[((tok % TP_NDEV) * TP_TOK_PER_RANK + tok / TP_NDEV) * RMSG + m] = make_uint4(__float_as_uint(v[0]), __float_as_uint(v[1]), __float_as_uint(v[2]), epoch);
-        else if (!dry)
+        else
         st_ll(P.rpart + ((size_t)unit * MAXM + tok) * RMSG + m, make_uint4(__float_as_uint(v[0]), __float_as_uint(v[1]), __float_as_uint(v[2]), epoch));
     }
     if constexpr (TP) {
@@ -3221,166 +2923,6 @@ __device__ __forceinline__ void router_compute(const Params& P, unsigned epoch, 
     }
 }
 
-#if FMOE_TP_LIN == 1
-// FMOE_TP_LIN router unit (kg, rg), issued at kernel entry: the bf16 weight tile + raw rows {this rank's partial of tokens 0..31, residual
-// of the 4 owned tokens, norm-weight slice} of k-group kg. The weight tile (HBM) first.
-__device__ __forceinline__ void lin_issue_loads(const Params& P, uint8_t* smem, int kg, int rg) {
-    constexpr int CPR = RKS * 2 / 16;   // 48 x 16-B chunks per 384-element bf16 row
-    for (int i = threadIdx.x; i < (LIN_COLS + 1) * CPR; i += NTHREADS) {   // group 0: raw rows (L2-resident partial / residual / norm-w)
-        const int row = i / CPR, q = i - row * CPR;
-        const __nv_bfloat16* src = row < TP_M ? P.partial + (size_t)row * DIM
-                                 : (row < LIN_COLS ? P.residual + (size_t)(P.my_rank + TP_NDEV * (row - TP_M)) * DIM : P.norm_w);
-        cp_async_16(smem + OFF_LIN_RAW + row * (RKS * 2) + q * 16, reinterpret_cast<const uint8_t*>(src + kg * RKS) + q * 16, 16u);
-    }
-    cp_async_commit();
-    for (int c = threadIdx.x; c < RROWS * CPR; c += NTHREADS) {   // group 1: the weight tile (HBM); the B planes are built while it lands
-        const int row = c / CPR, q = c - row * CPR;
-        const int e = min(rg * RROWS + row, P.n_exp - 1);
-        cp_async_16(smem + OFF_PW + row * W_STRIDE + q * 16, reinterpret_cast<const uint8_t*>(P.router_wb + (size_t)e * DIM + kg * RKS) + q * 16, 16u);
-    }
-    cp_async_commit();
-}
-// The router's unit math, then the k-group reduction + push. Activation side exact: x = w * v (bf16 x bf16 -> an exact fp32 with a
-// 16-bit significand) = hi + lo with hi = bf16(x), lo = x - hi (exact in bf16), two wgmmas per k16 step into one fp32 accumulator.
-#ifndef FMOE_LIN_DIAG
-#define FMOE_LIN_DIAG 0
-#endif
-#ifndef FMOE_LIN_POLL_NS
-#define FMOE_LIN_POLL_NS 0                 // > 0: the LIN k-group reducers back off this long between poll rounds
-#endif
-#if FMOE_LIN_DIAG & 1
-__device__ __noinline__ void lin_router_unit(const Params& P, unsigned epoch, uint8_t* smem, int kg, int rg) {
-#else
-__device__ __forceinline__ void lin_router_unit(const Params& P, unsigned epoch, uint8_t* smem, int kg, int rg) {
-#endif
-    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, r = P.my_rank;
-    constexpr int NT = LIN_NT, NR = NT / 2, PSTR = NT + 8, CPR = RKS * 2 / 16;
-    constexpr int RSTEPS = RKS / 16 / RWG;   // 6 k16 steps per warpgroup
-    cp_async_wait_group1();   // raw rows landed (the weight tile may still be in flight)
-    __syncthreads();
-    if (tid == 0) STAMP(P, 14);   // LIN: raw rows landed
-    {
-        const uint8_t* raw = smem + OFF_LIN_RAW;
-        for (int i = tid; i < NT * CPR; i += NTHREADS) {
-            const int c = i / CPR, rr = i - c * CPR, cc = rr >> 3, q = rr & 7;
-            uint4 hi = make_uint4(0u, 0u, 0u, 0u), lo = hi;
-            if (c < LIN_COLS) {
-                const uint4 x = *reinterpret_cast<const uint4*>(raw + c * (RKS * 2) + rr * 16);
-                const uint4 w = *reinterpret_cast<const uint4*>(raw + LIN_COLS * (RKS * 2) + rr * 16);
-                const uint32_t xw[4] = {x.x, x.y, x.z, x.w}, ww[4] = {w.x, w.y, w.z, w.w};
-                uint32_t h[4], l[4];
-#pragma unroll
-                for (int k = 0; k < 4; ++k) {
-                    const float v0 = __fmul_rn(bf16lo(xw[k]), bf16lo(ww[k])), v1 = __fmul_rn(bf16hi(xw[k]), bf16hi(ww[k]));
-                    h[k] = pack_bf16x2_rn(v0, v1);
-                    l[k] = pack_bf16x2_rn(__fsub_rn(v0, bf16lo(h[k])), __fsub_rn(v1, bf16hi(h[k])));
-                }
-                hi = make_uint4(h[0], h[1], h[2], h[3]); lo = make_uint4(l[0], l[1], l[2], l[3]);
-            }
-            const int off = cc * (NT * 128) + c * 128 + ((q ^ (c & 7)) << 4);
-            *reinterpret_cast<uint4*>(smem + OFF_LIN_B0 + off) = hi;
-            *reinterpret_cast<uint4*>(smem + OFF_LIN_B1 + off) = lo;
-        }
-    }
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");   // generic-proxy plane stores -> wgmma (async proxy) reads
-    cp_async_wait_all();   // weight tile landed
-    __syncthreads();
-    if (tid == 0) STAMP(P, 12);   // LIN: B planes built + weight tile landed
-    float* psum = reinterpret_cast<float*>(smem + OFF_PS);   // [RWG][64][PSTR]
-    if (warp < RWG * 4) {
-        const int wg = warp >> 2, wq = warp & 3, g = lane >> 2, tig = lane & 3;
-        const uint32_t pb0 = smem_u32(smem + OFF_LIN_B0), pb1 = smem_u32(smem + OFF_LIN_B1);
-        const uint8_t* wrow = smem + OFF_PW + (wq * 16 + g) * W_STRIDE + tig * 4;
-        float D[NR];
-#pragma unroll
-        for (int i = 0; i < NR; ++i) D[i] = 0.f;
-        uint32_t A0[4], A1[4];
-        auto load = [&](int s, uint32_t (&A)[4]) {
-#pragma unroll
-            for (int i = 0; i < 4; ++i)   // a0: (g, k), a1: (g+8, k), a2: (g, k+8), a3: (g+8, k+8)
-                A[i] = *reinterpret_cast<const uint32_t*>(wrow + ((i & 1) ? 8 * W_STRIDE : 0) + s * 32 + ((i >> 1) ? 16 : 0));
-        };
-        auto issue = [&](const uint32_t (&A)[4], int s, int first) {
-            const uint32_t boff = (uint32_t)((s >> 2) * (NT * 128) + (s & 3) * 32);
-            wg::MmaRSBF16<NT>::fma(D, A, wg::make_desc_sw128(pb0 + boff), first ? 0 : 1);
-            wg::MmaRSBF16<NT>::fma(D, A, wg::make_desc_sw128(pb1 + boff), 1);
-        };
-        const int s0 = wg * RSTEPS;
-        static_assert(RSTEPS % 2 == 0, "step pairs");
-        load(s0, A0); wg::fence(); issue(A0, s0, 1); wg::commit();
-#pragma unroll
-        for (int j = 1; j < RSTEPS; j += 2) {
-            load(s0 + j, A1); wg::fence(); issue(A1, s0 + j, 0); wg::commit(); wg::wait<1>();
-            if (j + 1 < RSTEPS) { load(s0 + j + 1, A0); wg::fence(); issue(A0, s0 + j + 1, 0); wg::commit(); wg::wait<1>(); }
-        }
-        wg::wait<0>();
-        named_bar_sync(1, RWG * 128);   // every router WG done: the W tile is dead, psum overlays it
-        if (tid == 0) STAMP(P, 15);   // LIN: router MMAs done
-        const int row0 = wq * 16 + g;
-#pragma unroll
-        for (int j = 0; j < NT / 8; ++j) {
-            *reinterpret_cast<float2*>(psum + (wg * RROWS + row0) * PSTR + 8 * j + 2 * tig) = make_float2(D[4 * j], D[4 * j + 1]);
-            *reinterpret_cast<float2*>(psum + (wg * RROWS + row0 + 8) * PSTR + 8 * j + 2 * tig) = make_float2(D[4 * j + 2], D[4 * j + 3]);
-        }
-    }
-    __syncthreads();
-    // this unit's partials of the 36 live columns -> the LOCAL fp32 table LZF[unit][c][64] (4 warpgroups summed in a fixed order), then
-    // ONE release flag per unit (an LL-tagged table polled by ~100K threads took 5.4 us to be seen: one flag per unit instead)
-    uint4* const* s_peer = reinterpret_cast<uint4* const*>(smem + OFF_TAB + TABX_PEER);
-    float* lzf = reinterpret_cast<float*>(s_peer[r] + PRO_LZ);
-    unsigned* lzflag = reinterpret_cast<unsigned*>(lzf + LIN_LZF_FLOATS);
-    const int unit = kg + RKG * rg;
-    float* stg = reinterpret_cast<float*>(smem + OFF_LIN_RED);   // [36][65] staging: transposed so the global stores are whole lines
-    for (int i = tid; i < LIN_COLS * RROWS; i += NTHREADS) {
-        const int c = i % LIN_COLS, row = i / LIN_COLS;   // column fastest: conflict-free psum reads and staging writes
-        const float* p = psum + row * PSTR + c;
-        float acc = p[0];
-#pragma unroll
-        for (int w = 1; w < RWG; ++w) acc += p[w * RROWS * PSTR];
-        stg[c * (RROWS + 1) + row] = acc;
-    }
-    __syncthreads();
-    for (int i = tid; i < LIN_COLS * RROWS; i += NTHREADS) {   // row fastest: a warp stores 128 contiguous bytes (scattered 4-B stores
-        const int c = i / RROWS, row = i - c * RROWS;           // to 32 lines took ~4 us to drain for 96 CTAs)
-        __stcg(lzf + ((size_t)unit * LIN_COLS + c) * RROWS + row, stg[c * (RROWS + 1) + row]);
-    }
-    __syncthreads();
-    if (tid == 0) st_release_gpu(lzflag + unit, epoch);
-    if (tid == 0) STAMP(P, 20);   // LIN diag (router CTAs; slot 20 is owner-only otherwise): unit partials published (local)
-    // k-group reduction of row group rg for columns kg, kg + 16 (and kg + 32 when < 36): the 16 units' flags, then 16 x 64 floats per
-    // column summed in k-group order, then one 22-message push per column to the token's owner (residual columns: this rank's own tokens)
-    const int ncol = kg + 2 * RKG < LIN_COLS ? 3 : 2;
-    float* red = reinterpret_cast<float*>(smem + OFF_LIN_RED);   // [3][64] k-group sums
-    if (FMOE_LIN_DIAG & 4) return;
-    if (tid < RKG) {
-        const unsigned* f = lzflag + tid + RKG * rg;
-        while (ld_acquire_gpu(f) != epoch) { if constexpr (FMOE_LIN_POLL_NS > 0) __nanosleep(FMOE_LIN_POLL_NS); }
-    }
-    __syncthreads();
-    if (tid < ncol * RROWS) {
-        const int j = tid / RROWS, row = tid - j * RROWS, c = kg + RKG * j;
-        float pv[RKG];
-#pragma unroll
-        for (int kq = 0; kq < RKG; ++kq) pv[kq] = __ldcg(lzf + ((size_t)(kq + RKG * rg) * LIN_COLS + c) * RROWS + row);
-        float acc = pv[0];
-#pragma unroll
-        for (int kq = 1; kq < RKG; ++kq) acc += pv[kq];
-        red[j * RROWS + row] = acc;
-    }
-    __syncthreads();
-    if (tid == 0) STAMP(P, 21);   // LIN diag: the 16 units' partials of this CTA's columns gathered and summed
-    if (tid < ncol * RMSG) {
-        const int j = tid / RMSG, m = tid - j * RMSG, c = kg + RKG * j;
-        float v[3];
-#pragma unroll
-        for (int q = 0; q < 3; ++q) v[q] = 3 * m + q < RROWS ? red[j * RROWS + 3 * m + q] : 0.f;
-        const int d = c < TP_M ? c % TP_NDEV : r, lt = c < TP_M ? c / TP_NDEV : c - TP_M, src = c < TP_M ? r : TP_NDEV;
-        st_ll(s_peer[d] + PRO_LZIN + ((size_t)(lt * LIN_NSRC + src) * NRG_MAX + rg) * RMSG + m,
-              make_uint4(__float_as_uint(v[0]), __float_as_uint(v[1]), __float_as_uint(v[2]), epoch));
-    }
-    if (tid == 0) STAMP(P, 19);   // LIN: k-group sums pushed to the token owners
-}
-#endif
 
 // ======================= prologue stage 3: k-group reduction + sigmoid/bias + top-8 of token t =======================
 // The correction bias (n_exp fp32, an HBM miss on every launch) used to be loaded per thread right after the partial gather,
@@ -3392,7 +2934,7 @@ __device__ __forceinline__ void stage3_prefetch_bias(const Params& P, uint8_t* s
     for (int i = threadIdx.x; i < NEXP; i += NTHREADS) s_bias[i] = i < P.n_exp ? __ldg(P.bias + i) : 0.f;
 }
 template <bool COMPACT_TOPK = false, bool TP = false, bool DRY = false>
-__device__ __forceinline__ void stage3_token(const Params& P, unsigned epoch, uint8_t* smem, int t, int n_rg, bool dry = false) {
+__device__ __forceinline__ void stage3_token(const Params& P, unsigned epoch, uint8_t* smem, int t, int n_rg) {
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     float* s_part = reinterpret_cast<float*>(smem + OFF_PS);      // [unit = rg*16 + kg][64]
     float* s_score = s_part + RUNITS_MAX * RROWS;                 // [384] sigmoid
@@ -3403,95 +2945,12 @@ __device__ __forceinline__ void stage3_token(const Params& P, unsigned epoch, ui
     const int n_units = RKG * n_rg;
     const int nm = n_units * RMSG;
     const int trow = TP ? t / TP_NDEV : t;   // TP: the owner rank's RPART rows hold its 4 tokens as rows 0..3
-#if FMOE_TP_LIN
-    float* s_lp = const_cast<float*>(s_bias) + NEXP;   // [16] LIN: the token's 16 sum-of-squares k-group partials (rstd)
-    static_assert((RUNITS_MAX * RROWS + 2 * NEXP + 2 * (NTHREADS / 32) * TOPK + NEXP + RKG) * 4 <= OFF_PS_FIRST - OFF_PS, "LIN p slots fit");
-#endif
-#if FMOE_TP_LIN == 2
-    if constexpr (TP && !DRY) {   // LIN-RS: the 96 units' pre-rstd partials (local RPART, as the default path) + the 8 p messages of this token
-        constexpr int NZ = RUNITS_MAX * RMSG;   // 2112
-        constexpr int K = (NZ + TP_NDEV + NTHREADS - 1) / NTHREADS;   // 4
-        const uint4* xag = tp_pro<true>(P, P.my_rank) + PRO_XAG;
-        uint4 m[K];
-        unsigned pending = 0;
-#pragma unroll
-        for (int k = 0; k < K; ++k) if (tid + k * NTHREADS < NZ + TP_NDEV) pending |= 1u << k;
-        if (dry) pending = 0u;
-        do {
-#pragma unroll
-            for (int k = 0; k < K; ++k) {
-                if (pending & (1u << k)) {
-                    const int i = tid + k * NTHREADS, unit = i / RMSG, mm = i - unit * RMSG;
-                    m[k] = ld_ll(i < NZ ? P.rpart + ((size_t)unit * MAXM + trow) * RMSG + mm : xag + tp_ag_idx(i - NZ, t, TP_PMSG));
-                }
-            }
-#pragma unroll
-            for (int k = 0; k < K; ++k) {
-                if (pending & (1u << k)) {
-                    const int i = tid + k * NTHREADS;
-                    if (i < NZ ? m[k].w == epoch : (m[k].y == epoch && m[k].w == epoch)) {
-                        if (i < NZ) {
-                            const int unit = i / RMSG, mm = i - unit * RMSG;
-                            float* d = s_part + unit * RROWS + 3 * mm;
-                            d[0] = __uint_as_float(m[k].x);
-                            if (3 * mm + 1 < RROWS) { d[1] = __uint_as_float(m[k].y); d[2] = __uint_as_float(m[k].z); }
-                        } else {
-                            const int sl = i - NZ;
-                            s_lp[2 * sl] = __uint_as_float(m[k].x); s_lp[2 * sl + 1] = __uint_as_float(m[k].z);
-                        }
-                        pending &= ~(1u << k);
-                    }
-                }
-            }
-        } while (pending);
-    } else
-#elif FMOE_TP_LIN == 1
-    if constexpr (TP && !DRY) {   // LIN: 9 sources x 6 row groups x 22 logit-partial messages + the 8 p messages of this token
-        constexpr int NZ = LIN_NSRC * NRG_MAX * RMSG;   // 1188
-        constexpr int K = (NZ + TP_NDEV + NTHREADS - 1) / NTHREADS;   // 2
-        const uint4* lzin = tp_pro<true>(P, P.my_rank) + PRO_LZIN + (size_t)trow * NZ;
-        const uint4* xag = tp_pro<true>(P, P.my_rank) + PRO_XAG;
-        uint4 m[K];
-        unsigned pending = 0;
-#pragma unroll
-        for (int k = 0; k < K; ++k) if (tid + k * NTHREADS < NZ + TP_NDEV) pending |= 1u << k;
-        if (dry) pending = 0u;
-        do {
-#pragma unroll
-            for (int k = 0; k < K; ++k) {
-                if (pending & (1u << k)) {
-                    const int i = tid + k * NTHREADS;
-                    m[k] = ld_ll(i < NZ ? lzin + i : xag + tp_ag_idx(i - NZ, t, TP_PMSG));
-                }
-            }
-#pragma unroll
-            for (int k = 0; k < K; ++k) {
-                if (pending & (1u << k)) {
-                    const int i = tid + k * NTHREADS;
-                    if (i < NZ ? m[k].w == epoch : (m[k].y == epoch && m[k].w == epoch)) {
-                        if (i < NZ) {
-                            const int q = i / RMSG, mm = i - q * RMSG, src = q / NRG_MAX, rg = q - src * NRG_MAX;
-                            float* d = s_part + (rg * RKG + src) * RROWS + 3 * mm;
-                            d[0] = __uint_as_float(m[k].x);
-                            if (3 * mm + 1 < RROWS) { d[1] = __uint_as_float(m[k].y); d[2] = __uint_as_float(m[k].z); }
-                        } else {
-                            const int sl = i - NZ;   // slice sl: k-groups 2 sl, 2 sl + 1
-                            s_lp[2 * sl] = __uint_as_float(m[k].x); s_lp[2 * sl + 1] = __uint_as_float(m[k].z);
-                        }
-                        pending &= ~(1u << k);
-                    }
-                }
-            }
-        } while (pending);
-    } else
-#endif
     if constexpr (!DRY) {   // gather this token's partial messages (all of a thread's messages in flight; retry the missing tags)
         constexpr int K = (RUNITS_MAX * RMSG + NTHREADS - 1) / NTHREADS;   // 4
         uint4 m[K];
         unsigned pending = 0;
 #pragma unroll
         for (int k = 0; k < K; ++k) if (tid + k * NTHREADS < nm) pending |= 1u << k;
-        if (dry) pending = 0u;   // FMOE_TP_S3_WARM pass 0: the loop body runs once with every load predicated off
         do {
 #pragma unroll
             for (int k = 0; k < K; ++k) {
@@ -3522,28 +2981,11 @@ __device__ __forceinline__ void stage3_token(const Params& P, unsigned epoch, ui
             const int rg = tid >> 6, row = tid & 63;
             float l = 0.f;
             if constexpr (TP) {   // same fixed-order sum, but the 16 smem loads are issued together instead of a load-add chain
-#if FMOE_TP_LIN && !(FMOE_LIN_DIAG & 2)
-                float pq[RKG];   // rstd = rsqrt(sum_{kg = 0..15} p[kg] / DIM + eps): stage 1's sequential sum (= the bits stage 1 uses)
-#pragma unroll
-                for (int kq = 0; kq < RKG; ++kq) pq[kq] = s_lp[kq];
-                float tot = 0.f;
-#pragma unroll
-                for (int kq = 0; kq < RKG; ++kq) tot += pq[kq];
-                const float rstd = rsqrtf(tot / (float)DIM + P.eps);
-                constexpr int LIN_NS = FMOE_TP_LIN == 2 ? RKG : LIN_NSRC;   // LIN-RS: the 16 k-group partials; LIN: ranks 0..7 + the residual term
-                float pv[LIN_NS];
-#pragma unroll
-                for (int sq = 0; sq < LIN_NS; ++sq) pv[sq] = s_part[(rg * RKG + sq) * RROWS + row];
-#pragma unroll
-                for (int sq = 0; sq < LIN_NS; ++sq) l += pv[sq];
-                l *= rstd;
-#else
                 float pv[RKG];
 #pragma unroll
                 for (int kg = 0; kg < RKG; ++kg) pv[kg] = s_part[(rg * RKG + kg) * RROWS + row];
 #pragma unroll
                 for (int kg = 0; kg < RKG; ++kg) l += pv[kg];
-#endif
             } else
 #pragma unroll
             for (int kg = 0; kg < RKG; ++kg) l += s_part[(rg * RKG + kg) * RROWS + row];   // fixed order: identical on every rank
@@ -3622,10 +3064,10 @@ __device__ __forceinline__ void stage3_token(const Params& P, unsigned epoch, ui
                 const float wa = s_win_s[2 * j], wb = s_win_s[2 * j + 1];
                 const uint4 mo = make_uint4((unsigned)ia | ((unsigned)ib << 16), __float_as_uint(wa / den), __float_as_uint(wb / den), epoch);
                 uint4* const* s_peer = reinterpret_cast<uint4* const*>(smem + OFF_TAB + TABX_PEER);   // cached at kernel entry
-                if (!DRY && !dry) st_ll(s_peer[d] + PRO_TOPK + t * (TOPK / 2) + j, mo);
+                if (!DRY) st_ll(s_peer[d] + PRO_TOPK + t * (TOPK / 2) + j, mo);
                 if (lane == 0) STAMP(P, 23);   // TP diag: top-8 list stores issued
                 if constexpr (FMOE_TP_OWNER_PREFETCH) {   // this token's 8 experts are certainly in the union -> warm their first FC1 k-tiles now
-                    if (!DRY && !dry) {
+                    if (!DRY) {
                         const int e = s_win_e[lane & 7];
                         const uint8_t* w = P.fc1_w + (size_t)e * FC1_W_EXPERT_BYTES + (size_t)(lane >> 3 & 1) * 4 * FC1_W_SLICE_BYTES;   // lanes 0..7: k-tile 0, 8..15: k-tile 1
                         if (lane < 16) { bulk_prefetch_l2(w, 2 * FC1_W_SLICE_BYTES); bulk_prefetch_l2(w + 2 * FC1_W_SLICE_BYTES, 2 * FC1_W_SLICE_BYTES); }
@@ -3634,7 +3076,7 @@ __device__ __forceinline__ void stage3_token(const Params& P, unsigned epoch, ui
                 }
                 return;
             }
-            if (lane < TOPK / 2 && !DRY && !dry) {
+            if (lane < TOPK / 2 && !DRY) {
                 const int ia = s_win_e[2 * lane], ib = s_win_e[2 * lane + 1];
                 const float wa = s_win_s[2 * lane], wb = s_win_s[2 * lane + 1];
                 if constexpr (TP) {   // the owner rank publishes the token's list to every rank's TOPK region (stage 4 gathers locally)
@@ -3695,7 +3137,7 @@ __device__ __forceinline__ void stage3_token(const Params& P, unsigned epoch, ui
         }
         const float den = sum + 1e-20f;
         if constexpr (TP) {
-            if (lane < TOPK / 2 && !dry) {
+            if (lane < TOPK / 2) {
                 const uint4 mo = make_uint4((unsigned)ia | ((unsigned)ib << 16), __float_as_uint(wa / den), __float_as_uint(wb / den), epoch);
                 uint4* const* s_peer = reinterpret_cast<uint4* const*>(smem + OFF_TAB + TABX_PEER);
 #pragma unroll
@@ -3740,7 +3182,7 @@ __device__ __forceinline__ void tp_prefetch_fc1_first_tiles(const Params& P, int
 // order-independent smem atomics (min / or), so every CTA and every rank gets the identical list.
 template <int EXACT_M, int PARTS, bool TP = false>
 __device__ __forceinline__ void stage4_build_tables(const Params& P, unsigned epoch, uint8_t* smem, int* s_union, unsigned long long* s_mask,
-                                                    int* s_slot, float* s_tkw, int* s_misc, int M, bool dry = false) {
+                                                    int* s_slot, float* s_tkw, int* s_misc, int M) {
     int* s_first = reinterpret_cast<int*>(smem + OFF_PS_FIRST);         // [384] first candidate index of expert e
     unsigned* s_fbits = reinterpret_cast<unsigned*>(s_first + NEXP);    // [16] bit i: candidate i is a first occurrence
     int* s_prefix = reinterpret_cast<int*>(s_fbits + 16);                // [16] exclusive popcount prefix, prologue-only scratch
@@ -3748,11 +3190,7 @@ __device__ __forceinline__ void stage4_build_tables(const Params& P, unsigned ep
     const int tid = threadIdx.x;
     if constexpr (EXACT_M == 32 && PARTS == 2) {
         if (tid == 0) {
-#ifndef FMOE_DIAG
             s_misc[35] = P.m32_tail_scratch && P.mode == 0 && P.reserve < 0 && P.out_bf16;
-#else
-            s_misc[35] = 0;
-#endif
         }
     }
     for (int i = tid; i < NEXP; i += NTHREADS) { s_first[i] = 0x7FFFFFFF; s_mask[i] = 0ull; }
@@ -3763,15 +3201,14 @@ __device__ __forceinline__ void stage4_build_tables(const Params& P, unsigned ep
         if constexpr (TP && FMOE_TP_S4_BACKOFF_NS > 0) {   // 128 CTAs x 128 threads spin on the same 4 KB while the owners run stage 3: back off
             while (true) { m = ld_ll(P.topk + t * (TOPK / 2) + j); if (m.w == epoch) break; __nanosleep(FMOE_TP_S4_BACKOFF_NS); }
         } else
-        do { m = ld_ll(P.topk + t * (TOPK / 2) + j); } while (!dry && m.w != epoch);
-        if (dry) m.x &= 0x00ff00ffu;   // FMOE_TP_S4_WARM pass 0: stale ids kept in range (< 256 <= NEXP)
+        do { m = ld_ll(P.topk + t * (TOPK / 2) + j); } while (m.w != epoch);
         s_tkid[t * TOPK + 2 * j] = (int)(m.x & 0xFFFFu); s_tkid[t * TOPK + 2 * j + 1] = (int)(m.x >> 16);
         s_tkw[t * TOPK + 2 * j] = __uint_as_float(m.y); s_tkw[t * TOPK + 2 * j + 1] = __uint_as_float(m.z);
     } else if (tid >= 256 && tid < 256 + M) {   // x_fp8 / scales of every token visible before fc1 gathers them
         // acquire per poll: the barrier below extends the ordering to every thread's later loads (fc1 gathers are generic-proxy cp.async)
         if constexpr (TP && FMOE_TP_S4_BACKOFF_NS > 0) { while (ld_acquire_gpu(&P.xflags[tid - 256]) != epoch) __nanosleep(FMOE_TP_S4_BACKOFF_NS); }
         else
-        if (FMOE_XFLAG_ACQUIRE) { while (!dry && ld_acquire_gpu(&P.xflags[tid - 256]) != epoch) {} }
+        if (FMOE_XFLAG_ACQUIRE) { while (ld_acquire_gpu(&P.xflags[tid - 256]) != epoch) {} }
         else { while (ld_relaxed_gpu(&P.xflags[tid - 256]) != epoch) {} }
     }
     if (!FMOE_XFLAG_ACQUIRE) fence_acq_rel_gpu();
@@ -3804,7 +3241,7 @@ __device__ __forceinline__ void stage4_build_tables(const Params& P, unsigned ep
             s_slot[i] = slot;
             if (f == i) {
                 s_union[slot] = e;
-                if constexpr (FMOE_TP_UNION_PREFETCH_KT > 0) { if (slot < 66 && !dry) tp_prefetch_fc1_first_tiles(P, e, slot); }   // wave-1 slots only, striped over CTAs
+                if constexpr (FMOE_TP_UNION_PREFETCH_KT > 0) { if (slot < 66) tp_prefetch_fc1_first_tiles(P, e, slot); }   // wave-1 slots only, striped over CTAs
             }
             static_assert(FMOE_MASK_OR32, "the folded stage 4 uses the 32-bit mask atomics");
             const unsigned bit = 1u << (i / TOPK);
@@ -3818,7 +3255,7 @@ __device__ __forceinline__ void stage4_build_tables(const Params& P, unsigned ep
             }
         }
         __syncthreads();
-        if (blockIdx.x == 0 && P.union_out && !dry) {
+        if (blockIdx.x == 0 && P.union_out) {
             const int U = s_misc[32];
             if (tid == 0) P.union_out[0] = U;
             for (int u = tid; u < U; u += NTHREADS) P.union_out[1 + u] = s_union[u];
@@ -3916,7 +3353,7 @@ __device__ __forceinline__ void fc1_early_weights(const Params& P, uint8_t* smem
     // (all expect_tx arrives first, one syncwarp, then the copies) instead of produce_tile's per-stage sequence.
     constexpr int N_EARLY = FMOE_EARLY_FIRST_TILE < NSTAGE1 ? FMOE_EARLY_FIRST_TILE : NSTAGE1;
     if (lane == 0) {
-        LSTAMP(P, 14);   // phase build: first weight TMA issued
+        STAMP(P, 14);   // phase build: first weight TMA issued
 #pragma unroll
         for (int s = 0; s < N_EARLY; ++s) mbar_arrive_expect_tx(&full[s], FC1_TILE_BYTES);
     }
@@ -4018,79 +3455,6 @@ __device__ __forceinline__ void build_m32_token_tasks(const Params& P, uint8_t* 
         const auto* masks = reinterpret_cast<const unsigned long long*>(smem + OFF_TAB + TAB_MASK);
         int* prefix = reinterpret_cast<int*>(smem + OFF_TAB + TAB_SLOT) + 32 * TOPK;
         auto* tasks = reinterpret_cast<uint16_t*>(smem + OFF_TAB + TAB_TKW + 32 * TOPK * 4);
-#if FMOE_MIXED_WIDTH
-        // Per expert: cold (<= 8 tokens, one N8 chunk) or hot (> 8 tokens). Three prefix fields, 10 bits each
-        // (<= 256 token assignments): cold count | hot experts' N16 chunks | hot experts' N8 chunks.
-        int fields = 0, inclusive = 0, tokens = 0;
-        if (tid < 256) {
-            tokens = tid < U ? __popcll(masks[tid]) : 0;
-            const bool hot = tokens > 8;
-            fields = hot ? ((((tokens + 15) / 16) << 10) | (((tokens + 7) / 8) << 20)) : (tokens > 0 ? 1 : 0);
-            inclusive = fields;
-#pragma unroll
-            for (int d = 1; d < 32; d <<= 1) {
-                int v = __shfl_up_sync(0xffffffffu, inclusive, d);
-                if (lane >= d) inclusive += v;
-            }
-            prefix[tid] = inclusive - fields;
-            if (lane == 31) misc[40 + warp] = inclusive;
-        }
-        __syncthreads();
-        if (warp == 0) {
-            int total = lane < 8 ? misc[40 + lane] : 0;
-            const int own = total;
-#pragma unroll
-            for (int d = 1; d < 32; d <<= 1) {
-                int v = __shfl_up_sync(0xffffffffu, total, d);
-                if (lane >= d) total += v;
-            }
-            if (lane < 8) misc[40 + lane] = total - own;
-            if (lane == 7) {
-                const int cold = total & 0x3ff, hot16 = (total >> 10) & 0x3ff, hot8 = (total >> 20) & 0x3ff;
-                // Physical widths: one wave of N16 when 2*sum(ceil(T/16)) fits 132 CTAs
-                // (unchanged); otherwise MIXED two-wave: cold experts stream N8 (2 tasks each), hot experts
-                // stream their weights ONCE per half as N16 chunks on the last H = 2*hot16 CTAs (helpers),
-                // instead of 2*ceil(T/8) N8 tasks. N8 task positions [0, 132-H) and [132, n_tasks), N16
-                // positions [132-H, 132); misc[38] - 132 stays the N8 tail count. Hot CTAs stay within the
-                // helper set (H <= 36) and the tail must fit the late N8 CTAs; otherwise all-N8 as before.
-                const bool wide = 2 * (cold + hot16) <= 132;
-                int H = 2 * hot16, n_tasks = 2 * cold + H;
-                const bool helpers = m32_fc2_helpers<EXACT_M, PARTS>(P, U, misc);
-                bool mixed = FMOE_MIXED_WIDTH && !wide && H > 0 && H <= 36 && n_tasks + 2 * H <= 264;
-                if (!mixed) { H = 0; n_tasks = wide ? 2 * (cold + hot16) : 2 * (cold + hot8); }
-                misc[58] = wide;
-                misc[59] = H;
-                misc[38] = n_tasks;
-                if constexpr (FMOE_ONEWAVE_KSPLIT) misc[61] = wide ? m32_ks_quarters(P, n_tasks) : 0;   // one-wave K-split quarters
-                if (n_tasks > M32_MAX_TASKS) misc[39] = 0;
-                misc[48] = !wide && n_tasks > 132 && n_tasks + H <= 216 && U <= 108 && helpers && !(FMOE_GP && n_tasks > FMOE_GP_MIN_TASKS);
-            }
-        }
-        __syncthreads();
-        if (!misc[39]) return;
-        if (tid < U) {
-            const int H = misc[59], wide = misc[58];
-            const int base = prefix[tid] + misc[40 + warp];
-            const int cold_p = base & 0x3ff, hot16_p = (base >> 10) & 0x3ff, hot8_p = (base >> 20) & 0x3ff;
-            const bool hot = tokens > 8;
-            int nchunks, first, hot_task = 0;
-            if (wide) { first = cold_p + hot16_p; nchunks = hot ? (tokens + 15) / 16 : 1; }
-            else if (H > 0 && hot) { first = hot16_p; nchunks = (tokens + 15) / 16; hot_task = 1; }
-            else if (H > 0) { first = cold_p; nchunks = 1; }
-            else { first = cold_p + hot8_p; nchunks = hot ? (tokens + 7) / 8 : 1; }
-            prefix[tid] = nchunks | (hot_task << 8);   // FC2: chunk count (ready mask) and hot flag (ordering)
-            const int wave1_pairs = (132 - H) / 2;
-            if (misc[48] && !hot_task && first < wave1_pairs && first + nchunks >= wave1_pairs)
-                misc[53] = tid + (first + nchunks == wave1_pairs);
-            for (int c = 0; c < nchunks; ++c) {
-                int pos = 2 * (first + c);
-                if (hot_task) pos += 132 - H;
-                else if (pos >= 132 - H) pos += H;
-                tasks[pos] = uint16_t(((tid * 2) << 2) | c);
-                tasks[pos + 1] = uint16_t(((tid * 2 + 1) << 2) | c);
-            }
-        }
-#else
         // the earlier schedule's build, byte for byte (the three-field version above measured +0.5 us on every case when
         // compiled in with the mixed schedule disabled; paired, bitwise-identical output).
         int nchunks = 0, inclusive = 0;
@@ -4109,7 +3473,6 @@ __device__ __forceinline__ void build_m32_token_tasks(const Params& P, uint8_t* 
             if (lane == 31) misc[40 + warp] = inclusive;
         }
         __syncthreads();
-#if FMOE_TASK_TABLE_FUSED
         // the cross-warp scan is redundant per thread (8 smem reads) instead of a serial warp-0 pass + barrier: the same
         // wide / n_tasks / joint values as the two-pass build below, misc words written by thread 0 only, one barrier less.
         int total = 0, wbase = 0;
@@ -4146,50 +3509,6 @@ __device__ __forceinline__ void build_m32_token_tasks(const Params& P, uint8_t* 
                 tasks[2 * (first + c) + 1] = uint16_t(((tid * 2 + 1) << 2) | c);
             }
         }
-#else
-        if (warp == 0) {
-            int total = lane < 8 ? misc[40 + lane] : 0;
-            // The ready mask removes the per-chunk polling cost. Keep the
-            // all-light path, then admit by physical two-wave capacity.
-            // !misc[35] already excludes all-light loads. Prefix both widths
-            // before choosing the physical one-wave N16 path.
-            const int own = total;
-#pragma unroll
-            for (int d = 1; d < 32; d <<= 1) {
-                int v = __shfl_up_sync(0xffffffffu, total, d);
-                if (lane >= d) total += v;
-            }
-            if (lane < 8) misc[40 + lane] = total - own;
-            if (lane == 7) {
-                const bool wide = 2 * (total & 0xffff) <= 132;
-                misc[58] = wide;
-                misc[38] = 2 * (wide ? (total & 0xffff) : (total >> 16));
-                if constexpr (FMOE_ONEWAVE_KSPLIT) misc[61] = wide ? m32_ks_quarters(P, misc[38]) : 0;   // one-wave K-split quarters
-                if (misc[38] > M32_MAX_TASKS) misc[39] = 0;
-                misc[48] = !wide && misc[38] > 132 && misc[38] <= 216 && !(FMOE_GP && misc[38] > FMOE_GP_MIN_TASKS) &&
-                           U <= 108 && m32_fc2_helpers<EXACT_M, PARTS>(P, U, misc);
-            }
-        }
-        __syncthreads();
-        if (!misc[39]) return;
-        if (tid < U) {
-            const int shift = misc[58] ? 0 : 16;
-            const int first = ((prefix[tid] + misc[40 + warp]) >> shift) & 0xffff;
-            nchunks = (nchunks >> shift) & 0xffff;
-            prefix[tid] = nchunks;
-            if (misc[48] && first < 66 && first + nchunks >= 66)
-                misc[53] = tid + (first + nchunks == 66);
-            if constexpr (FMOE_EARLY_FIRST_TILE > 0) {   // this CTA's first task: pair b/2 in this slot's chunk range (exactly one slot matches)
-                const int b = (int)blockIdx.x, pair = b >> 1;
-                if (first <= pair && pair < first + nchunks) misc[60] = (tid << 8) | ((pair - first) << 1) | (b & 1);
-            }
-            for (int c = 0; c < nchunks; ++c) {
-                tasks[2 * (first + c)] = uint16_t(((tid * 2) << 2) | c);
-                tasks[2 * (first + c) + 1] = uint16_t(((tid * 2 + 1) << 2) | c);
-            }
-        }
-#endif   // FMOE_TASK_TABLE_FUSED
-#endif
         __syncthreads();
     }
 }
@@ -4325,9 +3644,6 @@ __device__ __forceinline__ void fc1_producer(const Params& P, uint8_t* smem, uin
         // left after the fc1 tail is proportional to the item count of the LAST fc1-only round, which a larger front
         // region minimizes.
         int it = 0;
-#ifdef FMOE_DIAG
-        long long dp_wait = 0, dp_issue = 0;   // FC1 producer: cycles waiting for a free stage / issuing a tile (weight lane, gather lane)
-#endif
         int reserve = P.reserve;
         if (reserve < 0) {
             const int n_fc2 = n_front_ctas;
@@ -4411,16 +3727,9 @@ __device__ __forceinline__ void fc1_producer(const Params& P, uint8_t* smem, uin
                 const int s = EXACT_M ? 0 : it % NSTAGE1;
                 const int ph = EXACT_M ? 0 : (it / NSTAGE1) & 1;
                 mbar_wait(&empty[s], ph ^ 1);
-                if (weight_role && lane == 0) STRACE0(P, 36);   // FMOE_S_TRACE: FC1 sentinel
                 if constexpr (PREFILL) named_bar_sync(3, PREFILL_B3);   // see the entry: joint plan (warp 19) visible to the FC2 producer warps
                 if (weight_role && lane == 0) { s_item_q[n & 7] = -1; mbar_arrive(&full[s]); }
                 if (gather_role) cp_async_mbar_arrive_noinc(&full[s]);
-#ifdef FMOE_DIAG
-                if (P.dbg && lane == 0 && (warp == PROD_WARP || warp == PROD_WARP + 1)) {   // FC1 producer counters: dbg[11] weight lane, dbg[12] gather lane
-                    const unsigned w32 = (unsigned)min(dp_wait, 0xffffffffll), i32 = (unsigned)min(dp_issue, 0xffffffffll);
-                    P.dbg[blockIdx.x * NSTAMP + (warp == PROD_WARP ? 11 : 12)] = (unsigned long long)w32 | ((unsigned long long)i32 << 32);
-                }
-#endif
                 break;
             }
             if (weight_role && lane == 0) s_item_q[n & 7] = item;
@@ -4510,9 +3819,6 @@ __device__ __forceinline__ void fc1_producer(const Params& P, uint8_t* smem, uin
             // (Throttling the kernel-start burst -- tile 0 alone, then tiles 1-5 once it landed --
             // moved the median first tile only 0.2 us earlier and left fc1_end unchanged; not kept.)
             auto produce_tile = [&](int kt, int s, int ph) {
-#ifdef FMOE_DIAG
-                const long long tw0_ = clock64();
-#endif
                 if constexpr (FMOE_S_LPF > 0 && TOKEN_ONLY && EXACT_M == 32) {   // late-cohort prefetch-ahead (see FMOE_S_LPF)
                     if (lpf && weight_role && lane < 2 && kt + FMOE_S_LPF < kt0 + nkt) {
                         const int row = e * (NKT1 * 4) + (kt + FMOE_S_LPF) * 4;
@@ -4521,18 +3827,11 @@ __device__ __forceinline__ void fc1_producer(const Params& P, uint8_t* smem, uin
                     }
                 }
                 mbar_wait(&empty[s], ph ^ 1);
-                if (weight_role && lane == 0) STRACE1(P, n * 48 + kt, 0);
-#ifdef FMOE_DIAG
-                const long long tw1_ = clock64(); dp_wait += tw1_ - tw0_;
-#endif
                 uint8_t* stage = smem + OFF_RING + s * FC1_STAGE_BYTES;
                 if (weight_role) {
-#ifdef FMOE_DIAG
-                if (P.mode & 128) { if (lane == 0) mbar_arrive(&full[s]); } else   // diagnostics: no weight traffic (consumers compute on stale smem)
-#endif
                 if constexpr ((FMOE_S_ABL & 8) != 0) { if (lane == 0) mbar_arrive(&full[s]); } else
                 {
-                    if (n == 0 && kt == kt0 && tid == PROD_WARP * 32) LSTAMP(P, 14);   // phase build: first weight TMA issued
+                    if (n == 0 && kt == kt0 && tid == PROD_WARP * 32) STAMP(P, 14);   // phase build: first weight TMA issued
                     if (lane == 0) mbar_arrive_expect_tx(&full[s], FC1_TILE_BYTES);
                     __syncwarp();   // the expect_tx arrive precedes every copy's complete_tx
                     if (lane < 2) {
@@ -4577,16 +3876,10 @@ __device__ __forceinline__ void fc1_producer(const Params& P, uint8_t* smem, uin
                 }
                 cp_async_mbar_arrive_noinc(&full[s]);
                 }
-#ifdef FMOE_DIAG
-                dp_issue += clock64() - tw1_;
-#endif
             };
             if constexpr (EXACT_M != 0) {
                 // Tiles 0..N-1 of the first task were issued at entry (FMOE_EARLY_FIRST_TILE, misc[60]): skip them in period 0.
                 const bool early = FMOE_EARLY_FIRST_TILE > 0 && TASK_ONLY && n == 0 && s_misc[60] >= 0;
-#ifdef FMOE_PROBE
-                if (early && ((s_misc[60] >> 8) != u || ((s_misc[60] >> 1) & 0x7f) != first_token / WIDTH || (s_misc[60] & 1) != hf)) __trap();
-#endif
                 // A full chunk resets the six-stage ring's index and parity.
                 // Unroll one period only; the consumer's MMA loop is unchanged.
 #pragma unroll 1
@@ -4650,19 +3943,8 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
     const int sel = ((g >> 1) + (wq & 1)) & 1;                        // which word pair of the lane chunk this warp takes (see "Weight layout")
     const int row_local0 = rh * 64 + 32 * (wq >> 1) + 16 * sel + g;   // weight row (within the 128-row half) of this thread's first accumulator row; +8 for the second
     int it = 0;
-#ifdef FMOE_DIAG
-    unsigned long long d_setup = 0, d_tiles = 0, d_epi = 0, d_items = 0, tA = 0, tB = 0, tC = 0;
-    unsigned long long d_e[5] = {0, 0, 0, 0, 0}, tE = 0;   // epilogue / setup breakdown (DIAG): see FMOE_DIAG_EPI below
-    long long c_wait = 0, c_dq = 0, c_mw = 0, c_pi = 0, c_is = 0;   // per-tile phase cycles (tid 0): full-wait, dequant, wgmma-wait, promote, fence+issue+commit
-#define DIAG_T(v) do { if (tid == 0) (v) = gtimer(); } while (0)
-#define DIAG_C(acc, t0) do { if (tid == 0) { const long long t1 = clock64(); (acc) += t1 - (t0); (t0) = t1; } } while (0)
-#else
-#define DIAG_T(v) do {} while (0)
-#define DIAG_C(acc, t0) do {} while (0)
-#endif
     for (int n = 0;; ++n) {
-        DIAG_T(tA);
-        if (n == 0 && tid == 0) LSTAMP(P, 19);   // phase build: consumer entered fc1_consumer (overwrites the TP router diag stamp)
+        if (n == 0 && tid == 0) STAMP(P, 19);   // phase build: consumer entered fc1_consumer (overwrites the TP router diag stamp)
         int item;
         // Measured: -1.45 us on both one-wave cases, +0.2..0.8 us on every two-wave
         // case, so the hoist is on for the N16 one-wave instantiation only; the N8 two-wave consumer stays as in the earlier schedule.
@@ -4727,14 +4009,9 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
                 }
             }
         }
-#ifdef FMOE_DIAG
-        if (tid == 0) { tE = gtimer(); d_e[4] += tE - tA; }   // setup part 1: item resolve (+ previous publish tail on tid 0)
-#endif
-        if (tid == 0 && n > 0) STRACEE(P, n - 1, 6);   // FMOE_S_TRACE: next item resolved
         if (warp == 0) { const int T = build_token_list(s_mask[u], s_tok, s_inv, lane); if (lane == 0) s_misc[0] = T; }
         named_bar_sync(1, NCONS);
-        if (tid == 0 && n > 0) STRACEEB(P, n - 1, 7, smem + OFF_TOK);   // FMOE_S_TRACE: next item's token list barrier
-        if (n == 0 && tid == 0) LSTAMP(P, 20);   // phase build: first item's token list built (after the consumer barrier)
+        if (n == 0 && tid == 0) STAMP(P, 20);   // phase build: first item's token list built (after the consumer barrier)
         const int T = s_misc[0];
         const int token_end = token_tasks ? min(first_token + NT, T) : max(T, 1);
         for (int token_base = first_token; token_base < token_end; token_base += (CHUNKED ? NT : MAXM)) {
@@ -4769,18 +4046,14 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
         // K-split piece counter: every thread read s_misc[62] before this barrier; the epilogue barriers order this write before the
         // next loop-top read.
         if constexpr (ONE_WAVE && FMOE_ONEWAVE_KSPLIT) { if (tid == 0) ++s_misc[62]; }
-        DIAG_T(tB);
-        if (tid == 0 && n > 0) STRACEEB(P, n - 1, 8, smem + OFF_TOK);   // FMOE_S_TRACE: next item's setup barrier
-        if (n == 0 && token_base == first_token && tid == 0) LSTAMP(P, 15);   // phase build: first item's consumer setup done
+        if (n == 0 && token_base == first_token && tid == 0) STAMP(P, 15);   // phase build: first item's consumer setup done
         if constexpr (ONE_WAVE || (TASK_ONLY && FMOE_SETUP_HOIST)) {   // setup done: now wait for the item's tile 0 (one chunk per task, ring restarts at 0/0)
             if constexpr (FMOE_FC1_DESYNC_NS > 0 && TOKEN_ONLY) {
                 if (mat == 1) { const unsigned long long t0_ = globaltimer_ns(); while (globaltimer_ns() - t0_ < FMOE_FC1_DESYNC_NS) {} }   // up WGs trail the gate WGs
             }
             const int s = it % NSTAGE1, ph = (it / NSTAGE1) & 1;
-            if (tid == 0) STRACE1(P, n * 48, 3);
             mbar_wait(&full[s], ph);
             if (n == 0 && tid == 0) STAMP(P, 10);
-            if (tid == 0) STRACE1(P, n * 48, 1);
         }
 
         float D[NR], S[NR];
@@ -4817,13 +4090,7 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
                                  int ring_phase, int previous_stage) {
                 const int s = TOKEN_ONLY ? ring_stage : it % NSTAGE1;
                 const int ph = TOKEN_ONLY ? ring_phase : (it / NSTAGE1) & 1;
-#ifdef FMOE_DIAG
-                long long tc = 0; if (tid == 0) tc = clock64();
-#endif
-                if (tid == 0) STRACE1(P, n * 48 + kt, 3);
                 if (kt > kt0 || token_base > 0) mbar_wait(&full[s], ph);
-                if (tid == 0) STRACE1(P, n * 48 + kt, 1);
-                DIAG_C(c_wait, tc);
                 if constexpr (!TOKEN_ONLY) {
                     if (P.mode & 1) { if (lane == 0) mbar_arrive(&empty[s]); ++it; return; }   // diagnostics: pipeline only
                 }   // TOKEN_ONLY admission already requires P.mode == 0
@@ -4860,28 +4127,13 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
                 // Combined gate/up TMA packs [slice][mat][rh] weights and [slice][mat] offsets.
                 const uint8_t* frag = stage + mat * (2 * HL_BLOCK_BYTES) + rh * HL_BLOCK_BYTES + ((wq >> 1) * 32 + lane) * 16 + sel * 8;
                 const uint8_t* scl = stage + FC1_TILE_W_BYTES + mat * 128 + rh * 64 + 8 * g + 4 * (wq >> 1) + 2 * sel;
-#ifdef FMOE_DIAG   // diagnostics build: mode 16 = skip dequant, 32 = skip wgmma, 64 = skip promote
-                const bool do_dq = !(P.mode & 16), do_mma = !(P.mode & 32), do_pr = !(P.mode & 64);
-#else
                 constexpr bool do_dq = true, do_mma = true, do_pr = true;
-#endif
                 auto dequant = [&]() {
-#ifdef FMOE_DIAG   // mode 1024: fragment loads only; 2048: LUT ALU only (fragments from registers)
-                    if (do_dq) {
-                        if (P.mode & 1024) dequant_slices4_loadonly<4096, 256>(frag, scl, Ac);
-                        else if (P.mode & 2048) dequant_slices4_noload<4096, 256>(scl, tid128, Ac);
-                        else dequant_slices4<4096, 256, (EXACT_M != 0)>(frag, scl, Ac);
-                    }
-                    if (tid == 0) asm volatile("" :: "r"(Ac[0][0]), "r"(Ac[1][0]), "r"(Ac[2][0]), "r"(Ac[3][0]));   // dequant results materialized before the stamp
-#else
                     if (do_dq) dequant_slices4<4096, 256, (EXACT_M != 0)>(frag, scl, Ac);
-#endif
                 };
                 if constexpr (NA == 2) dequant();   // overlaps tile kt-1's group (other A buffer)
-                DIAG_C(c_dq, tc);
                 if (do_mma) wg::wait<0>();   // tile kt-1's group complete: S holds its products, its A buffer and stage are free
                 fence_operand(S); fence_operand_a(A[0]); fence_operand_a(A[NA - 1]);
-                DIAG_C(c_mw, tc);
                 if (kt > kt0) {
                     const int ps = TOKEN_ONLY ? previous_stage : (it - 1) % NSTAGE1;
                     float2 xv = make_float2(0.f, 0.f);
@@ -4890,7 +4142,6 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
                         asm volatile("" : "+f"(xv.x), "+f"(xv.y) :: "memory");
                     }
                     if (lane == 0) mbar_arrive(&empty[ps]);
-                    if (tid == 0) STRACE1(P, n * 48 + kt - 1, 2);
                     if (do_pr) promote(kt - 1, xv);
                 }
                 // Pin the completed promotion before S is reused. Otherwise
@@ -4898,7 +4149,6 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
                 // copy its new accumulator before wait_group (C7515).
                 if constexpr (EXACT_M == 24 || EXACT_M == 32 || EXACT_M == 64) fence_operand(D);
                 if constexpr (NA == 1) dequant();   // single buffer: only after the group that read it completed
-                DIAG_C(c_pi, tc);
                 if (do_mma) {
                     fence_operand(S);
                     wg::fence();
@@ -4910,7 +4160,6 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
 #pragma unroll
                     for (int s4 = 0; s4 < 4; ++s4) asm volatile("" :: "r"(Ac[s4][0]), "r"(Ac[s4][1]), "r"(Ac[s4][2]), "r"(Ac[s4][3]));
                 }
-                DIAG_C(c_is, tc);
                 ++it;
             };
             if constexpr (TOKEN_ONLY) {
@@ -4941,8 +4190,6 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
             promote(kt0 + nkt - 1, xl);
         }
         if (lane == 0 && (TOKEN_ONLY || !(P.mode & 1))) mbar_arrive(&empty[(it - 1) % NSTAGE1]);
-        if (tid == 0) { STRACE1(P, n * 48 + 47, 2); STRACE0(P, 37); }   // FMOE_S_TRACE 37: last item's mainloop end
-        DIAG_T(tC);
         // FMOE_C_EPI & 2: thread 0 reads this expert's h flag word now (relaxed; latency hidden by the SiLU/requant below)
         constexpr bool EPI_FLAG = (FMOE_C_EPI & 2) && TOKEN_ONLY && EXACT_M == 32 && !FC1_PUB_OFFLOAD;   // (offload: warp 18 publishes)
         uint64_t flag_pre = 0;
@@ -4962,7 +4209,6 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
                 const int* pub_ = reinterpret_cast<const int*>(smem + OFF_PUB);
                 while (ld_acquire_cta_s(pub_ + 1) != (int)epoch) {}
                 rs_e = reinterpret_cast<const float2*>(smem + OFF_S2TAB)[u].x;
-                if (tid == 0) STRACEE(P, n, 0);   // FMOE_S_TRACE: epilogue factor table ready
             } else
             rs_e = (EPI_PRE ? pre_s1 : __ldg(P.fc1_s2 + e)) * 64.0f;
             static_assert(KSPLIT == 1, "M32 light tail uses one guarded N8 panel");
@@ -5028,9 +4274,6 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
             }
             named_bar_sync(1, NCONS);   // every thread's stores precede thread 0's cumulative release
             if (tid == 0) st_release_gpu(&P.part_flags[u * 2 + hf], epoch);
-#ifdef FMOE_DIAG
-            if (tid == 0) { const unsigned long long tD = gtimer(); d_setup += tB - tA; d_tiles += tC - tB; d_epi += tD - tC; ++d_items; }
-#endif
             continue;
         }
         if (KSPLIT == 2) {
@@ -5045,9 +4288,6 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
             }
         }
 
-#ifdef FMOE_DIAG
-        if (tid == 0) { tE = gtimer(); d_e[0] += tE - tC; }   // epi part 0: metadata re-read + fc1_s2 load
-#endif
         if constexpr (FMOE_S_EOFF && TOKEN_ONLY && FC1_PUB_OFFLOAD && EXACT_M == 32 && PARTS == 2 && NT == 8) if (s_eoff_on(P)) {
             int* pub_ = reinterpret_cast<int*>(smem + OFF_PUB);
             while (ld_acquire_cta_s(pub_ + 2) < n) {}   // warp 18 consumed every earlier item's HST rows
@@ -5074,10 +4314,7 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
             }
         }
         named_bar_sync(1, NCONS);
-        if (tid == 0) STRACEEB(P, n, 1, smem + OFF_TOK);   // FMOE_S_TRACE: up staging barrier
-        if (lane == 0 && n == 0) STRACE0(P, 1800 + warp);   // FMOE_S_TRACE: each consumer warp past the staging barrier (item 0)
         if (mat == 0) {
-            if (lane == 0 && n == 0) STRACE0(P, 1820 + warp);   // FMOE_S_TRACE: SiLU block entered (item 0)
 #pragma unroll
             for (int j = 0; j < NT / 8; ++j) {
                 if (j < C) {
@@ -5088,17 +4325,11 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
                         else if constexpr ((FMOE_S_ABL & 128) != 0) *hp = silu_f(D[4 * j + i] * rs_e);   // DIAGNOSTIC: no hst read
                         else
                         *hp = silu_f(D[4 * j + i] * rs_e) * *hp;
-                        if (i == 0 && lane == 0 && n == 0) STRACE0(P, 1840 + warp);   // FMOE_S_TRACE: first SiLU element stored
                     }
                 }
             }
         }
-        if (lane == 0 && n == 0) STRACE0(P, 1760 + warp);   // FMOE_S_TRACE: each consumer warp's arrival at the SiLU barrier (item 0)
         named_bar_sync(1, NCONS);
-        if (tid == 0) STRACEEB(P, n, 2, smem + OFF_TOK);   // FMOE_S_TRACE: SiLU barrier
-#ifdef FMOE_DIAG
-        if (tid == 0) { const unsigned long long t_ = gtimer(); d_e[1] += t_ - tE; tE = t_; }   // epi part 1: stage + SiLU (2 barriers)
-#endif
         {   // requant: 8 threads per token (16 columns each), all M_pad tokens in one pass (unrouted -> zeros)
             const int tok = tid >> 3, q = tid & 7;
             const int full_pos = (tok < M) ? s_inv[tok] : -1;
@@ -5153,18 +4384,8 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
         }
         // Generic-proxy stores -> visible to the fc2 producer's cp.async.bulk (async proxy) after its acquire + proxy fence;
         // bar.sync orders every thread's stores before thread 0's cumulative st.release.gpu.
-#ifdef FMOE_DIAG
-        if (tid == 0) { const unsigned long long t_ = gtimer(); d_e[2] += t_ - tE; tE = t_; }   // epi part 2: requant + h/cs stores (tid 0's view)
-#endif
-        if (tid == 0) STRACEE(P, n, 3);   // FMOE_S_TRACE: tid 0's requant + stores issued
-        if (lane == 0 && n == 0) STRACE0(P, 1780 + warp);   // FMOE_S_TRACE: each consumer warp's requant + stores issued (item 0)
         fence_proxy_async_global();
-        if (tid == 0) STRACEE(P, n, 4);   // FMOE_S_TRACE: tid 0's proxy fence done
         named_bar_sync(1, NCONS);
-        if (tid == 0) STRACEEB(P, n, 5, smem + OFF_TOK);   // FMOE_S_TRACE: publish barrier
-#ifdef FMOE_DIAG
-        if (tid == 0) { const unsigned long long t_ = gtimer(); d_e[3] += t_ - tE; tE = t_; }   // epi part 3: proxy fence + barrier
-#endif
         if (tid == 0) {
             if constexpr (TOKEN_ONLY && FC1_PUB_OFFLOAD) {   // hand the publish to producer warp 18 (item n of this CTA)
                 int* pub_ = reinterpret_cast<int*>(smem + OFF_PUB);
@@ -5179,22 +4400,9 @@ __device__ __forceinline__ void fc1_consumer(const Params& P, unsigned epoch, ui
             else if (!CHUNKED || token_base + NT >= T)
                 st_release_gpu(&P.h_flags[u * 2 + hf], epoch);
         }
-#ifdef FMOE_DIAG
-        if (tid == 0) { const unsigned long long tD = gtimer(); d_setup += tB - tA; d_tiles += tC - tB; d_epi += tD - tC; ++d_items; }
-#endif
         }   // routed-token chunks; all chunks finish before publishing the expert-half flag
     }
-    if (tid == 0) { STAMP(P, 1); STRACE0(P, 30); }   // fc1 CTA: all items done (FMOE_S_TRACE: clock twin in 30)
-#ifdef FMOE_DIAG
-    if (tid == 0 && P.dbg) {   // epilogue/setup breakdown in the (DIAG-overwritten) prologue stamp slots 6..10
-        P.dbg[blockIdx.x * NSTAMP + 6] = d_e[0]; P.dbg[blockIdx.x * NSTAMP + 7] = d_e[1]; P.dbg[blockIdx.x * NSTAMP + 8] = d_e[2];
-        P.dbg[blockIdx.x * NSTAMP + 9] = d_e[3]; P.dbg[blockIdx.x * NSTAMP + 10] = d_e[4];
-    }
-    if (tid == 0 && P.dbg) { P.dbg[blockIdx.x * NSTAMP + 16] = d_setup; P.dbg[blockIdx.x * NSTAMP + 17] = d_tiles; P.dbg[blockIdx.x * NSTAMP + 18] = d_epi; P.dbg[blockIdx.x * NSTAMP + 19] = d_items;
-                            P.dbg[blockIdx.x * NSTAMP + 20] = c_wait; P.dbg[blockIdx.x * NSTAMP + 21] = c_dq; P.dbg[blockIdx.x * NSTAMP + 22] = c_mw; P.dbg[blockIdx.x * NSTAMP + 23] = c_pi; P.dbg[blockIdx.x * NSTAMP + 24] = c_is; }
-#endif
-#undef DIAG_T
-#undef DIAG_C
+    if (tid == 0) STAMP(P, 1);   // fc1 CTA: all items done
 }
 
 // ======================= fc2 role =======================
@@ -5251,8 +4459,6 @@ __device__ __forceinline__ void fc2_producer(const Params& P, unsigned epoch, ui
                 __syncwarp();
             }
             if (!s_xt_on(P)) named_bar_sync(FC2_START_BAR, FC2_START_THREADS);   // FMOE_S_XT: per-stage gates below instead
-            if (warp == PROD_WARP && lane == 0) STRACE0(P, 34);   // FMOE_S_TRACE: FC2 start gate passed
-            if (warp == PROD_WARP && lane == 0) STRACE0B(P, 60, smem + OFF_TOK);   // FMOE_S_TRACE: ... gate completed
             if constexpr (FMOE_FC2_PREFILL_NOTAIL_DELAY_NS > 0) {
                 // Early leavers (see the knob) idle for the old join-chain time. bar.sync blocks lazily (BAR.SYNC.DEFER_BLOCKING): the
                 // timer is read only inside a branch on a shared load, which does wait for the barrier.
@@ -5356,7 +4562,6 @@ __device__ __forceinline__ void fc2_producer(const Params& P, unsigned epoch, ui
                         if (ROLE == 2 && l == XT_K) mbar_wait(xt_free, 0u); else xt_gate(l);
                     }
                     mbar_wait(&empty[s], ph ^ 1);
-                    STRACE2(P, l, ROLE == 1 ? 0 : 5);
                     uint8_t* stage = smem + OFF_RING + s * STAGE;
                     if constexpr ((FMOE_S_ABL & 1) != 0) { (void)stage; (void)e; mbar_arrive(&full[s]); }
                     else if constexpr (ROLE == 1) {
@@ -5419,7 +4624,6 @@ __device__ __forceinline__ void fc2_producer(const Params& P, unsigned epoch, ui
                 }
                 if (!xt_skip) {
                 mbar_wait(&empty[s], ph ^ 1);
-                STRACE2(P, l, ROLE == 1 ? 0 : 5);
                 uint8_t* stage = smem + OFF_RING + s * STAGE;
                 const int weight_tile = tile + (LOCKSTEP ? pass * 36 : (dual_helper ? (l & 1) * 36 : 0));
                 if constexpr ((FMOE_S_ABL & 1) != 0) { (void)stage; (void)weight_tile; (void)e; mbar_arrive(&full[s]); }
@@ -5464,7 +4668,6 @@ __device__ __forceinline__ void fc2_producer(const Params& P, unsigned epoch, ui
             for (int l = 0;; ++l) {
                 const int s = l % NST;
                 mbar_wait(&cs_go[s], (l / NST) & 1);
-                STRACE2(P, l, 2);
                 const int code = cs_u[s];
                 if (code == -1) break;
                 if (code == -2) { mbar_arrive(&full[s]); continue; }   // merge pseudo-stage: no cs
@@ -5490,7 +4693,6 @@ __device__ __forceinline__ void fc2_producer(const Params& P, unsigned epoch, ui
             // Mixed-width loads: hot experts' N16 tasks end ~4-9 us after the cold first wave, so every role streams
             // its cold experts first and its hot experts last (a data-dependent, deterministic order; the consumer
             // only needs the stage count, and M32 token tasks always use the prescaled cs plane).
-#if FMOE_BATCH_FENCE
             // Batched ready check for token-task loads. the earlier schedule paid one L2 poll round trip +
             // fence.acquire.gpu (= CCTL.IVALL) + fence.proxy.async per expert on this single lane, which paces FC2 once
             // all 132 CTAs stream (B-owners 1.0-1.08 us/expert vs A 0.85). Here the ready words of this expert and the
@@ -5507,7 +4709,6 @@ __device__ __forceinline__ void fc2_producer(const Params& P, unsigned epoch, ui
                 const int s = l % NST, ph = (l / NST) & 1;
                 xt_gate(l);   // FMOE_S_XT: FC1 ring stage(s) released / consumers left FC1
                 mbar_wait(&empty[s], ph ^ 1);
-                STRACE2(P, l, 1);
                 uint8_t* stage = smem + OFF_RING + s * STAGE;
                 constexpr bool ABL_H = (FMOE_S_ABL & 2) != 0;
                 mbar_arrive_expect_tx(&full[s], ((EXACT_M == 24 || SPLIT_PROD) ? 0 : FC2_W_BYTES) + (ABL_H ? 0 : NT * 256) + ((dummy || CSSPLIT) ? 0 : NT * 8));
@@ -5569,44 +4770,6 @@ __device__ __forceinline__ void fc2_producer(const Params& P, unsigned epoch, ui
             } else
             if (token_tasks) {
                 constexpr int BW = FMOE_BATCH_FENCE;   // experts per round trip (register-limited: the producer warp has 64)
-#if FMOE_MIXED_WIDTH
-                // Mixed widths: the hot experts' single N16 tasks end ~4.5 us after the cold N8 first
-                // wave, so each role walks its range twice -- pass 0 streams the cold experts, pass 1 the hot ones (bit 8 of
-                // the chunk count; a deterministic order, and M32 token tasks always use the prescaled cs plane so the
-                // consumer needs only the stage count). A two-pass walk sat on the per-expert poll chain; here the
-                // skipped expert costs two smem reads and the polls stay batched. The ready window restarts per pass.
-                int l = 0;
-#pragma unroll 1
-                for (int pass = 0; pass < 2; ++pass) {
-                    ready = 0; win = expert_begin;
-                    for (int idx = expert_begin; idx < expert_end; idx += expert_stride) {
-                        const int u = fc2_union_index<EXACT_M, PARTS>(misc, idx);
-                        if (((chunk_counts[u] >> 8) & 1) != pass) continue;
-                        const int e = s_union[u];
-                        if (idx >= win + 32) { win = idx; ready = 0; }
-                        while (!(ready & (1u << (idx - win)))) {
-                            uint64_t f[BW]; unsigned lo[BW];
-#pragma unroll
-                            for (int k = 0; k < BW; ++k) {
-                                const int ik = idx + k * expert_stride;
-                                const int uk = k == 0 ? u : fc2_union_index<EXACT_M, PARTS>(misc, ik < expert_end ? ik : idx);
-                                lo[k] = ((1u << (chunk_counts[uk] & 0xff)) - 1u) * 0x11u;
-                                f[k] = ld_relaxed_gpu_u64(reinterpret_cast<const uint64_t*>(P.h_flags + MAXU * 2 + uk * 8));
-                            }
-                            asm volatile("fence.acquire.gpu;" ::: "memory");
-                            fence_proxy_async_global();
-#pragma unroll
-                            for (int k = 0; k < BW; ++k) {
-                                const int ik = idx + k * expert_stride;
-                                if (ik < expert_end && ik < win + 32 && f[k] == ((uint64_t(epoch) << 32) | lo[k]))
-                                    ready |= 1u << (ik - win);
-                            }
-                        }
-                        issue(l, u, e, false); ++l;
-                        if (dual_helper) { issue(l, u, e, false); ++l; }   // the pair's second tile, same expert (weight_tile + 36)
-                    }
-                }
-#else
                 int l = 0;
                 const int n_per = (expert_end - expert_begin + expert_stride - 1) / expert_stride;
                 const int pad_end = expert_end + ((LOCKSTEP && (n_per & 1)) ? expert_stride : 0);   // see the weight walk above
@@ -5645,7 +4808,6 @@ __device__ __forceinline__ void fc2_producer(const Params& P, unsigned epoch, ui
                     }
                     issue(l, u, e, dummy);
                 }
-#endif
             } else {
                 int l = 0;
                 const int n_per = (expert_end - expert_begin + expert_stride - 1) / expert_stride;
@@ -5717,82 +4879,6 @@ __device__ __forceinline__ void fc2_producer(const Params& P, unsigned epoch, ui
                 mbar_wait(&empty[s], ph ^ 1);
                 cs_u[s] = -1; mbar_arrive(&cs_go[s]);
             }
-#else
-#if FMOE_MIXED_WIDTH
-            // Without mixed widths this is the plain range walk: the two-pass form's extra per-expert index/flag reads
-            // on this single lane cost ~2 us on every two-wave case -- the producer
-            // lane, not the consumer pairs, paces FC2 once all 132 CTAs stream.
-            int next_idx = expert_begin, pass = 0;
-            auto next_expert = [&]() -> int {
-                if constexpr (!FMOE_MIXED_WIDTH) {
-                    if (next_idx >= expert_end) return -1;
-                    const int cur = next_idx;
-                    next_idx += expert_stride;
-                    return cur;
-                }
-                while (true) {
-                    if (next_idx >= expert_end) { if (pass) return -1; pass = 1; next_idx = expert_begin; continue; }
-                    const int cur = next_idx;
-                    next_idx += expert_stride;
-                    const int hot = token_tasks ? ((chunk_counts[fc2_union_index<EXACT_M, PARTS>(misc, cur)] >> 8) & 1) : 0;
-                    if (hot == pass) return cur;
-                }
-            };
-            int idx = -1;
-            for (int l = 0;; ++l) {
-                if (!(dual_helper && (l & 1))) { idx = next_expert(); if (idx < 0) break; }
-#else
-            for (int l = 0, idx = expert_begin; idx < expert_end;
-                 ++l, idx += (dual_helper && (l & 1)) ? 0 : expert_stride) {
-#endif
-                const int u = fc2_union_index<EXACT_M, PARTS>(misc, idx);
-                const int e = s_union[u];
-                while (true) {   // poll up to 8 experts' flag pairs per round trip: 16 relaxed loads, then ONE acquire
-                    if (token_tasks) {
-                        // NVFP4-style single arrival mask, extended with a
-                        // full epoch so changed-input Graph replays cannot
-                        // consume a previous launch's completed chunks.
-                        const int nc = FMOE_MIXED_WIDTH ? (chunk_counts[u] & 0xff) : chunk_counts[u];
-                        const uint64_t expected = (uint64_t(epoch) << 32) | (((1u << nc) - 1u) * 0x11u);
-                        const auto* p = reinterpret_cast<const uint64_t*>(P.h_flags + MAXU * 2 + u * 8);
-                        // Only the successful read acquires the published
-                        // chunk payloads; failed polls never consume data.
-                        while (ld_relaxed_gpu_u64(p) != expected) {}
-                        asm volatile("fence.acquire.gpu;" ::: "memory");
-                        fence_proxy_async_global();
-                        break;
-                    }
-                    if (u >= win + 32) { win = u; ready = 0; }   // fence + ONE proxy fence for the whole batch
-                    if (ready & (1u << (u - win))) break;
-                    unsigned f[16];
-#pragma unroll
-                    for (int k = 0; k < 8; ++k) {
-                        const int ue = min(u + k, U - 1);  // codespell:ignore
-                        f[2 * k] = ld_relaxed_gpu(&P.h_flags[ue * 2]);  // codespell:ignore
-                        f[2 * k + 1] = ld_relaxed_gpu(&P.h_flags[ue * 2 + 1]);  // codespell:ignore
-                    }
-                    fence_acq_rel_gpu();          // acquire: h data of the confirmed experts is visible (generic proxy)
-                    fence_proxy_async_global();   // ... and to the bulk-copy (async) proxy
-#pragma unroll
-                    for (int k = 0; k < 8; ++k)
-                        if (u + k < U && u + k < win + 32 && f[2 * k] == epoch && f[2 * k + 1] == epoch) ready |= 1u << (u + k - win);
-                }
-                const int s = l % NST, ph = (l / NST) & 1;
-                mbar_wait(&empty[s], ph ^ 1);
-                uint8_t* stage = smem + OFF_RING + s * STAGE;
-                mbar_arrive_expect_tx(&full[s], (EXACT_M == 24 ? 0 : FC2_W_BYTES) + NT * 256 + NT * 8);
-                bulk_g2s(stage + H_OFF, P.h_buf + (size_t)u * 2 * NT * 128, NT * 256, &full[s]);
-                const int scale_u = (EXACT_M == 32 && FMOE_CS_PERM) ? MAXU + u : u + ((FC2_PRESCALE<EXACT_M> && U <= MAXU / 2) ? MAXU / 2 : 0);
-                uint8_t* cs_dst = (EXACT_M == 32 && FMOE_CS_PERM) ? reinterpret_cast<uint8_t*>(fc2_cs_ring(smem) + (l & (FC2_CS_RING - 1)) * 64) : stage + CS_OFF;
-                bulk_g2s(cs_dst, P.cs_buf + (size_t)scale_u * NT * 2, NT * 8, &full[s]);
-                // the tile's 128 rows = blocks tile*2, tile*2+1 of the expert's 8 k32 slices: one 16-KB TMA box ([slice][rh][1 KB]) + one 1-KB offset box
-                if constexpr (EXACT_M != 24) {
-                    const int weight_tile = tile + (dual_helper ? (l & 1) * 36 : 0);
-                    tma_load_3d(stage + W_OFF, P.tmaps + 2, 0, weight_tile * 2, e * (INTER / 32), &full[s]);
-                    tma_load_2d(stage + W_OFF + FC2_TILE_W_BYTES, P.tmaps + 3, weight_tile * 128, e * (INTER / 32), &full[s]);
-                }
-            }
-#endif
         }
         return;
     }
@@ -5836,13 +4922,10 @@ __device__ __forceinline__ void fc2_consumer(const Params& P, unsigned epoch, ui
     } else {
     fc2_map<PARTS>((int)blockIdx.x, grid, tile, part, parts);
     fc2_expert_range<EXACT_M, PARTS>(P, U, part, parts, expert_begin, expert_end, expert_stride);
-    if (threadIdx.x == 0) STRACE0(P, 56);
     fc2_helper_range<EXACT_M, PARTS>(P, U, misc, tile, part, parts, expert_begin, expert_end, expert_stride);
-    if (threadIdx.x == 0) STRACE0(P, 57);
     gp2 = m32_gp2_active<EXACT_M, PARTS>(P, U, misc);
     dual_helper = !gp2 && m32_fc2_dual_helper<EXACT_M, PARTS>(P, U, misc);
     }
-    if (threadIdx.x == 0) STRACE0(P, 58 + (dual_helper ? 1 : 0) * 0);
     using G = Fc2Geom<NT, EXACT_M>;
     constexpr int H_OFF = G::H_OFF, CS_OFF = G::CS_OFF, W_OFF = G::W_OFF, STAGE = G::STAGE, NST = G::NST;
     // Consumer WG pair par = wg>>1 takes the CTA's local experts l = par, par+2, ...; within a pair WG rh = wg&1 owns
@@ -5965,31 +5048,9 @@ __device__ __forceinline__ void fc2_consumer(const Params& P, unsigned epoch, ui
     };
     // one expert of this pair; RET: retire the previous expert's k-block 1 (compile-time so no runtime branch guards
     // accumulator reads -- C7518 otherwise)
-#ifdef FMOE_DIAG
-    long long c2_wait = 0, c2_dq = 0, c2_mw = 0, c2_rt = 0, c2_is = 0, c2_n = 0;   // per-expert phase cycles (tid 0 = pair 0): full-wait, dequant, wgmma-wait, retire, issue
-    long long w_dq = 0, w_is = 0, w_t = 0;   // FMOE_DIAG_SKEW: this warp's own dequant / issue cycles (lane 0 of warps 0..3)
-#define DIAG2(acc, t0) do { if (tid == 0) { const long long t1 = clock64(); (acc) += t1 - (t0); (t0) = t1; } } while (0)
-#ifdef FMOE_DIAG_SKEW
-#define DIAGW(acc) do { if (lane == 0 && warp < 4) { const long long t1 = clock64(); (acc) += t1 - w_t; w_t = t1; } } while (0)
-#define DIAGW0() do { if (lane == 0 && warp < 4) w_t = clock64(); } while (0)
-#else
-#define DIAGW(acc) do {} while (0)
-#define DIAGW0() do {} while (0)
-#endif
-#else
-#define DIAGW(acc) do {} while (0)
-#define DIAGW0() do {} while (0)
-#define DIAG2(acc, t0) do {} while (0)
-#endif
     auto expert = [&](auto ret_t, int l) {
         constexpr bool RET = decltype(ret_t)::value;
-#ifdef FMOE_DIAG
-        long long tc = 0; if (tid == 0) { tc = clock64(); ++c2_n; }
-#endif
-        if (lane == 0 && wq == 0 && rh == 0) STRACE2(P, l, 7);
         mbar_wait(&full[l % NST], (l / NST) & 1);
-        if (lane == 0 && wq == 0 && rh == 0) STRACE2(P, l, 3);
-        DIAG2(c2_wait, tc);
         const uint8_t* stage = stage_of(l);
         // this thread's fragment words / offset bytes: [k32 slice][rh] blocks (slice stride 2048), [slice] offset runs (stride 128)
         const uint8_t* frag = stage + W_OFF + rh * HL_BLOCK_BYTES + ((wq >> 1) * 32 + lane) * 16 + sel * 8;
@@ -6006,35 +5067,21 @@ __device__ __forceinline__ void fc2_consumer(const Params& P, unsigned epoch, ui
             dequant_slices4<2048, 128, (EXACT_M != 0)>(frag + 4 * 2048, scl + 4 * 128, A[0]);
             issue_kb(A[0], stage, 1);
         } else {
-        DIAGW0();
         if constexpr ((FMOE_S_ABL & 4) == 0)
         dequant_slices4<2048, 128, (EXACT_M != 0)>(frag, scl, A[0]);   // overlaps the previous expert's k-block 1 (reads A[1])
-        if (l < 4 && lane == 0 && wq == 0 && rh == 0) STRACE0(P, 38 + 4 * l);
-        DIAG2(c2_dq, tc); DIAGW(w_dq);
         wg::wait<0>();
         fence_operand(S); fence_operand_a(A[0]); fence_operand_a(A[1]);
-        DIAG2(c2_mw, tc);
         if constexpr (RET) retire(std::integral_constant<int, 1>{}, l - 2);
-        DIAG2(c2_rt, tc); DIAGW0();
         issue_kb(A[0], stage, 0);
-        DIAG2(c2_is, tc); DIAGW(w_is);
-        if (l < 4 && lane == 0 && wq == 0 && rh == 0) STRACE0(P, 39 + 4 * l);
         if constexpr ((FMOE_S_ABL & 4) == 0)
         dequant_slices4<2048, 128, (EXACT_M != 0)>(frag + 4 * 2048, scl + 4 * 128, A[1]);   // overlaps k-block 0 (reads A[0])
-        if (l < 4 && lane == 0 && wq == 0 && rh == 0) STRACE0(P, 40 + 4 * l);
         if constexpr ((FMOE_S_ABL & 32) != 0) {   // DIAGNOSTIC: release the whole stage once both k-blocks are dequantized (h still read by the wgmma)
             if (lane == 0) mbar_arrive(&empty[l % NST]);
         }
-        DIAG2(c2_dq, tc); DIAGW(w_dq);
         wg::wait<0>();
         fence_operand(S); fence_operand_a(A[0]); fence_operand_a(A[1]);
-        DIAG2(c2_mw, tc);
         retire(std::integral_constant<int, 0>{}, l);
-        DIAG2(c2_rt, tc); DIAGW0();
         issue_kb(A[1], stage, 1);
-        DIAG2(c2_is, tc); DIAGW(w_is);
-        if (lane == 0 && wq == 0 && rh == 0) STRACE2(P, l, 6);
-        if (l < 4 && lane == 0 && wq == 0 && rh == 0) STRACE0(P, 41 + 4 * l);
         if constexpr (FMOE_FC2_EARLY_RELEASE && EXACT_M == 32 && FMOE_CS_PERM && (FMOE_S_ABL & 32) == 0) {
             // release the stage as soon as its k-block-1 group completed (the scales live outside the stage): the slot goes back
             // to the producer one dequant earlier than the retire-time arrive; costs the overlap of the next k-block-0 dequant
@@ -6042,7 +5089,6 @@ __device__ __forceinline__ void fc2_consumer(const Params& P, unsigned epoch, ui
             wg::wait<0>();
             fence_operand(S); fence_operand_a(A[0]); fence_operand_a(A[1]);
             if (lane == 0) mbar_arrive(&empty[l % NST]);
-            if (lane == 0 && wq == 0 && rh == 0) STRACE2(P, l, 4);
         }
         }
     };
@@ -6147,7 +5193,6 @@ __device__ __forceinline__ void fc2_consumer(const Params& P, unsigned epoch, ui
         // wgmma descriptors in the uniform datapath (no R2UR pair in front of every QGMMA)
         const int par_u = (FMOE_C_UNI && EXACT_M == 32) ? (int)__reduce_or_sync(0xffffffffu, (unsigned)par) : par;
         int l0 = par_u;
-        if (tid == 0) STRACE0(P, 59);
         if (gp2 && (int)blockIdx.x >= 96 && par_u == 1) {
             const int l1 = 2 * misc[GP2_MISC + 2];
             if (l0 < l1) {
@@ -6170,7 +5215,6 @@ __device__ __forceinline__ void fc2_consumer(const Params& P, unsigned epoch, ui
             for (int i = 0; i < NR; ++i) D[i] = 0.f;
             l0 = l1 + 1;
         }
-        if (tid == 0) STRACE0(P, 33);   // FMOE_S_TRACE: fc2_consumer setup done (pair 0)
 #if FMOE_S_WARM & 2
         constexpr bool S_DRY = EXACT_M == 32 && PARTS == 2 && fc2_prefill<EXACT_M, PARTS>() && NA == 2;
 #else
@@ -6289,20 +5333,7 @@ __device__ __forceinline__ void fc2_consumer(const Params& P, unsigned epoch, ui
             }
         }
     }
-    if (tid == 0) { STAMP(P, 2); STRACE0(P, 29); }   // fc2 compute done, including any helper partial (FMOE_S_TRACE: clock twin in 29)
-#ifdef FMOE_DIAG
-    if (tid == 0 && P.dbg) {   // FC2 pair-0 phase cycles (DIAG build only; overwrites the TP diag stamps 25..27)
-        P.dbg[blockIdx.x * NSTAMP + 25] = (unsigned long long)(unsigned)c2_wait | ((unsigned long long)(unsigned)c2_dq << 32);
-        P.dbg[blockIdx.x * NSTAMP + 26] = (unsigned long long)(unsigned)c2_mw | ((unsigned long long)(unsigned)c2_rt << 32);
-        P.dbg[blockIdx.x * NSTAMP + 27] = (unsigned long long)(unsigned)c2_is | ((unsigned long long)(unsigned)c2_n << 32);
-    }
-#ifdef FMOE_DIAG_SKEW
-    if (lane == 0 && warp < 4 && P.dbg) P.dbg[blockIdx.x * NSTAMP + 16 + warp] = (unsigned long long)(unsigned)w_dq | ((unsigned long long)(unsigned)w_is << 32);   // WG 0, per warp
-#endif
-#undef DIAG2
-#undef DIAGW
-#undef DIAGW0
-#endif
+    if (tid == 0) STAMP(P, 2);   // fc2 compute done, including any helper partial
     if constexpr (FMOE_LATE_TRIGGER) griddep_launch_dependents();   // late PDL trigger for the next layer's norm kernel
 
     // M32 must not round local TP partials to BF16: the captured layer2
@@ -6351,18 +5382,9 @@ __device__ __forceinline__ void fc2_consumer(const Params& P, unsigned epoch, ui
                 const uint4* rs_me = tp_rs<TP>(P, P.my_rank);
                 auto reduce_batch = [&](int base, int tok, int j,
                                         float& a0, float& a1, float& a2, float& a3
-#if FMOE_TAIL_WARM
-                                        , bool dry
-#endif
                                         ) {
                     uint4 m[8];
-#if FMOE_TAIL_WARM
-#pragma unroll
-                    for (int d = 0; d < 8; ++d) m[d] = make_uint4(0u, 0u, 0u, 0u);
-                    unsigned pending = dry ? 0u : 0xffu;
-#else
                     unsigned pending = 0xffu;
-#endif
                     do {
 #pragma unroll
                         for (int d = 0; d < 8; ++d)
@@ -6375,9 +5397,6 @@ __device__ __forceinline__ void fc2_consumer(const Params& P, unsigned epoch, ui
                         for (int d = 0; d < 8; ++d)
                             if ((pending & (1u << d)) && m[d].w == epoch) pending &= ~(1u << d);
                         if constexpr (FMOE_TAIL_POLL_NS > 0) { if (pending) __nanosleep(FMOE_TAIL_POLL_NS); }
-#if FMOE_RT_AB
-                        if (pending && (P.ab & 3)) __nanosleep(32u << (P.ab & 3));
-#endif
                     } while (pending);
 #pragma unroll
                     for (int d = 0; d < 8; ++d) {
@@ -6389,13 +5408,6 @@ __device__ __forceinline__ void fc2_consumer(const Params& P, unsigned epoch, ui
                 };
                 if (tid == 0) DSTAMP(d22);   // comm diag: reducer poll starts
                 for (unsigned i = wire_tid; i < TPS * BMSG; i += NCONS) {
-#if FMOE_TAIL_WARM
-                  static_assert(FMOE_TAIL_POLL16, "FMOE_TAIL_WARM: two-half poll only");
-#pragma unroll 1
-                  for (int pass = EXACT_M == 32 ? (int)(epoch == 0u) : 1; pass < 2; ++pass) {   // pass 0 = dry (runtime start value: never peeled; M32 only)
-                    const bool dry = pass == 0;
-                    if (tid == 0 && !dry) DSTAMP(d24);   // comm diag: real poll starts (after the dry pass)
-#endif
                     const unsigned tok = t0 + i / BMSG, j = i - (i / BMSG) * BMSG;
                     float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
                     if constexpr (FMOE_TAIL_POLL16 && EXACT_M == 32) {
@@ -6405,29 +5417,16 @@ __device__ __forceinline__ void fc2_consumer(const Params& P, unsigned epoch, ui
                         // the dead FC2 ring; after one named barrier thread i adds them in order: ((0 + m0) + ... + m7) + m8 + ... + m15,
                         // exactly the original sequence -> bitwise identical. One poll round trip instead of two.
                         static_assert(TPS * BMSG == 64 && NCONS >= 128, "two halves of 64 threads");
-#if FMOE_TAIL_WARM
-                        reduce_batch(0, tok, j, a0, a1, a2, a3, dry);
-#else
                         reduce_batch(0, tok, j, a0, a1, a2, a3);
-#endif
-#if FMOE_TAIL_HS_T
                         const float4* hs = reinterpret_cast<const float4*>(smem + OFF_TP_HALF) + i;   // sources 8..15 of this (tok, j), stride 64
-#else
-                        const float4* hs = reinterpret_cast<const float4*>(smem + OFF_TP_HALF) + (size_t)i * 8;   // sources 8..15 of this (tok, j)
-#endif
                         named_bar_sync(6, 128);
                         if (tid == 0) { DCLOCK(k0); DSTAMP(d21); }   // comm diag: all 16 sources of this CTA's 64 (tok, j) seen (barrier 6 = the 128 pollers)
 #pragma unroll
-                        for (int d = 0; d < 8; ++d) { const float4 v = hs[FMOE_TAIL_HS_T ? 64 * d : d]; a0 += v.x; a1 += v.y; a2 += v.z; a3 += v.w; }
+                        for (int d = 0; d < 8; ++d) { const float4 v = hs[64 * d]; a0 += v.x; a1 += v.y; a2 += v.z; a3 += v.w; }
                         if (tid == 0) DCLOCK(k1);
                     } else {
-#if FMOE_TAIL_WARM
-                        reduce_batch(0, tok, j, a0, a1, a2, a3, false);
-                        reduce_batch(8, tok, j, a0, a1, a2, a3, false);
-#else
                         reduce_batch(0, tok, j, a0, a1, a2, a3);
                         reduce_batch(8, tok, j, a0, a1, a2, a3);
-#endif
                     }
                     if constexpr (EXACT_M == 32) {
                         static_assert(NT == 32 && TPS == 2 && BMSG == 32);
@@ -6446,19 +5445,11 @@ __device__ __forceinline__ void fc2_consumer(const Params& P, unsigned epoch, ui
                             const uint32_t x = (j & 1) ? ah : al;
                             const uint32_t y = j == AG_BMSG - 1 ? 0u : ((j & 1) ? bl : ah);
                             const uint32_t z = j == AG_BMSG - 1 ? 0u : ((j & 1) ? bh : bl);
-#if FMOE_TAIL_WARM
-                            const uint4 mo = make_uint4(x, y, z, dry ? 0u : epoch);   // dry: tag 0 to this rank's own slot (never accepted)
-                            if (tid == 0) DSTAMP(d23);   // comm diag: reduced + packed, AG stores about to issue
-                            for (int d = 0; d < 8; ++d)
-                                st_ll(tp_ag<TP>(P, dry ? P.my_rank : d) + ((size_t)rtile * NT + tok) * MSG_PER_TOK + j, mo);
-                            if (tid == 0) DCLOCK(k4);
-#else
                             const uint4 mo = make_uint4(x, y, z, epoch);
                             if (tid == 0) DSTAMP(d23);   // comm diag: reduced + packed, AG stores about to issue
                             for (int d = 0; d < 8; ++d)
                                 st_ll(tp_ag<TP>(P, d) + ((size_t)rtile * NT + tok) * MSG_PER_TOK + j, mo);
                             if (tid == 0) DCLOCK(k4);
-#endif
                         }
                     } else {
                         const uint4 mo = make_uint4(pack_bf16x2_rn(a0, a1), pack_bf16x2_rn(a2, a3),
@@ -6466,26 +5457,12 @@ __device__ __forceinline__ void fc2_consumer(const Params& P, unsigned epoch, ui
                         for (int d = 0; d < 8; ++d)
                             st_ll(tp_ag<TP>(P, d) + ((size_t)rtile * NT + tok) * MSG_PER_TOK + j, mo);
                     }
-#if FMOE_TAIL_WARM
-                  }
-#endif
                 }
                 if constexpr (FMOE_TAIL_POLL16 && EXACT_M == 32) {   // partner half: poll + decode sources 8..15, hand over through smem
                     if (wire_tid >= 64 && wire_tid < 128) {
-#if FMOE_TAIL_WARM
-#pragma unroll 1
-                      for (int pass = (int)(epoch == 0u); pass < 2; ++pass) {   // dry pass first (see FMOE_TAIL_WARM)
-                        const bool dry = pass == 0;
-                        const unsigned i = wire_tid - 64, tok = t0 + i / BMSG, j = i - (i / BMSG) * BMSG;
-                        uint4 m[8];
-#pragma unroll
-                        for (int d = 0; d < 8; ++d) m[d] = make_uint4(0u, 0u, 0u, 0u);
-                        unsigned pending = dry ? 0u : 0xffu;
-#else
                         const unsigned i = wire_tid - 64, tok = t0 + i / BMSG, j = i - (i / BMSG) * BMSG;
                         uint4 m[8];
                         unsigned pending = 0xffu;
-#endif
                         do {
 #pragma unroll
                             for (int d = 0; d < 8; ++d)
@@ -6497,33 +5474,23 @@ __device__ __forceinline__ void fc2_consumer(const Params& P, unsigned epoch, ui
                             for (int d = 0; d < 8; ++d)
                                 if ((pending & (1u << d)) && m[d].w == epoch) pending &= ~(1u << d);
                             if constexpr (FMOE_TAIL_POLL_NS > 0) { if (pending) __nanosleep(FMOE_TAIL_POLL_NS); }
-#if FMOE_RT_AB
-                            if (pending && (P.ab & 3)) __nanosleep(32u << (P.ab & 3));
-#endif
                         } while (pending);
-#if FMOE_TAIL_HS_T
                         float4* hs = reinterpret_cast<float4*>(smem + OFF_TP_HALF) + i;
-#else
-                        float4* hs = reinterpret_cast<float4*>(smem + OFF_TP_HALF) + (size_t)i * 8;
-#endif
 #pragma unroll
                         for (int d = 0; d < 8; ++d)
-                            hs[FMOE_TAIL_HS_T ? 64 * d : d] = make_float4(__uint_as_float(m[d].x << 8), __uint_as_float(((m[d].x >> 16) | (m[d].y << 16)) & 0xffffff00u),
+                            hs[64 * d] = make_float4(__uint_as_float(m[d].x << 8), __uint_as_float(((m[d].x >> 16) | (m[d].y << 16)) & 0xffffff00u),
                                                 __uint_as_float(((m[d].y >> 8) | (m[d].z << 24)) & 0xffffff00u), __uint_as_float(m[d].z & 0xffffff00u));
                         named_bar_sync(6, 128);
                         // trigger 2: all 16 sources of this CTA's owned (tile, tokens) landed = every rank's FC2 for that tile is done;
                         // the partner half has nothing left but the pull -> its first thread issues the share.
                         if constexpr (FMOE_TAIL_PREFETCH == 2) { if (wire_tid == 64) tail_prefetch_share(P, (int)blockIdx.x, N_FC2_TILES * PARTS); }
-#if FMOE_TAIL_WARM
-                      }
-#endif
                     }
                 }
             }
             if (tid == 0) {
                 STAMP(P, 4);
                 DSTAMP_PUT(P, 3, d3);
-                if constexpr (!FMOE_STAMP_PRO) { DSTAMP_PUT(P, 25, d25); DSTAMP_PUT(P, 22, d22); DSTAMP_PUT(P, 24, d24); DSTAMP_PUT(P, 21, d21); DSTAMP_PUT(P, 23, d23); }
+                DSTAMP_PUT(P, 25, d25); DSTAMP_PUT(P, 22, d22); DSTAMP_PUT(P, 24, d24); DSTAMP_PUT(P, 21, d21); DSTAMP_PUT(P, 23, d23);
                 // (clock sub-stamps k0..k4 are kept in registers only; dump them to free slots when needed -- 16..19 are the prologue's)
             }
             if (!NN || !P.norm_next) {   // FMOE_NORM_NEXT: with the row stage on, the row CTAs write `out` (and residual_new / x_fp8 / scales)
@@ -6748,77 +5715,11 @@ __device__ __forceinline__ void fc2_consumer(const Params& P, unsigned epoch, ui
 template <int N> __device__ __forceinline__ void setmaxnreg_inc() { asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" :: "n"(N)); }
 template <int N> __device__ __forceinline__ void setmaxnreg_dec() { asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" :: "n"(N)); }
 
-#ifndef LAYER_DBG_STUB
-#define LAYER_DBG_STUB 0                 // compile-only bisection of the layer kernel's register allocation (bits: 1 no mega math, 2 no mega,
-#endif                                   // 4 no early reduce, 8 no phase 1, 16 keep the body's token reduce, 32 no setmaxnreg); 0 = production
-#ifdef FMOE_LAYER_FUSED
-// goal11 layer: phase 1 of the one-kernel SWA layer fused_moe_kernel<32, 2, 32, true, WINDOW> (layer_fused.cu; 132 CTAs as 66 cluster pairs,
-// blk::MG_SMEM_ALLOC): the attention megakernel (blk::mega_body, FUSED) on warps 0..10 of CTAs 0..127 -- the 8 math warps at
-// LAYER_MATH_REGS (mega needs 142), the producers at LAYER_SIDE_REGS -- while warps 12..19 of the token CTAs 0..31 run this CTA's MoE input
-// reduce-scatter reduce + all-gather push (tp_reduce_token<true>) as soon as the CTA's own attention pushes are issued: the MoE entry code
-// overlaps the last messages' flight instead of following a kernel boundary (in situ: last message -> RS landed 6.1 us, entry code 3.1 of
-// it). Every other warp mirrors the megakernel's two cluster syncs. Then every warpgroup returns to 96 registers for the MoE body.
-constexpr int LAYER_MATH_REGS = 144, LAYER_SIDE_REGS = 64;
-static_assert(2 * 128 * LAYER_MATH_REGS + 3 * 128 * LAYER_SIDE_REGS <= 96 * NTHREADS && NTHREADS == 640, "layer register phases fit the CTA pool");
-#ifndef LAYER_PHASE1_NOINLINE
-#define LAYER_PHASE1_NOINLINE 0          // 1: phase 1 as a separate (non-inlined) function: isolates the MoE body's register allocation, but the
-#endif                                   //    megakernel then reads its params through generic loads and ptxas serializes its wgmma (C7520): lab +9 us
-                                         //    per layer vs +6.3 inlined (both net losses, see GOAL11_LAYER_NOTES.md)
-template <int WINDOW>
-#if LAYER_PHASE1_NOINLINE
-__device__ __noinline__
-#else
-__device__ __forceinline__
-#endif
-void layer_phase1(const Params& P, uint8_t* smem) {
-    // volatile special-register reads: a plain threadIdx / blockIdx read here would dominate (and be reused by) every read in the MoE
-    // body, keeping those values live across the whole attention phase (ptxas then spilled them in the MoE body: 101 STL / LDL)
-    unsigned tx_, bx_;
-    asm volatile("mov.u32 %0, %%tid.x;" : "=r"(tx_));
-    asm volatile("mov.u32 %0, %%ctaid.x;" : "=r"(bx_));
-    const int warp = (int)tx_ >> 5, b = (int)bx_;
-    if (warp < 8) {
-        if constexpr (!(LAYER_DBG_STUB & 32)) setmaxnreg_inc<LAYER_MATH_REGS>();
-        if (b < blk::NCTA && !(LAYER_DBG_STUB & 3)) blk::mega_body<WINDOW, true, 1>(P.mg, smem);
-        else { blk::cluster_sync_relaxed(); blk::cluster_sync_relaxed(); }
-        if constexpr (!(LAYER_DBG_STUB & 32)) setmaxnreg_dec<96>();
-    } else {
-        if constexpr (!(LAYER_DBG_STUB & 32)) setmaxnreg_dec<LAYER_SIDE_REGS>();
-        if (b < blk::NCTA && warp < blk::MG_NTHREADS / 32 && !(LAYER_DBG_STUB & 2)) {
-            blk::mega_body<WINDOW, true, 2>(P.mg, smem);
-        } else {
-            blk::cluster_sync_relaxed();                                              // the megakernel's barrier-init sync
-            if (b < blk::LAYER_TOKC && (int)tx_ >= LAYER_EARLY_T0 && !(LAYER_DBG_STUB & 4)) {
-                asm volatile("griddepcontrol.wait;" ::: "memory");                    // the previous layer's residual / epoch counter
-                const unsigned epoch = (FMOE_TP_EPOCH_HINT ? (unsigned)ld_evict_last_s32(&P.work[2]) : (unsigned)__ldg(&P.work[2])) + 1u;
-                named_bar_sync(blk::LAYER_PUSH_BAR, 2 * blk::NMATH);                   // this CTA's attention pushes issued
-                asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory"); // the end sync: waited for inside, before smem is written
-                tp_reduce_token<true>(P, epoch, P.my_rank + TP_NDEV * (b >> 3), b & 7, smem);
-            } else {
-                blk::cluster_sync_relaxed();                                          // the megakernel's end sync
-            }
-        }
-        if constexpr (!(LAYER_DBG_STUB & 32)) setmaxnreg_inc<96>();
-    }
-}
-#endif
 
-// LAYER (goal11 layer, layer_fused.cu builds only): 0 = the MoE kernel; 128 / 129 = the one-kernel SWA layer (attention megakernel of that
-// window as phase 1, see layer_phase1). Production instantiations keep LAYER = 0 (SASS unchanged).
+// LAYER: always 0 (kept because it is part of the kernels' mangled names).
 template <int NT, int PARTS, int EXACT_M = 0, bool INPUT_TP = false, int LAYER = 0>
 __global__ void __launch_bounds__(NTHREADS, 1) fused_moe_kernel(const __grid_constant__ Params P) {   // grid_constant: the router TMA maps live in the parameter
     extern __shared__ uint8_t smem_raw[];
-#ifdef FMOE_LAYER_FUSED
-    if constexpr (LAYER != 0) {   // phase 1 computes its own shared-memory base: no value lives across it into the MoE body
-        if (!(LAYER_DBG_STUB & 8)) {
-            const uint32_t r1_ = smem_u32(smem_raw);
-            layer_phase1<LAYER>(P, smem_raw + (((r1_ + 1023u) & ~1023u) - r1_));
-        }
-        // every thread: the previous kernel's outputs (residual, epoch counter, ...) are only guaranteed visible after griddepcontrol.wait
-        // (the layer kernel is PDL-launched; in phase 1 only the megakernel's producers and the token-reduce warps waited; CTAs 128..131 none)
-        asm volatile("griddepcontrol.wait;" ::: "memory");
-    }
-#endif
     const uint32_t raw_u32 = smem_u32(smem_raw);
     uint8_t* smem = smem_raw + (((raw_u32 + 1023u) & ~1023u) - raw_u32);
     uint64_t* full = reinterpret_cast<uint64_t*>(smem + OFF_BAR);
@@ -6829,7 +5730,6 @@ __global__ void __launch_bounds__(NTHREADS, 1) fused_moe_kernel(const __grid_con
     int* s_misc = p_tok + 64;
     if constexpr (fc2_prefill<EXACT_M, PARTS>() && FMOE_FC2_PREFILL_NOTAIL_DELAY_NS > 0) { if (threadIdx.x == 0) s_misc[63] = (int)gtimer32(); }   // CTA start for the FC2 producers' early-leaver test
     if constexpr (INPUT_TP) {   // the reduce-scatter pushes leave before anything else (no smem needed)
-        if (threadIdx.x == 0 && blockIdx.x < 32) LCLK(P, 12);   // FMOE_L_DIAG: token CTA entry (clock)
         if (threadIdx.x == 0) STAMP(P, 27);   // TP diag: kernel entry, BEFORE the epoch read + RS push (stamp 0 follows the barrier init: use --t0 27 for absolute times)
 #if FMOE_BLK_PREPUSH
         if (!P.rs_prepushed)
@@ -6873,13 +5773,11 @@ __global__ void __launch_bounds__(NTHREADS, 1) fused_moe_kernel(const __grid_con
         if (tid == 42) reinterpret_cast<int*>(smem + OFF_TOK)[3 * 64 + S_WARM_MISC + 7] = 0;
     }
     if (PREFILL_FC2 ? tid < (FMOE_S_XT ? 42 : 40) : tid == 0) asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-    if (tid == 0 && blockIdx.x < 32) LCLK(P, 26);   // FMOE_L_DIAG: thread 0 reaches the barrier-init __syncthreads
     __syncthreads();
-    if (tid == 0) { STAMP(P, 0); STRACE0(P, 28); }   // CTA start (FMOE_S_TRACE: clock64 twin of stamp 0 in slot 28)
+    if (tid == 0) STAMP(P, 0);   // CTA start
 #if FMOE_PDL_ENTRY == 1
     if constexpr (INPUT_TP && LAYER == 0) asm volatile("griddepcontrol.wait;" ::: "memory");   // PDL-launched: the attention kernel's outputs
 #endif
-    if (tid == 0 && blockIdx.x < 32) LCLK(P, 20);   // FMOE_L_DIAG: clock twin of stamp 0
     // Epoch tag for this launch: device counter (work[2]) + 1, bumped by the last CTA out, so graph
     // replays get a fresh tag with no host involvement (all ranks launch the same number of times).
     const unsigned epoch = (INPUT_TP && FMOE_TP_EPOCH_HINT) ? (unsigned)ld_evict_last_s32(&P.work[2]) + 1u : (unsigned)__ldg(&P.work[2]) + 1u;
@@ -6916,15 +5814,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) fused_moe_kernel(const __grid_con
         const bool owner = ROUTER_TOKENS && b < M && (b % TP_NDEV) == P.my_rank;
         const bool spare = ROUTER_TOKENS && b >= M && b < M + TP_TOK_PER_RANK;
         const int t1 = spare ? P.my_rank + TP_NDEV * (b - M) : b;   // token whose stage 1 this CTA runs
-#if FMOE_TP_LIN
-        static_assert(FMOE_TP_ROUTER_TOKENS && FMOE_TP_OWNER_REDUCE && !FMOE_TP_ROUTER_RS && !FMOE_TP_RT_WARM && FMOE_ROUTER_BF16, "LIN: design-B owner-reduce prologue");
-#endif
-#if FMOE_TP_LIN == 1
-        if (router) lin_issue_loads(P, smem, kg, rg);   // LIN: everything the router needs is local at kernel entry
-        if (false) {
-#else
         if (router) {   // input-independent loads at kernel start
-#endif
             if constexpr (ROUTER_TOKENS) issue_slice_loads_tp4(P, smem, kg); else issue_slice_loads_tp(P, smem, kg, NT, M);
             if constexpr (ROUTER_TOKENS && FMOE_TP_OWNER_REDUCE) {
                 // Only the producer warpgroup waits out the delay and issues the weight tile (24 cp.asyncs per thread); the 16 consumer warps
@@ -6952,49 +5842,13 @@ __global__ void __launch_bounds__(NTHREADS, 1) fused_moe_kernel(const __grid_con
         }
         if (FMOE_PROLOGUE_TIGHT && owner) stage3_prefetch_bias(P, smem);   // its smem slot is disjoint from the reduce staging; published by the barriers below
         if (b < M) {   // reduce-scatter: owner-reduce -> (owned token r + 8 (b / 8), slice b % 8); else (token b, slice r); then the all-gather push
-#if FMOE_TP_RED_WARM
-            static_assert(FMOE_TP_OWNER_REDUCE, "RED_WARM: owner-reduce mapping");
-#pragma unroll 1
-            for (int pass = (int)(epoch == 0u); pass < 2; ++pass) {   // pass 0 = dry (runtime start value: the loop is never peeled)
-                tp_reduce_token(P, epoch, P.my_rank + TP_NDEV * (b >> 3), b & 7, smem, pass == 0);
-                if (pass == 0) __syncthreads();
-            }
-#else
-            if constexpr (LAYER != 0 && !(LAYER_DBG_STUB & 16)) {}   // goal11 layer: done by the layer kernel's warps 12..19 during the attention phase
-            else if constexpr (FMOE_TP_OWNER_REDUCE) tp_reduce_token(P, epoch, P.my_rank + TP_NDEV * (b >> 3), b & 7, smem);
+            if constexpr (FMOE_TP_OWNER_REDUCE) tp_reduce_token(P, epoch, P.my_rank + TP_NDEV * (b >> 3), b & 7, smem);
             else tp_reduce_token(P, epoch, b, P.my_rank, smem);
-#endif
         }
         if ((b < M && !owner) || spare) stage1_token_tp(P, epoch, t1, smem);   // stage 1 on the gathered row
         if (tid == 0) STAMP(P, 6);
         if (router) {
             if constexpr (ROUTER_TOKENS) {
-#if FMOE_TP_LIN == 1
-                lin_router_unit(P, epoch, smem, kg, rg);   // unit math + local k-group reduction + push to the token owners
-#elif FMOE_TP_LIN == 2
-                lin_rs_gather(P, epoch, smem, kg);         // B planes straight from the reduce-scatter messages (fp32 sum, x w, hi + lo)
-                if (tid == 0) STAMP(P, 14);                // router: B planes built
-                cp_async_wait_all();                       // weight tile landed (producer warpgroup)
-                __syncthreads();
-                if (tid == 0) STAMP(P, 19);                // router: W tile landed
-                router_compute<8, EXACT_M, false, true>(P, epoch, smem, unit, TP_TOK_PER_RANK);   // pre-rstd partial logits -> local RPART
-#elif FMOE_TP_RT_WARM
-                static_assert(!FMOE_TP_ROUTER_RS, "RT_WARM: local-AG router gather only");
-#pragma unroll 1
-                for (int pass = (int)(epoch == 0u); pass < 2; ++pass) {   // pass 0 = dry (runtime start value: the loop is never peeled)
-                const bool dry = pass == 0;
-                router_gather_tp4(P, epoch, smem, kg, dry);
-                if (tid == 0) STAMP(P, 14);                // router: slice + rstd known
-                if (!dry) cp_async_wait_all();             // residual slices, norm-w slice, weight tile landed
-                __syncthreads();
-                if (tid == 0) STAMP(P, 19);                // router: W / residual / norm-w tiles landed (cp.async drained)
-                router_normalize(P, smem, 8, TP_TOK_PER_RANK);
-                __syncthreads();                           // normalized B tile visible to every warpgroup
-                if (tid == 0) STAMP(P, 12);
-                router_compute<8, EXACT_M>(P, epoch, smem, unit, TP_TOK_PER_RANK, dry);
-                if (dry) __syncthreads();
-                }
-#else
                 if constexpr (FMOE_TP_ROUTER_RS) router_gather_rs_tp4(P, epoch, smem, kg);   // reduce the k-group from the RS messages, exchange p locally
                 else router_gather_tp4(P, epoch, smem, kg);     // the 4 owned tokens' k-group slice (local AG messages) -> B tile rows 0..3; p messages -> rstd
                 if (tid == 0) STAMP(P, 14);                // router: slice + rstd known
@@ -7005,7 +5859,6 @@ __global__ void __launch_bounds__(NTHREADS, 1) fused_moe_kernel(const __grid_con
                 __syncthreads();                           // normalized B tile visible to every warpgroup
                 if (tid == 0) STAMP(P, 12);
                 router_compute<8, EXACT_M>(P, epoch, smem, unit, TP_TOK_PER_RANK);   // partial logits of rows 0..3 -> the LOCAL RPART rows (stage 3 reads row t / 8)
-#endif
                 if constexpr (FMOE_TP_FC1_PREFETCH_KT > 0) {   // HBM is idle from here until the first FC1 tiles: warm L2 with k-tiles 0..N-1 of experts u0 + 96 j
                     if (warp == PROD_WARP + 3 && (tid & 31) == 0)
                         for (int kt = 0; kt < FMOE_TP_FC1_PREFETCH_KT; ++kt)
@@ -7046,30 +5899,12 @@ __global__ void __launch_bounds__(NTHREADS, 1) fused_moe_kernel(const __grid_con
             __syncthreads();
             if (tid == 0) STAMP(P, 26);   // TP diag: owner CTA enters stage 3 (after the fence + barrier)
             if constexpr (FMOE_TP_S3_DRY) { stage3_token<true, true, true>(P, epoch, smem, b, NRG_MAX); __syncthreads(); }   // warm-up pass, no gather / publish
-#if FMOE_TP_S3_WARM
-            static_assert(!FMOE_TP_S3_NOINLINE && !FMOE_TP_S3_DRY, "one warm-up mechanism");
-#pragma unroll 1
-            for (int pass = (int)(epoch == 0u); pass < 2; ++pass) {   // pass 0 = dry (runtime start value: the loop is never peeled)
-                stage3_token<true, true>(P, epoch, smem, b, NRG_MAX, pass == 0);
-                if (pass == 0) __syncthreads();
-            }
-#else
             if constexpr (FMOE_TP_S3_NOINLINE) stage3_token_tp_call(P, epoch, smem, b, NRG_MAX);
             else stage3_token<true, true>(P, epoch, smem, b, NRG_MAX);
-#endif
         }
         if (tid == 0) STAMP(P, 8);
         __syncthreads();
-#if FMOE_TP_S4_WARM
-        static_assert(FMOE_TP_S4_FOLD && FMOE_XFLAG_ACQUIRE && FMOE_TP_S4_BACKOFF_NS == 0, "S4_WARM: folded stage 4 path only");
-#pragma unroll 1
-        for (int pass = (b < M && (b % TP_NDEV) == P.my_rank) ? 1 : (int)(epoch == 0u); pass < 2; ++pass) {   // owners: real pass only
-            stage4_build_tables<EXACT_M, PARTS, true>(P, epoch, smem, s_union, s_mask, s_slot, s_tkw, s_misc, M, pass == 0);
-            if (pass == 0) __syncthreads();
-        }
-#else
         stage4_build_tables<EXACT_M, PARTS, true>(P, epoch, smem, s_union, s_mask, s_slot, s_tkw, s_misc, M);
-#endif
     } else if (!P.pre_routed) {
         const int grid = exact_shape ? 132 : (int)gridDim.x, b = (int)blockIdx.x;
         const int n_rg = (P.n_exp + RROWS - 1) / RROWS, n_units = RKG * n_rg;
@@ -7162,7 +5997,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) fused_moe_kernel(const __grid_con
     // async-proxy TMA writes of the early tiles here, instead of one thread fencing on the issue chain after the task table.
     if constexpr (FMOE_EARLY_FENCE_HOIST && FMOE_EARLY_FIRST_TILE > 0) fence_proxy_async_smem();
     if (tid == 0) STAMP(P, 9);   // routing tables ready: fc1 starts
-    static_assert(!(INPUT_TP && FMOE_TP_TASK_NOINIT) || (FMOE_TASK_TABLE_FUSED && !FMOE_ONEWAVE_KSPLIT && !FMOE_MIXED_WIDTH), "TP task-table init moved into the folded stage 4");
+    static_assert(!(INPUT_TP && FMOE_TP_TASK_NOINIT) || !FMOE_ONEWAVE_KSPLIT, "TP task-table init moved into the folded stage 4");
     build_m32_token_tasks<EXACT_M, PARTS, INPUT_TP && FMOE_TP_S4_FOLD>(P, smem, s_misc);
     if (tid == 0) STAMP(P, 13);   // phase build: task table built (router-internal stamp 13 repurposed)
     constexpr bool PRE_SPLIT = FMOE_EARLY_PRE_SPLIT || (INPUT_TP && FMOE_TP_EARLY_PRE_SPLIT);
@@ -7192,7 +6027,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) fused_moe_kernel(const __grid_con
         // Exact M64 FC1 uses N16, so give its gather producer64 registers.
         // FC2 retains the original112/32 budget after the full-CTA join.
         setmaxnreg_dec<EXACT_M == 64 ? 64 : RegSplit<NT>::producer>();
-        if (tid == PROD_WARP * 32) LSTAMP(P, 18);   // phase build: producer warps past the register split
+        if (tid == PROD_WARP * 32) STAMP(P, 18);   // phase build: producer warps past the register split
         if constexpr (PREFILL_FC2) {   // idle warp 19 builds the joint FC2 plan during FC1; fc1_producer's barrier 3 publishes it
             if (warp == PROD_WARP + 3 && (tid & 31) == 0) build_m32_joint_plan<EXACT_M, PARTS, true>(s_misc);
         }
@@ -7239,7 +6074,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) fused_moe_kernel(const __grid_con
         }
     } else {
         setmaxnreg_inc<EXACT_M == 64 ? 104 : RegSplit<NT>::consumer>();
-        if (tid == 0) LSTAMP(P, 17);   // phase build: consumer warps past the register split
+        if (tid == 0) STAMP(P, 17);   // phase build: consumer warps past the register split
         if constexpr (EXACT_M == 32 && PARTS == 2) {
             if (wide_m32_fc1) fc1_consumer<16, PARTS, true, EXACT_M>(P, epoch, smem, full, empty, s_tok, s_inv, s_misc, xp_s, hst, M, M_pad);
             else if (m32_token_tasks<EXACT_M, PARTS>(P, s_misc))
@@ -7259,8 +6094,6 @@ __global__ void __launch_bounds__(NTHREADS, 1) fused_moe_kernel(const __grid_con
             if constexpr (FMOE_S_XT) { if (tid == 0) mbar_arrive(reinterpret_cast<uint64_t*>(smem + OFF_XT)); }   // FMOE_S_XT: HST / xp_s dead
         }
         else named_bar_sync(0, NTHREADS);
-        if (tid == 0) STRACE0(P, 31);   // FMOE_S_TRACE: consumers joined after FC1
-        if (tid == 0) STRACE0B(P, 54, smem + OFF_TOK);   // FMOE_S_TRACE: ... join barrier completed
         if (run_fc2) {
             if constexpr (EXACT_M == 64) {
                 static_assert(104 * NCONS + 64 * 128 == 96 * NTHREADS &&
@@ -7285,8 +6118,6 @@ __global__ void __launch_bounds__(NTHREADS, 1) fused_moe_kernel(const __grid_con
             }
             }   // !FMOE_S_XT
             if constexpr (PREFILL_FC2) named_bar_sync(CONS_JOIN_BAR, NCONS); else named_bar_sync(0, NTHREADS);
-            if (tid == 0) STRACE0(P, 32);   // FMOE_S_TRACE: FC2 barriers re-initialised, entering fc2_consumer
-            if (tid == 0) STRACE0B(P, 55, smem + OFF_TOK);   // FMOE_S_TRACE: ... that barrier completed
             fc2_consumer<NT, PARTS, EXACT_M, INPUT_TP, INPUT_TP && FMOE_NORM_NEXT>(P, epoch, smem, full2, empty2, reinterpret_cast<float*>(smem + Fc2Geom<NT, EXACT_M>::OUTS), M);
             if constexpr (EXACT_M == 32 && PARTS == 2)
                 named_bar_sync(0, NTHREADS);
@@ -7425,9 +6256,6 @@ static void fill_common_and_launch(Params& P, int M,
     TORCH_CHECK(N_FC2_TILES % ndev == 0, "ndev must divide 48");
     int M_pad = (M + 7) & ~7;
     if (M_pad == 56) M_pad = 64;   // the NT=56 instantiation spills inside the fc1 loop at the 96-register cap; NT=64 does not
-#ifdef FMOE_DIAG
-    if (mode & 256) M_pad = 32;    // diagnostics: run the NT=32 instantiation on larger M (fc1 timing only; h of tokens >= 32 is dropped)
-#endif
     P.M = M; P.M_pad = M_pad;
     if (FMOE_ROUTER_TMA && !P.pre_routed) {
         // Router prologue maps, encoded per launch into the kernel parameter: 3-D {64 bf16 (one 128-B k64 column), rows, 96 columns}
@@ -7462,11 +6290,7 @@ static void fill_common_and_launch(Params& P, int M,
     g_pdl_entry = (mode >> 29) & 1;   // FMOE_PDL_ENTRY: launch with programmatic stream serialization (host-only, not a kernel param)
     mode &= ~(int64_t(1) << 29);
     TORCH_CHECK(!g_pdl_entry || (FMOE_PDL_ENTRY != 0 && P.rs_prepushed), "PDL entry (mode bit 29) needs a FMOE_PDL_ENTRY build and a prepushed launch");
-#if FMOE_RT_AB
-    P.mode = (int)(mode & 0xffff); P.ab = (int)(mode >> 16);
-#else
     P.mode = (int)mode;
-#endif
     P.work = work.data_ptr<int>();
     TORCH_CHECK(parts >= 1 && parts <= 3, "parts must be 1, 2 or 3 (3 = mixed 3/2 parts over the whole grid)");
     P.parts = (int)parts;
@@ -7484,8 +6308,8 @@ static void fill_common_and_launch(Params& P, int M,
         grid = (int)n_fc1 + N_FC2_TILES * (int)parts;
     }
     TORCH_CHECK(grid <= sms_cache[dev], "grid must be co-resident (1 CTA/SM): n_fc1 + 48*parts <= #SMs (CTAs spin-wait on each other)");
-#if !defined(FMOE_PHASE_STAMPS) && !defined(FMOE_DIAG)
-    TORCH_CHECK(!P.dbg, "phase stamps require a separate build with -DFMOE_PHASE_STAMPS or -DFMOE_DIAG");
+#if !defined(FMOE_PHASE_STAMPS)
+    TORCH_CHECK(!P.dbg, "phase stamps require a separate build with -DFMOE_PHASE_STAMPS");
 #endif
     if (P.dbg) TORCH_CHECK(dbg.numel() >= (int64_t)grid * NSTAMP, "dbg too small");
     TORCH_CHECK(h_buf.numel() >= (int64_t)MAXU * 2 * M_pad * 128, "h_buf too small (sized for 384 union slots)");
@@ -7496,9 +6320,6 @@ static void fill_common_and_launch(Params& P, int M,
 #if FMOE_INPUT_TP
         TORCH_CHECK(M == TP_M && ndev == TP_NDEV && grid == 132 && parts == 1 && !P.pre_routed && P.out_bf16 && P.n_exp == NEXP,
                     "input-TP entry needs M == 32, TP8, a 132-CTA grid (n_fc1 84, parts 1), bf16 output and 384 experts");
-#ifdef FMOE_LAYER_FUSED
-        if (g_moe_capture) { *g_moe_capture = P; return; }   // goal11 layer: params only, the layer kernel launches them
-#endif
         launch<32, 2, 32, true>(P, grid, stream, g_pdl_entry);
 #else
         TORCH_CHECK(false, "fused_moe_full_tp: this build has FMOE_INPUT_TP=0 (rebuild with FMOE_NVCC_FLAGS=-DFMOE_INPUT_TP=1)");
@@ -7678,7 +6499,6 @@ void fused_moe_full_tp(torch::Tensor partial, torch::Tensor residual, torch::Ten
 
 }  // namespace fmoe
 
-#ifndef FMOE_NO_PYBIND
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_moe", &fmoe::fused_moe);
     m.def("fused_moe_full", &fmoe::fused_moe_full);
@@ -7707,4 +6527,3 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("FC2_W_EXPERT_BYTES") = fmoe::FC2_W_EXPERT_BYTES;
     m.attr("FC2_S_EXPERT_BYTES") = fmoe::FC2_S_EXPERT_BYTES;
 }
-#endif  // FMOE_NO_PYBIND
