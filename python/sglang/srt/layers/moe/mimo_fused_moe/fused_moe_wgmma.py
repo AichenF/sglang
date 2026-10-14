@@ -79,6 +79,28 @@ def ext():
     return _ext
 
 
+# The M = 32 input-TP fused MoE launch (grid == 132), attn_block (128 CTAs) and fa_block (132 CTAs) size their grids for one
+# CTA per SM of a 132-SM sm_90 part and spin-wait across CTAs, so every CTA must be co-resident. Other SM counts take the
+# unfused paths (gated in layer.py / attn_block.py / fa_block.py).
+GRID_SMS = 132
+_SM_COUNT = {}
+
+
+def device_sm_count(device) -> int:
+    idx = torch.device(device).index
+    if idx is None:
+        idx = torch.cuda.current_device()
+    n = _SM_COUNT.get(idx)
+    if n is None:
+        n = _SM_COUNT[idx] = int(torch.cuda.get_device_properties(idx).multi_processor_count)
+    return n
+
+
+def full_grid_ok(device) -> bool:
+    """True when the persistent kernels' 132-CTA grids are co-resident on ``device`` (exactly 132 SMs)."""
+    return device_sm_count(device) == GRID_SMS
+
+
 # ---------------------------------------------------------------- weight preprocessing (Humming fused-e8m0 layout)
 # Bit-exact torch re-implementation of humming.transform.transform_humming_tensors for b=e2m1, bs=e8m0 g32, a=e4m3 on
 # sm90 (mma WGMMA, use_fused_e8m0_scale, interleave mode 2, tensor-type weight_scale_2), validated word-for-word against

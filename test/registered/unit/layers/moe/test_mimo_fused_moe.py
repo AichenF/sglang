@@ -48,6 +48,7 @@ class TestMiMoFusedMoE(CustomTestCase):
         self.kernel = load_source("mimo_wrapper_under_test", "fused_moe_wgmma.py")
         self.extension = SimpleNamespace(ROUTER_BF16=1, fused_moe_full=Mock())
         self.kernel._ext = self.extension
+        self.kernel.device_sm_count = Mock(return_value=self.kernel.GRID_SMS)
         self.parallel = SimpleNamespace(
             tp_size=8, moe_ep_size=1, attn_dp_size=1, attn_tp_size=8
         )
@@ -185,6 +186,12 @@ class TestMiMoFusedMoE(CustomTestCase):
         self.parallel.moe_ep_size = 1
         with patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)):
             self.assertIn("sm90", self.adapter.MiMoFusedMoE._check(self.decoder()))
+        # the persistent grids need every CTA co-resident: other SM counts fall back
+        for sms in (78, 114):
+            self.kernel.device_sm_count.return_value = sms
+            self.assertIn("SMs", self.adapter.MiMoFusedMoE._check(self.decoder()))
+        self.kernel.device_sm_count.return_value = self.kernel.GRID_SMS
+        self.assertIsNone(self.adapter.MiMoFusedMoE._check(self.decoder()))
         decoder = self.decoder()
         decoder.attn_boundary.plan.paths[BatchVariant.ORDINARY].output.always_partial = (
             False

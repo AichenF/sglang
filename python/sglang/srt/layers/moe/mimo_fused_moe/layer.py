@@ -628,6 +628,9 @@ class MiMoFusedMoE:
                 return f"{name}: {None if t is None else (t.dtype, tuple(t.shape))} (want fp32 [{F.NEXP}])"
         if torch.cuda.get_device_capability(gate.weight.device) != (9, 0):
             return "needs sm90"
+        n_sm = F.device_sm_count(gate.weight.device)
+        if n_sm != F.GRID_SMS:
+            return f"{n_sm} SMs (the persistent kernels need {F.GRID_SMS} co-resident CTAs)"
         return None
 
     @classmethod

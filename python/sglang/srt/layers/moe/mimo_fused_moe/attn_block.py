@@ -374,6 +374,8 @@ class BlkLayer:
         from sglang.srt.layers.moe.mimo_fused_moe import fused_moe_wgmma as F
         from sglang.srt.layers.moe.mimo_fused_moe.layer import fused_moe_stream_residual
 
+        if not F.full_grid_ok(fmoe.router_w.device):   # 128 co-resident CTAs spin-wait on each other
+            return None
         if not getattr(F.ext(), "BLK_PREPUSH", 0):
             return None
         if not forward_batch.forward_mode.is_target_verify():
@@ -650,6 +652,10 @@ class MegaQkv:
             or xs.stride(1) != 32
             or xs.data_ptr() % 16 != 0
         ):
+            return None
+        from sglang.srt.layers.moe.mimo_fused_moe import fused_moe_wgmma as F
+
+        if not F.full_grid_ok(xq.device):
             return None
         mq = getattr(attn, "_mega_qkv", None)
         if mq is None:

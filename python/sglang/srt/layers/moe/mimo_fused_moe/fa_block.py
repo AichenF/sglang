@@ -165,6 +165,8 @@ class FaBlock:
             if os.environ.get("SGLANG_MIMO_FA2_DENSE", "1") != "1" or getattr(FL, "_shared", None) is None:
                 return None
             shared, push = FL._shared, False
+        if not F.full_grid_ok(shared.device):   # 132 co-resident CTAs spin-wait on each other
+            return None
         attn = decoder_layer.self_attn
         if getattr(attn, "attention_sink_bias", None) is not None:
             _log_once("fb_sinks", "not used: full-attention layer with sinks")
