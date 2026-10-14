@@ -219,9 +219,8 @@ _EMPTY = {}
 
 
 def default_parts(M):
-    """fc2 CTAs per output tile (measured on 8xH200): 2 at M<=24 (one fc1 item per fc2 CTA); 1 at M=25..40 (fc1
-    2-round tail-bound, 138.5 us at M=32); 3 = mixed 3/2 parts over the whole grid at M=41..48 (163.6 vs 168.4 us); 2 above
-    (shared queue, 209 vs 235 us at M=64)."""
+    """fc2 CTAs per output tile (chosen by measurement on 8xH200): 2 at M<=24 (one fc1 item per fc2 CTA); 1 at M=25..40
+    (fc1 2-round tail-bound); 3 = mixed 3/2 parts over the whole grid at M=41..48; 2 above (shared queue)."""
     env = os.environ.get("FMOE_PARTS")
     return (
         int(env)
@@ -403,7 +402,7 @@ def pf_desc(tensors, evict_last=()):
 
 def _pf_default(state):
     """No ranges from the caller: empty (no prefetch) -- or, in a bench build with -DFMOE_PF_TEST_KB=N, one N-KB dummy device range so the
-    kernel-side cost of issuing the prefetch can be timed by harnesses that know nothing about it (input_tp_bench)."""
+    kernel-side cost of issuing the prefetch can be timed by harnesses that know nothing about it."""
     dev = str(state.device)
     kb = int(getattr(ext(), "PF_TEST_KB", 0))
     if kb > 0:
@@ -447,13 +446,13 @@ def run_fused_full_tp(
     norm_next=None,
     pf=None,
 ):
-    """FMOE_INPUT_TP entry (build with FMOE_NVCC_FLAGS=-DFMOE_INPUT_TP=1): inp = dict(partial, residual, norm_w, router_w[_bf16], bias) where
+    """FMOE_INPUT_TP entry (on by default): inp = dict(partial, residual, norm_w, router_w[_bf16], bias) where
     `partial` is this rank's UN-reduced o_proj output (bf16 [32][DIM]); the input all-reduce runs inside the kernel's prologue over the
     ranks' IPC prologue buffers (state.link_pro_ptrs). Exact M = 32, TP8 only; outputs are bitwise those of CustomAllReduceV2 + run_fused_full.
     norm_next (FMOE_NORM_NEXT): dict(norm_w = the NEXT layer's input_layernorm weight bf16 [DIM], eps, res_new, xq, xs (norm_next_buffers))
     -> the kernel's TP tail also produces residual_new = out + residual_out, x_fp8 and the column-major scales of the next layer's
     qkv_proj input, bitwise flashinfer fused_add_rmsnorm + SGLang per_token_group_quant (deep_gemm layout).
-    pf: pf_desc(...) of the NEXT layer's weights to L2-prefetch in the TP tail (kernel built with -DFMOE_TAIL_PREFETCH=1..3); None = none."""
+    pf: pf_desc(...) of the NEXT layer's weights to L2-prefetch in the TP tail (FMOE_TAIL_PREFETCH builds, the default); None = none."""
     M = inp["partial"].shape[0]
     assert M == 32 and ndev == 8 and state.pro_ptrs is not None and state.pro_local, (
         "input-TP entry: M == 32, TP8, linked prologue buffers"

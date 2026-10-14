@@ -31,7 +31,7 @@ E2M1_LUT = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
 # ---------------------------------------------------------------- weight preprocessing (Humming fused-e8m0 layout)
 # Bit-exact torch re-implementation of humming.transform.transform_humming_tensors for b=e2m1, bs=e8m0 g32, a=e4m3 on
 # sm90 (mma WGMMA, use_fused_e8m0_scale, interleave mode 2, tensor-type weight_scale_2), validated word-for-word against
-# humming's ops (check_humming_layout.py). The kernel reads SGLang's Humming MoE layer tensors directly; these functions
+# humming's own ops. The kernel reads SGLang's Humming MoE layer tensors directly; these functions
 # exist so the tests/benchmarks need no humming install and so the effective (post-transform) fp32 weights are available.
 SIGN_SRC = [0, 4, 1, 5, 2, 6, 3, 7]  # nibble i carries the sign of element SIGN_SRC[i]
 MAX_RANGE = 11  # octaves kept below the per-expert max e8m0 (fp8 activation)
