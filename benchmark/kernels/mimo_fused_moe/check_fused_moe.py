@@ -2,7 +2,7 @@
 """Multi-process check of the fused MoE kernel on REAL checkpoint weights, one process per TP rank
 (the production setting: CUDA-IPC all-reduce buffers, Humming's own weight transform), without the server.
 
-  torchrun --nproc_per_node 8 check_fused_moe.py --model /path/to/checkpoint --layer 1 --M 24 32 48 64
+  torchrun --nproc_per_node 8 benchmark/kernels/mimo_fused_moe/check_fused_moe.py --model /path/to/checkpoint --layer 1 --M 24 32 48 64
 
 Per rank: loads its TP slice of one MoE layer (gate/up rows, down columns) from the safetensors shards, runs Humming's
 transform exactly as SGLang's prepare_humming_moe_layer does (fp8 g128 activations), then for each M:
@@ -18,10 +18,12 @@ import json
 import os
 import time
 
-import fused_moe_wgmma as F
+import fused_moe_reference as R
 import torch
 import torch.distributed as dist
 from safetensors import safe_open
+
+from sglang.srt.layers.moe.mimo_fused_moe import fused_moe_wgmma as F
 
 DIM, INTER, NEXP, TOPK = F.DIM, F.INTER, F.NEXP, F.TOPK
 
@@ -141,7 +143,7 @@ def ipc_share(nbytes, rank, world, device):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
-        "--model", default="/raid/data/aichenf_scratch/models/MiMo-V2.5-Pro-FP4-DFlash"
+        "--model", required=True, help="checkpoint directory (safetensors shards + index)"
     )
     ap.add_argument("--layer", type=int, default=1)
     ap.add_argument("--M", type=int, nargs="*", default=[24, 32, 48, 64])
@@ -168,8 +170,8 @@ def main():
     )
 
     # effective weights + (reference) kernel layout from the torch re-implementation; the kernel weights from humming
-    w13_ref, wg_eff, wu_eff = F.prep_fc1(gp, gs, up, us)
-    w2_ref, wd_eff = F.prep_fc2(dp, ds)
+    w13_ref, wg_eff, wu_eff = R.prep_fc1(gp, gs, up, us)
+    w2_ref, wd_eff = R.prep_fc2(dp, ds)
     if args.no_humming:
         w = {**w13_ref, **w2_ref}
     else:
@@ -239,9 +241,9 @@ def main():
         F.run_fused_full(state, inp, w, out, ro, rank, world)
         torch.cuda.synchronize()
         # prologue checks vs the SGLang-semantics oracles
-        ro_ref, xn_ref = F.rmsnorm_reference(hidden, residual, norm_w)
+        ro_ref, xn_ref = R.rmsnorm_reference(hidden, residual, norm_w)
         xn_k = state.xn_buf[: M * DIM].reshape(M, DIM)
-        _, ids_ref, w_ref = F.routing_reference(xn_k, router_reference_w, bias)
+        _, ids_ref, w_ref = R.routing_reference(xn_k, router_reference_w, bias)
         ids_k, wk = state.kernel_topk(M)
         sets_ok = all(
             set(ids_k[t].tolist()) == set(ids_ref[t].tolist()) for t in range(M)
@@ -250,10 +252,10 @@ def main():
         U = len(uni)
         # fp32 reference of this rank's partial from the kernel's own routing / quantized x, summed over ranks
         union = torch.tensor(uni, dtype=torch.int32, device=device)
-        gate_w = F.gate_w_from_routing(ids_k, wk, uni)
+        gate_w = R.gate_w_from_routing(ids_k, wk, uni)
         xq = state.xq_buf[: M * DIM].reshape(M, DIM).view(torch.float8_e4m3fn)
         xs = state.xs_buf[: M * (DIM // F.A_GROUP)].reshape(M, DIM // F.A_GROUP)
-        ref = F.reference_full(xq, xs, wg_eff, wu_eff, wd_eff, union, gate_w)
+        ref = R.reference_full(xq, xs, wg_eff, wu_eff, wd_eff, union, gate_w)
         dist.all_reduce(ref)
         diff = (out.float() - ref).abs()
         tol = 0.05 * ref.abs() + 0.02 * ref.abs().max()
