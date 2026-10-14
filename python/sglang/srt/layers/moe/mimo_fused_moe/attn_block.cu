@@ -90,7 +90,7 @@ struct Params {
     int pt_stride, my_rank, mode;
     float sm_scale;
 };
-constexpr int MODE_POS64 = 1, MODE_LOC64 = 2, MODE_FULL_LOCAL = 4, MODE_NO_PUSH = 8, MODE_SINK = 16, MODE_DBG_NOW = 32, MODE_DBG_NOB = 64, MODE_DBG_ATTONLY = 128, MODE_EXT_ATTN = 256, MODE_DBG_NOPOLL = 512, MODE_DBG_GARB = 1024,
+constexpr int MODE_POS64 = 1, MODE_LOC64 = 2, MODE_FULL_LOCAL = 4, MODE_NO_PUSH = 8, MODE_SINK = 16, MODE_DBG_NOW = 32, MODE_DBG_NOB = 64, MODE_DBG_ATTONLY = 128, MODE_EXT_ATTN = 256, MODE_DBG_NOPOLL = 512,
               MODE_SLOTS_WRITE = 2048, MODE_SLOTS_READ = 4096, MODE_DBG_GNOMMA = 8192, MODE_DBG_GNOX = 16384, MODE_DBG_GNOW = 32768, MODE_QKV_ONLY = 65536;
 
 constexpr float LOG2E = 1.4426950408889634f;
@@ -683,147 +683,44 @@ __global__ void __launch_bounds__(NTHREADS, 1) attn_block_kernel(const __grid_co
     cluster_sync_relaxed();   // no CTA exits while its partner's st.async into it may be in flight
 }
 
-// ================================================================================================================== mega (goal11 "mega")
+// ================================================================================================================== mega
 // attention MEGAKERNEL: the target qkv_proj fp8 GEMM (M = 32, N = 3392, K = 6144; DeepGEMM 128x128 weight block scales x per-token
 // per-128 activation scales = the fused MoE's norm-next output) as phase 0 of the fused SWA block, in the SAME grid (128 CTAs = 64
-// cluster pairs). Phase 0: cluster pair p owns qkv rows [53 p, 53 p + 53) (64 x 53 = 3392), its CTA h the K half [3072 h, +3072):
-// 24 units of {53 x 128 fp8 weight box, 32 x 128 x tile, 32 x scales}, swap-AB m64n32k32 wgmma (rows 53..63 of the A tile are
-// don't-care), warpgroup w takes units w, w + 2, .. with DeepGEMM's per-unit promotion (acc += partial * sw[row block][kb] * sx[tok]);
-// warpgroup 1 hands its sum to warpgroup 0 through smem, the pair exchanges halves over DSMEM, CTA h finalizes rows [27 h, ..) in the
-// fixed order (K half 0 + K half 1), writes them as bf16 into the qkv buffer (= what the unfused GEMM writes, up to the summation order)
-// and releases one flag (epoch). The 64 attention CTAs issued their K/V window gathers before griddepcontrol.wait (they depend only on
-// earlier kernels), poll the flags of the row groups they read and run attention_ks from the qkv loads on; phase 2 (o_proj + RS push) is
-// attn_block_kernel's.
+// cluster pairs). Phase 0: cluster pair p owns the q_rows(p) qkv rows from q_row0(p), its CTA h the K half [3072 h, +3072) = 24 k-blocks,
+// streamed as 12 k-block pairs (pair stages: one 3D TMA per operand, a {128, 64 rows, 2} weight box -- {128, 32, 2} for the late pairs;
+// the A-tile rows past the pair's share are don't-care -- and a {128, 32, 2} x box); swap-AB m64n32k32 wgmma, warpgroup g takes the
+// pairs g, g + 2, .. with DeepGEMM's per-k-block promotion (acc += partial * sw[row block][kb] * sx[tok]); warpgroup 1 hands its sum to
+// warpgroup 0 through smem, the pair exchanges halves over DSMEM, CTA h finalizes half of the pair's rows in the fixed order (K half 0 +
+// K half 1), writes them as bf16 into the qkv buffer (= what the unfused GEMM writes, up to the summation order) and releases one flag
+// (epoch). The 64 attention CTAs issued their K/V window gathers at kernel entry (they depend only on earlier kernels), poll the flags of
+// the row groups they read and run attention_ks from the qkv loads on; phase 2 (o_proj + RS push) is attn_block_kernel's.
 constexpr int QN = QKVW, QK = DIM, QBK = 128, QKB = QK / QBK, QNB = (QN + 127) / 128;   // 3392, 6144, 48 k-blocks, 27 scale row blocks
-constexpr int QG = 53, QKH = QKB / CL, QFIN0 = 27;   // rows per pair, k-blocks per CTA, rows finalized by cluster rank 0 (rank 1: 26)
-#ifndef MEGA_SPLIT
-#define MEGA_SPLIT 1                           // 0: 64 pairs x 53 rows; 1: pairs 0..49 x 60 rows + pairs 50..63 x 28 rows (the pairs that land last
-#endif                                         //    -- on the SMs of the fused MoE's tail CTAs -- get the small share; the early ones preload, qpre)
-constexpr int QSPLIT_P = 50, QG_E = 60, QG_L = 28;   // in situ CTAs 100..127 (pairs 50..63) land on the MoE tail SMs at its end
+constexpr int QKH = QKB / CL;                  // k-blocks per CTA (its K half)
+// qkv rows per cluster pair: pairs 0..49 x 60 rows + pairs 50..63 x 28 rows. CTAs 100..127 (pairs 50..63) land on the SMs of the fused
+// MoE's tail CTAs and start last, so they get the small share; the early ones preload their weight units before griddepcontrol.wait (qpre).
+constexpr int QSPLIT_P = 50, QG_E = 60, QG_L = 28;
 static_assert(QSPLIT_P * QG_E + (64 - QSPLIT_P) * QG_L == QN, "mega split");
-__device__ __forceinline__ int q_rows(int p) { return MEGA_SPLIT ? (p < QSPLIT_P ? QG_E : QG_L) : QG; }
-__device__ __forceinline__ int q_row0(int p) { return MEGA_SPLIT ? (p < QSPLIT_P ? QG_E * p : QG_E * QSPLIT_P + QG_L * (p - QSPLIT_P)) : QG * p; }
-__device__ __forceinline__ int q_pair(int r) { return MEGA_SPLIT ? (r < QG_E * QSPLIT_P ? r / QG_E : QSPLIT_P + (r - QG_E * QSPLIT_P) / QG_L) : r / QG; }
-constexpr int G_W = 8192, G_X = M * QBK, G_ST = 12288;   // <= 60 x 128 B weight box (1024-aligned slot) + x tile
-#ifndef MEGA_LL
-#define MEGA_LL 0                              // 1: qkv rows handed to the attention CTAs as LL messages {6 bf16, epoch} (no release fence, no flag
-#endif                                         //    round trip: the consumers' tag polls ARE the data loads); 0: bf16 rows + per-CTA release flags
-#ifndef MEGA_EARLY_KV
-#define MEGA_EARLY_KV 1                        // 1 (goal12): attention CTAs issue their K / V window gathers at kernel entry (the old keys depend on no running
-#endif                                         //    kernel; the math warps idle ~7 us before the first GEMM data): the window K / V live ABOVE a 12-stage GEMM ring
-                                               //    (MEGA_OFF_KV), the scratch written after the GEMM (Q, P, row stats, DSMEM exchange) inside the dead ring.
-                                               //    Gathers issued after the GEMM sat on the critical path (in situ +0.8..1.3 us of cp.async issue before the
-                                               //    finalize); issued after the qkv release (MEGA_REL_EARLY) they gated the attention inputs instead.
-#ifndef MEGA_LATE_GATHER
-#define MEGA_LATE_GATHER (MEGA_EARLY_KV ? 0 : 1)                     // 1: attention CTAs compute their window slots in the prologue but issue the K / V gathers after their
-#endif                                         //    GEMM loop (L2-resident rows, landing during the handoff) -> their GEMM ring can use 16 stages
-#ifndef MEGA_KVPF_END
-#define MEGA_KVPF_END 0                        // 1: the next SWA layer's K / V L2 prefetch at the kernel end; 0: right after the attention release
-#endif
-#ifndef MEGA_KTREADY
-#define MEGA_KTREADY 1                         // 1: each o_proj attention k-tile is TMA'd as soon as ITS 4 producer CTAs released (thread kt of warp kt % 8
-#endif                                         //    polls them), instead of after all 64 attention flags + one thread issuing 13 TMAs
-#ifndef MEGA_PAIRS
-#define MEGA_PAIRS 1                           // 1: each warpgroup consumes unit pairs (one fence / commit / wait per 2 k-blocks); 0: single units
-#endif                                         //    alternating between the warpgroups (the e4c5053e41 consumer)
-#ifndef MEGA_PSTAGE
-#define MEGA_PSTAGE 1                          // 1: GEMM ring of PAIR stages [W k-block a | W b | x a | x b] (24 KB), each side loaded by ONE 3D TMA
-#endif                                         //    (box {128, rows, 2 k-blocks}): half the TMA issues (in situ the x producer's ~190 ns per TMA bounded the
-                                               //    loop) and one full barrier per unit pair; early pairs load 64-row W boxes (4 rows of the neighbour pair)
-#ifndef MEGA_PROD_LOOP
-#define MEGA_PROD_LOOP 1                       // 1: the GEMM producer loops stay loops (#pragma unroll 1): unrolled, every unit's TMA issue is fresh code,
-#endif                                         //    and the kernel's code is cold every launch (the MoE in between evicts it) -> ~350 cycles per unit
-#if MEGA_PROD_LOOP
-#define MEGA_PROD_UNROLL _Pragma("unroll 1")
-#else
-#define MEGA_PROD_UNROLL
-#endif
-#ifndef MEGA_XFLAG
-#define MEGA_XFLAG 0                           // 1: with P.xflags (the fused MoE's FMOE_NN_XFLAG row flags) the x producer starts on the 32 x-row flags of the
-#endif                                         //    producing MoE launch (or griddepcontrol.wait, whichever is first) instead of griddepcontrol.wait alone.
-                                               //    MEASURED NO GAIN (8-GPU lab, MoE stamps build): the x producer passed its wait at the same +1.0 us after the
-                                               //    last row CTA as with griddepcontrol.wait (flag release + poll ~= PDL completion latency); per layer +0.0..+1.4 us
-                                               //    (a 1-lane 8 x v4 poll of the flag line during the MoE tail cost 1.4 us). The MoE side (FMOE_NN_XFLAG row-CTA
-                                               //    release) is not in the tree: claude_tmp/goal11/mega/xflag_moe.patch.
-#ifndef MEGA_XFLAG_NS
-#define MEGA_XFLAG_NS 128                      // x-flag poll back-off (ns)
-#endif
-#ifndef MEGA_MID_GATHER
-#define MEGA_MID_GATHER 0                      // 1 (pair stages + late gathers): attention CTAs issue their K / V window gathers inside the last pair-loop
-#endif                                         //    iteration -- the second lap only uses pair stages 0..3, the attention scratch = pair stages 4..7 is dead
-                                               //    once pairs 4..7 are finished -- instead of after the loop (~0.8 us of cp.async issue on the critical path)
-#ifndef MEGA_GWARP
-#define MEGA_GWARP 0                           // 1 (pair stages + late gathers): a 12th warp issues the attention CTAs' K / V window gathers (cp.async) as soon
-#endif                                         //    as pair stages 4..7 are dead (first lap consumed) -- off the math warps (~1 us of their issue) and
-                                               //    under the GEMM's second lap. MEASURED +7.5 us (1-GPU lab): one warp's cp.async memory-level
-                                               //    parallelism cannot carry 82 KB of gathers (bulk copies: ~130 issue cycles each x 160). N > 1 = N gather
-                                               //    warps; 8-GPU lab (L2-warm K/V): 1 warp attention inputs +6 us, 2 warps +1.5 us, 3 warps +0.3 us (the
-                                               //    attention CTAs' qkv rows 0.3-0.8 us earlier, layer +0.4 us). Off.
-#ifndef MEGA_OPF
-#define MEGA_OPF 0                             // 1: once the GEMM loops are done, the o_proj producer L2-prefetches the weight k-tiles that only get an smem stage late
-#endif                                         //    (others: 13..15 after stages free up; attention CTAs: 8..15 after attention) -- without the MoE tail's o_proj
-                                               //    prefetch those reloads were HBM round trips at the end of the o_proj. MEASURED +1.3 us per layer
-                                               //    (8-GPU lab): the 8 MB of prefetches at the GEMM end delayed the qkv row stores / flags. Off.
-#ifndef MEGA_WPF
-#define MEGA_WPF 0                             // 1 (pair stages): right after its wait (MoE done), the W producer L2-prefetches the qkv weight pairs that were not
-#endif                                         //    preloaded (they get a ring stage only once the first lap is consumed: an HBM round trip at the loop end)
-                                               //    2: issue those prefetches before the wait (under the MoE tail). MEASURED (1): +0.8..1.0 us per layer
-                                               //    (8-GPU lab): x tiles landed 0.5 us later behind the prefetch traffic. Off.
-#ifndef MEGA_LOOPDBG
-#define MEGA_LOOPDBG 0                         // 1: extra GEMM-loop stamps (warpgroup 0 thread 0: slots 15 / 18 / 19 / 20 = after the first issue / pair-loop
-#endif                                         //    iterations q = 2, 4 / after the last wait; W / x producer done issuing: 23 / 24)
-#ifndef MEGA_ATT_EARLY_W
-#define MEGA_ATT_EARLY_W 0                     // 1: attention CTAs issue their o_proj weight k-tiles 0..7 right after their GEMM loop (not after att_in):
-#endif                                         //    without the o_proj tail prefetch they stream from HBM and need the lead time
-#ifndef MEGA_REL_EARLY
-#define MEGA_REL_EARLY 1                       // 1 (goal12): attention CTAs store + release their qkv rows BEFORE issuing their K / V window gathers (the
-#endif                                         //    gather issue sat between their GEMM loop and the finalize: +0.77 us in situ), released by math tid 0 after
-                                               //    the row-store barrier (its SM has no TMA / cp.async in flight then: the gpu-scope release fence = MEMBAR.ALL.GPU
-                                               //    waits for the SM's in-flight loads, ub/handoff.cu: 0.3 us idle, +0.3 us per 12 KB of HBM TMA in flight)
-#ifndef MEGA_PRELOAD
-#define MEGA_PRELOAD 1                         // 1 (goal12): attention CTAs load what mega_attention needs from EARLIER kernels (seqlen, positions -> cos/sin
-#endif                                         //    values, KV write slot, sinks) BEFORE polling the qkv flags (in situ "flags seen -> inputs" was 1.0 us with the
-                                               //    window already in smem: positions -> cos_sin is a dependent load chain after the poll)
-#ifndef MEGA_OPW_PACE
-#define MEGA_OPW_PACE 0                        // 1 (goal12): the other CTAs stream their o_proj weights from gdone as before, but ONE k-tile deep until their qkv
-#endif                                         //    flag release retired (qrel), then BLK_WD deep (OPW_LATE delayed the o_proj phase; 36 KB in flight cost the release ~0.9 us)
-#ifndef MEGA_OPW_LATE
-#define MEGA_OPW_LATE 0                        // 1 (goal12): the other CTAs start their o_proj weight TMAs after their qkv flag release (qrel), not at gdone:
-#endif                                         //    with 3 weight k-tiles (36 KB) in flight the release fence took ~1.0 us in situ (rows stored -> released)
-#ifndef MEGA_KCH
-#define MEGA_KCH 1                             // independent accumulator chains per k-block (1 = DeepGEMM's single chain)
-#endif
+__device__ __forceinline__ int q_rows(int p) { return p < QSPLIT_P ? QG_E : QG_L; }
+__device__ __forceinline__ int q_row0(int p) { return p < QSPLIT_P ? QG_E * p : QG_E * QSPLIT_P + QG_L * (p - QSPLIT_P); }
+__device__ __forceinline__ int q_pair(int r) { return r < QG_E * QSPLIT_P ? r / QG_E : QSPLIT_P + (r - QG_E * QSPLIT_P) / QG_L; }
+constexpr int G_W = 8192, G_X = M * QBK, G_ST = 12288;   // one k-block of a pair stage: 64-row x 128 B weight slot + 32 x 128 B x tile
 #ifndef MEGA_ROT
-#define MEGA_ROT 5                             // k-block order of pair p starts at (p * MEGA_ROT) % 24 (x-tile hot spot); 0 = all in order
+#define MEGA_ROT 5                             // k-block pair order of cluster pair p starts at pair (p * MEGA_ROT) % 12 (x-tile hot spot); 0 = all in order
 #endif
-constexpr int GNS_ATT = 10, GNS_OTH = 16;      // GEMM ring stages: attention CTAs below OFF_ATT, the others below OFF_X
-#ifndef MEGA_GNS_ATT
-#define MEGA_GNS_ATT (MEGA_EARLY_KV ? 12 : MEGA_LATE_GATHER ? 16 : (MEGA_PAIRS ? 8 : 10))   // GEMM ring depth of the attention CTAs (early gathers: K/V window above OFF_ATT)
-#endif
-#ifndef MEGA_GNS_OTH
-#define MEGA_GNS_OTH 16                        // GEMM ring depth of the other CTAs (<= GNS_OTH)
-#endif
-constexpr int MEGA_OFF_KV = 12 * G_ST;        // MEGA_EARLY_KV: window K | V | slot list of an attention CTA (above its 12-stage GEMM ring)
-static_assert(!MEGA_EARLY_KV || (!MEGA_LATE_GATHER && !MEGA_GWARP && !MEGA_MID_GATHER && !MEGA_LL && MEGA_GNS_ATT * G_ST <= MEGA_OFF_KV
-                                 && MEGA_OFF_KV >= OFF_ATT + 16 * (DQK + 8) * 2 + 16 * (80 + 8) * 2 + (2 * NW * 16 + 32 + 16 * 64) * 4
-                                 && MEGA_OFF_KV + (80 * (DQK + 8) + 96 * (DV + 8)) * 2 + 80 * 4 <= OFF_X), "early-KV attention scratch");
-static_assert((MEGA_LATE_GATHER || MEGA_EARLY_KV || MEGA_GNS_ATT <= GNS_ATT) && MEGA_GNS_OTH <= GNS_OTH && MEGA_GNS_ATT % 2 == 0 && MEGA_GNS_OTH % 2 == 0, "mega ring depth");
+// GEMM ring depth in G_ST units (pair stages = 2 units). The attention CTAs' ring ends at MEGA_OFF_KV: their K / V window lives above it
+// (gathered at kernel entry: the old keys depend on no running kernel and the math warps idle until the first GEMM data; gathers issued
+// after the GEMM sat on the critical path), the scratch written after the GEMM (Q, P, row stats, DSMEM exchange) inside the dead ring.
+constexpr int GNS_ATT = 12, GNS_OTH = 16;
+constexpr int MEGA_OFF_KV = 12 * G_ST;        // window K | V | slot list of an attention CTA (above its 12-stage GEMM ring)
+static_assert(GNS_ATT * G_ST <= MEGA_OFF_KV && MEGA_OFF_KV >= OFF_ATT + 16 * (DQK + 8) * 2 + 16 * (80 + 8) * 2 + (2 * NW * 16 + 32 + 16 * 64) * 4
+              && MEGA_OFF_KV + (80 * (DQK + 8) + 96 * (DV + 8)) * 2 + 80 * 4 <= OFF_X, "early-KV attention scratch");
+static_assert(GNS_OTH * G_ST <= OFF_X, "mega ring depth");
 // every ring stage must always be consumed by the SAME warpgroup (it then waits for lap k only after it consumed lap k - 1 of that stage):
-// a warpgroup two laps ahead of a stage whose data has not landed yet would see the parity of lap k as 'complete' (mbarrier parity aliasing)
-// -> E2E GPU hang g11m_m7_eg_r1 (pairs + a 10-stage ring: stage s alternated between the warpgroups from lap to lap)
-static_assert(MEGA_PAIRS ? (MEGA_GNS_ATT % 4 == 0 && MEGA_GNS_OTH % 4 == 0) : (MEGA_GNS_ATT % 2 == 0 && MEGA_GNS_OTH % 2 == 0), "ring stage -> warpgroup");
-static_assert(!MEGA_PSTAGE || MEGA_PAIRS, "pair stages need the unit-pair consumer");
-static_assert(!MEGA_GWARP || (MEGA_PSTAGE && MEGA_LATE_GATHER && !MEGA_MID_GATHER && MEGA_GNS_ATT == 16 && OFF_ATT >= 4 * 2 * G_ST && QKH / 2 == 12),
-              "gather warp: 12 pairs over 8 pair stages, the attention scratch within pair stages 4..7 (+ above the ring)");
-static_assert(!MEGA_MID_GATHER || (MEGA_PSTAGE && MEGA_LATE_GATHER && MEGA_GNS_ATT == 16 && OFF_ATT >= 4 * 2 * G_ST && QKH / 2 == 12),
-              "mid-loop gathers: 12 pairs over 8 pair stages, the attention scratch within pair stages 4..7 (+ above the ring)");
-static_assert(!MEGA_PSTAGE || (2 * G_W + 2 * G_X == 2 * G_ST && G_W == 64 * 128), "pair stage = 2 x (64-row W slot) + 2 x tile");
-constexpr int OFF_RED_ATT = GNS_ATT * G_ST, OFF_RED_OTH = GNS_OTH * G_ST;   // [64 rows][32 tok] fp32 warpgroup-1 partial (8 KB)
-constexpr int LL_MSG = 6;                      // LL slots per (token, CTA): ceil(27 / 6) = 5 messages + 1 pad (a CTA's slots = whole 32-B sectors)
-constexpr int OFF_FIN = 0;                     // [32 tok][30] bf16: this CTA's finalized qkv rows (staging for the LL messages; dead GEMM ring)
-constexpr int OFF_QS = 4096;                   // [8 tok][QS_LD] bf16: an attention CTA's qkv slice (unpacked LL messages; dead GEMM ring)
-constexpr int QS_LD = 704;                     // Q head 2 hg (0..191) | Q head 2 hg + 1 (192..383) | new K (384..575) | new V (576..703)
-constexpr int MG_NTHREADS = NTHREADS + 64 + 32 * MEGA_GWARP;   // + warp 9: GEMM weight TMA producer, warp 10: x TMA producer, [warp 11: gathers] (a TMA issue costs ~100 cycles
+// a warpgroup two laps ahead of a stage whose data has not landed yet would see the parity of lap k as 'complete' (mbarrier parity
+// aliasing; this hung the GPU with a ring whose stages alternated between the warpgroups from lap to lap)
+static_assert(GNS_ATT % 4 == 0 && GNS_OTH % 4 == 0, "ring stage -> warpgroup");
+static_assert(2 * G_W + 2 * G_X == 2 * G_ST && G_W == 64 * 128, "pair stage = 2 x (64-row W slot) + 2 x tile");
+constexpr int MG_NTHREADS = NTHREADS + 64;     // + warp 9: GEMM weight TMA producer, warp 10: x TMA producer (a TMA issue costs ~100 cycles
                                                //   of the issuing thread: one thread issuing W + x + scales per unit could not keep up)
 constexpr int MG_OFF_BAR = OFF_X + COLS * M * 4;
 constexpr int MG_OFF_MISC = MG_OFF_BAR + 1024;
@@ -831,22 +728,21 @@ constexpr int MG_OFF_QSW = MG_OFF_MISC + 64;   // [2][24] fp32: the weight block
 constexpr int MG_OFF_SX = MG_OFF_QSW + 256;    // [24][32] fp32: the x scales of this CTA's K half (one bulk copy after griddepcontrol.wait)
 constexpr int MG_OFF_XG = MG_OFF_SX + QKB / 2 * M * 4;   // [2 warpgroups][<= 30 rows][32 tok] fp32: the partner's partials of my finalized rows
 constexpr int MG_SMEM_ALLOC = MG_OFF_XG + 2 * 30 * M * 4 + 1024;
-static_assert(MG_SMEM_ALLOC <= 232448 && OFF_RED_ATT + 8192 <= OFF_ATT && OFF_RED_OTH + 8192 <= OFF_X && QG * 64 == QN && QG_E * QBK <= G_W && G_W + G_X <= G_ST, "mega smem");
-static_assert(!(MEGA_SPLIT && MEGA_LL), "MEGA_LL assumes the uniform 53-row split");
-static_assert(QFIN0 * 2 >= QG && COLS >= QFIN0, "mega exchange fits OFF_X");
+static_assert(MG_SMEM_ALLOC <= 232448 && QG_E * QBK <= G_W && G_W + G_X <= G_ST, "mega smem");
+static_assert((QG_E + 1) / 2 <= 30 && (QG_L + 1) / 2 <= 30, "finalized rows per CTA (MG_OFF_XG, the 32-column row staging tile)");
 
 struct MegaParams : Params {
-    CUtensorMap tm_qw;                 // qkv weight [3392][6144] e4m3: box {128 K, 53 (MEGA_SPLIT: 60) rows}, SWIZZLE_128B
-    CUtensorMap tm_qw2;                // MEGA_SPLIT: box {128 K, 32 rows} (the late pairs)
-    CUtensorMap tm_qx;                 // x [32][6144] e4m3: box {128, 32}, SWIZZLE_128B
+    CUtensorMap tm_qw;                 // qkv weight [3392][6144] e4m3 as 3D {128, rows, 48 k-blocks}: box {128, 64 rows, 2}, SWIZZLE_128B
+    CUtensorMap tm_qw2;                // the same, box {128, 32 rows, 2} (the late pairs)
+    CUtensorMap tm_qx;                 // x [32][6144] e4m3 as 3D: box {128, 32, 2}, SWIZZLE_128B
     const float* qsx;                  // x scales, column-major: k-group g, token t at qsx[g * qsx_ld + t]
     const float* qsw;                  // weight block scales [27][48] fp32
     __nv_bfloat16* qout;               // [32][3392] bf16 qkv (written by phase 0, read by the attention CTAs after the flags)
-    unsigned* qflags;                  // [128] qkv-rows-ready flags (epoch), one per 128-B line (MEGA_LL 0)
-    uint4* qll;                        // [32 tok][128 CTA][LL_MSG] LL messages {6 bf16, epoch} of the finalized qkv rows (MEGA_LL 1)
+    unsigned* qflags;                  // [128] qkv-rows-ready flags (epoch), one per 128-B line
+    uint4* qll;                        // unused (null)
     int qsx_ld, qpre;                  // qpre: weight units TMA-issued before griddepcontrol.wait (<= ring stages)
-    const unsigned* xflags;            // MEGA_XFLAG: [32] x-row-ready flags of the producing fused MoE (epoch = its work[2] + 1), nullptr = off
-    const int* xwork;                  // that MoE's work counters (work[2] = launches completed)
+    const unsigned* xflags;            // unused (null)
+    const int* xwork;                  // unused (null)
 };
 
 __device__ __forceinline__ uint64_t desc_lo(uint32_t lo, uint32_t hi) { uint64_t d; asm("mov.b64 %0, {%1, %2};" : "=l"(d) : "r"(lo), "r"(hi)); return d; }
@@ -858,29 +754,13 @@ __device__ __forceinline__ void wgmma_m64n32k32_e4m3(float* d, uint64_t da, uint
                    "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15])
                  : "l"(da), "l"(db), "r"(scale_d));
 }
-__device__ __forceinline__ void tma_load_2d_pol(void* dst, const CUtensorMap* map, int c0, int c1, uint64_t* bar, uint64_t pol) {
-    asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1, {%2, %3}], [%4], %5;"
-                 :: "r"(sa(dst)), "l"(reinterpret_cast<uint64_t>(map)), "r"(c0), "r"(c1), "r"(sa(bar)), "l"(pol) : "memory");
-}
 __device__ __forceinline__ void tma_load_3d_pol(void* dst, const CUtensorMap* map, int c0, int c1, int c2, uint64_t* bar, uint64_t pol) {
     asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1, {%2, %3, %4}], [%5], %6;"
                  :: "r"(sa(dst)), "l"(reinterpret_cast<uint64_t>(map)), "r"(c0), "r"(c1), "r"(c2), "r"(sa(bar)), "l"(pol) : "memory");
 }
-__device__ __forceinline__ unsigned ld_relaxed_gpu(const unsigned* p) { unsigned v; asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory"); return v; }
-__device__ __forceinline__ bool mbar_test(uint64_t* b, unsigned ph) {
-    unsigned r;
-    asm volatile("{\n .reg .pred p;\n mbarrier.test_wait.parity.shared::cta.b64 p, [%1], %2;\n selp.u32 %0, 1, 0, p;\n}\n" : "=r"(r) : "r"(sa(b)), "r"(ph) : "memory");
-    return r != 0;
-}
 __device__ __forceinline__ void bulk_g2s(void* dst, const void* src, unsigned bytes, uint64_t* bar) {
     asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
                  :: "r"(sa(dst)), "l"(src), "r"(bytes), "r"(sa(bar)) : "memory");
-}
-__device__ __forceinline__ void st_relaxed_v4(uint4* p, uint4 v) {
-    asm volatile("st.relaxed.gpu.global.v4.b32 [%0], {%1,%2,%3,%4};" :: "l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
-}
-__device__ __forceinline__ uint4 ld_relaxed_v4(const uint4* p) {
-    uint4 v; asm volatile("ld.relaxed.gpu.global.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p) : "memory"); return v;
 }
 // the qkv rows read by the attention CTA (b, hg, kh): Q of heads 2 hg, 2 hg + 1 (+ the new K / V rows for kh 1) -> row groups
 __device__ __forceinline__ void mega_groups(int hg, int kh, int& qa, int& qb, int& ka, int& kb) {
@@ -888,80 +768,14 @@ __device__ __forceinline__ void mega_groups(int hg, int kh, int& qa, int& qb, in
     ka = kh ? q_pair(NH * DQK) : 1; kb = kh ? q_pair(QN - 1) : 0;   // (ka > kb: none)
 }
 
-// MEGA_LL consumer: poll the LL messages of the qkv rows this attention CTA reads (tokens 8 b .. 8 b + 7; Q of heads 2 hg, 2 hg + 1; kh 1:
-// also the new K / V rows) and unpack them into qs [8][QS_LD]. One message = 6 consecutive finalized rows of one producer CTA.
-__device__ __forceinline__ void mega_ll_gather(const MegaParams& P, uint8_t* smem, int b, int hg, int kh, unsigned epoch) {
-    __nv_bfloat16* qs = reinterpret_cast<__nv_bfloat16*>(smem + OFF_QS);
-    int qa, qb, ka, kb;
-    mega_groups(hg, kh, qa, qb, ka, kb);
-    if (ka <= qb) ka = qb + 1;                     // hg 7: the K/V groups start inside the Q range
-    const int nq = qb - qa + 1, nk = ka <= kb ? kb - ka + 1 : 0, ng = nq + nk;
-    const int per_tok = ng * 2 * 5;                // groups x K halves x 5 messages
-    const int nmsg = VT * per_tok;                 // <= 8 x 16 x 10 = 1280 -> <= 5 per thread
-    constexpr int MPT = 5;
-    // one sentinel poll per producer CTA first (2 ng threads, backoff): 64 x 256 threads spinning on the whole message set flood L2 while
-    // the last producers still stream their GEMM operands; then every message is loaded once (stragglers re-polled)
-    if (threadIdx.x < 2 * ng) {
-        const int gi = threadIdx.x >> 1, grp = gi < nq ? qa + gi : ka + (gi - nq);
-        const uint4* sp = P.qll + ((size_t)(8 * b + VT - 1) * NCTA + 2 * grp + (threadIdx.x & 1)) * LL_MSG + 4;
-        while (ld_relaxed_v4(sp).w != epoch) __nanosleep(64);
-    }
-    named_bar_sync(1, NMATH);
-    if (threadIdx.x == 0) BSTAMP(21);
-    uint4 v[MPT];
-    const uint4* src[MPT];
-    // all of this thread's message loads in flight at once (a per-message poll loop paid one L2 round trip per message)
-#pragma unroll
-    for (int k = 0; k < MPT; ++k) {
-        const int idx = threadIdx.x + k * NMATH;
-        src[k] = nullptr;
-        if (idx < nmsg) {
-            const int t = idx / per_tok, r = idx - t * per_tok;
-            const int gi = r / 10, hj = r - gi * 10, hh = hj / 5, j = hj - hh * 5;
-            const int grp = gi < nq ? qa + gi : ka + (gi - nq);
-            src[k] = P.qll + ((size_t)(8 * b + t) * NCTA + 2 * grp + hh) * LL_MSG + j;
-            v[k] = ld_relaxed_v4(src[k]);
-        }
-    }
-#pragma unroll
-    for (int k = 0; k < MPT; ++k)
-        if (src[k]) while (v[k].w != epoch) { __nanosleep(20); v[k] = ld_relaxed_v4(src[k]); }
-    if (threadIdx.x == 0) BSTAMP(22);
-#pragma unroll
-    for (int k = 0; k < MPT; ++k) {
-        const int idx = threadIdx.x + k * NMATH;
-        if (idx >= nmsg) break;
-        const int t = idx / per_tok, r = idx - t * per_tok;
-        const int gi = r / 10, hj = r - gi * 10, hh = hj / 5, j = hj - hh * 5;
-        const int grp = gi < nq ? qa + gi : ka + (gi - nq);
-        const uint32_t wv[3] = {v[k].x, v[k].y, v[k].z};
-        const int lr0 = (hh ? QFIN0 : 0) + 6 * j, lr_end = hh ? QG : QFIN0;
-#pragma unroll
-        for (int e = 0; e < 6; ++e) {
-            const int lr = lr0 + e;
-            if (lr >= lr_end) break;
-            const int col = grp * QG + lr;
-            int lc = -1;
-            if (col >= 2 * DQK * hg && col < 2 * DQK * (hg + 1)) lc = col - 2 * DQK * hg;
-            else if (kh && col >= NH * DQK) lc = 2 * DQK + (col - NH * DQK);
-            if (lc >= 0) {
-                const uint32_t w = wv[e >> 1];
-                qs[t * QS_LD + lc] = __ushort_as_bfloat16((unsigned short)((e & 1) ? (w >> 16) : (w & 0xffff)));
-            }
-        }
-    }
-    named_bar_sync(1, NMATH);
-}
-
-// the megakernel's key-split attention scratch: attention_ks's layout (from OFF_ATT), or with MEGA_EARLY_KV the window K | V | slots at
-// MEGA_OFF_KV (above the attention CTAs' 12-stage GEMM ring: gathered at kernel entry) and Q | P | row stats | DSMEM exchange from OFF_ATT
-// (inside the GEMM ring: written only after the GEMM; below OFF_ATT = the o_proj stages issued after att_in)
+// the megakernel's key-split attention scratch: the window K | V | slots at MEGA_OFF_KV (above the attention CTAs' 12-stage GEMM ring:
+// gathered at kernel entry) and Q | P | row stats | DSMEM exchange from OFF_ATT (inside the GEMM ring: written only after the GEMM; below
+// OFF_ATT = the o_proj stages issued after att_in)
 struct MegaAtt { __nv_bfloat16 *Qs, *Ks, *Vs, *Ps; float *rmax, *rsum; int* s_slot; float *xm, *xl, *xo; };
 __device__ __forceinline__ MegaAtt mega_att(uint8_t* smem) {
     constexpr int MPAD = 16, NRMAX = 80, KP = DQK + 8, VP = DV + 8, PP = NRMAX + 8;
     MegaAtt a;
     a.Qs = reinterpret_cast<__nv_bfloat16*>(smem + OFF_ATT);
-#if MEGA_EARLY_KV
     a.Ps = a.Qs + MPAD * KP;
     a.rmax = reinterpret_cast<float*>(a.Ps + MPAD * PP);
     a.rsum = a.rmax + NW * MPAD;
@@ -969,15 +783,6 @@ __device__ __forceinline__ MegaAtt mega_att(uint8_t* smem) {
     a.Ks = reinterpret_cast<__nv_bfloat16*>(smem + MEGA_OFF_KV);
     a.Vs = a.Ks + NRMAX * KP;
     a.s_slot = reinterpret_cast<int*>(a.Vs + (NRMAX + 16) * VP);
-#else
-    a.Ks = a.Qs + MPAD * KP;
-    a.Vs = a.Ks + NRMAX * KP;
-    a.Ps = a.Vs + (NRMAX + 16) * VP;
-    a.rmax = reinterpret_cast<float*>(a.Ps + MPAD * PP);
-    a.rsum = a.rmax + NW * MPAD;
-    a.s_slot = reinterpret_cast<int*>(a.rsum + NW * MPAD);
-    a.xm = reinterpret_cast<float*>(a.s_slot + NRMAX); a.xl = a.xm + MPAD; a.xo = a.xl + MPAD;
-#endif
     return a;
 }
 
@@ -1012,25 +817,6 @@ __device__ __forceinline__ void mega_gathers(const MegaParams& P, uint8_t* smem,
         s_slot[tid] = v;
     }
     named_bar_sync(1, NMATH);
-#if MEGA_LATE_GATHER
-}
-// the K / V window cp.async gathers of a key-split attention CTA (slots from mega_gathers), issued once its GEMM ring is dead
-template <int WINDOW>
-__device__ __forceinline__ void mega_gather_issue(const MegaParams& P, uint8_t* smem, int kh) {
-    constexpr int W = VT;
-    constexpr int NKEY = WINDOW - 1 + W, NPAD = (NKEY + 15) / 16 * 16, MPAD = 16;
-    constexpr int R0H = 64, NRMAX = NPAD - R0H;
-    constexpr int KP = DQK + 8, VP = DV + 8, PP = NRMAX + 8;
-    constexpr int KCH = DQK / 8, VCH = DV / 8;
-    constexpr int NOLD = NKEY - W;
-    const MegaAtt ma = mega_att(smem);
-    __nv_bfloat16* Ks = ma.Ks;
-    __nv_bfloat16* Vs = ma.Vs;
-    const int* s_slot = ma.s_slot;
-    (void)MPAD; (void)PP;
-    const int tid = threadIdx.x;
-    const int R0 = kh ? R0H : 0, NR = kh ? NRMAX : R0H;
-#endif
     {
         constexpr int CPR = KCH + VCH, NG = NMATH / CPR, RPG = (NRMAX + NG - 1) / NG;
         const int c = tid % CPR, gq = tid / CPR;
@@ -1054,52 +840,12 @@ __device__ __forceinline__ void mega_gather_issue(const MegaParams& P, uint8_t* 
     cp_commit();
 }
 
-#if MEGA_GWARP
-// one warp issues the K / V window gathers (the same rows / layout as mega_gather_issue) and signals gath_full
-template <int WINDOW>
-__device__ __forceinline__ void mega_gather_warp(const MegaParams& P, uint8_t* smem, int kh, int gt, uint64_t* gath_full) {
-    constexpr int NGT = 32 * MEGA_GWARP;   // gather threads
-    const int lane = gt & 31;
-    constexpr int W = VT;
-    constexpr int NKEY = WINDOW - 1 + W, MPAD = 16;
-    constexpr int NPAD = (NKEY + 15) / 16 * 16, R0H = 64, NRMAX = NPAD - R0H;
-    constexpr int KP = DQK + 8, VP = DV + 8, PP = NRMAX + 8;
-    constexpr int KCH = DQK / 8, VCH = DV / 8, CPR = KCH + VCH;
-    constexpr int NOLD = NKEY - W;
-    const MegaAtt ma = mega_att(smem);
-    __nv_bfloat16* Ks = ma.Ks;
-    __nv_bfloat16* Vs = ma.Vs;
-    const int* s_slot = ma.s_slot;
-    (void)MPAD; (void)PP;
-    const int R0 = kh ? R0H : 0, NR = kh ? NRMAX : R0H;
-    // zero rows first (padding keys outside the window), then the plain arrive (release: orders the warp's zero stores)
-    for (int i = gt; i < NR * CPR; i += NGT) {
-        const int lr = i / CPR, c = i - lr * CPR, r = R0 + lr;
-        if (s_slot[lr] == -1 && (r < NOLD || r >= NKEY)) {
-            __nv_bfloat16* d = c < KCH ? Ks + lr * KP + c * 8 : Vs + lr * VP + (c - KCH) * 8;
-            *reinterpret_cast<uint4*>(d) = make_uint4(0u, 0u, 0u, 0u);
-        }
-    }
-    __syncwarp();
-    if (lane == 0) mbar_arrive(gath_full);
-#pragma unroll 4
-    for (int i = gt; i < NR * CPR; i += NGT) {
-        const int lr = i / CPR, c = i - lr * CPR;
-        const int sl = s_slot[lr];
-        if (sl >= 0) {
-            if (c < KCH) cp16(Ks + lr * KP + c * 8, P.kc + (size_t)sl * P.ks + c * 8);
-            else cp16(Vs + lr * VP + (c - KCH) * 8, P.vc + (size_t)sl * P.vs + (c - KCH) * 8);
-        }
-    }
-    cp_arrive_noinc(gath_full);
-}
-#endif
-
 __device__ __forceinline__ __nv_bfloat16 ldcg_bf(const __nv_bfloat16* p) {
     const unsigned short u = __ldcg(reinterpret_cast<const unsigned short*>(p));
     return __ushort_as_bfloat16(u);
 }
-// mega_attention's inputs written by EARLIER kernels (no dependency on this grid's qkv rows)
+// mega_attention's inputs written by EARLIER kernels (no dependency on this grid's qkv rows): loaded BEFORE the qkv flag poll, so the
+// dependent positions -> cos_sin load chain is in flight during the poll instead of after it
 struct MegaPre { int seqlen; long long kslot; float sk0, sk1; __nv_bfloat16 qc[2], qsn[2], kc_, ks_; };
 __device__ __forceinline__ MegaPre mega_att_pre(const MegaParams& P, int b, int hg, int kh) {
     constexpr int W = VT;
@@ -1126,7 +872,7 @@ __device__ __forceinline__ MegaPre mega_att_pre(const MegaParams& P, int b, int 
 // L2-coherent (.cg) loads after the row-group flags were acquired
 template <int WINDOW>
 __device__ __forceinline__ void mega_attention(const MegaParams& P, uint8_t* smem, int b, int hg, int kh, uint64_t* att_in, uint64_t* xm_full, uint64_t* xo_full,
-                                               uint64_t* gath_full, const MegaPre& pre) {
+                                               const MegaPre& pre) {
     constexpr int W = VT;
     constexpr int NKEY = WINDOW - 1 + W, NPAD = (NKEY + 15) / 16 * 16, MR = W * HP, MPAD = 16;
     constexpr int R0H = 64, NRMAX = NPAD - R0H;
@@ -1158,20 +904,6 @@ __device__ __forceinline__ void mega_attention(const MegaParams& P, uint8_t* sme
     __nv_bfloat16 qx[2], qy[2], qc[2] = {pre.qc[0], pre.qc[1]}, qsn[2] = {pre.qsn[0], pre.qsn[1]};
     __nv_bfloat16 kx = __float2bfloat16(0.f), ky = kx, kc_ = pre.kc_, ks_ = pre.ks_;
     uint4 qrest, krest = make_uint4(0u, 0u, 0u, 0u);
-#if MEGA_LL
-    {
-        const __nv_bfloat16* qs = reinterpret_cast<const __nv_bfloat16*>(smem + OFF_QS);
-        const __nv_bfloat16* qsrc = qs + (qr / HP) * QS_LD + (qr % HP) * DQK;
-        const __nv_bfloat16* ksrc = qs + warp * QS_LD + 2 * DQK;
-#pragma unroll
-        for (int e = 0; e < 2; ++e) { const int i = 2 * qq + e; qx[e] = qsrc[i]; qy[e] = qsrc[i + 32]; }
-        qrest = *reinterpret_cast<const uint4*>(qsrc + 64 + 8 * qq);
-        if (kh) {
-            kx = ksrc[lane]; ky = ksrc[lane + 32];
-            krest = *reinterpret_cast<const uint4*>(lane < 16 ? ksrc + 64 + 8 * lane : ksrc + DQK + 8 * (lane - 16));
-        }
-    }
-#else
     {
         const __nv_bfloat16* qsrc = P.qout + (size_t)qtok * QKVW + (size_t)qh * DQK;
         const __nv_bfloat16* ksrc = P.qout + (size_t)ktok * QKVW + NH * DQK;
@@ -1183,7 +915,6 @@ __device__ __forceinline__ void mega_attention(const MegaParams& P, uint8_t* sme
             krest = __ldcg(reinterpret_cast<const uint4*>(lane < 16 ? ksrc + 64 + 8 * lane : ksrc + DQK + 8 * (lane - 16)));
         }
     }
-#endif
 #pragma unroll
     for (int e = 0; e < 2; ++e) {
         const int i = 2 * qq + e;
@@ -1206,13 +937,7 @@ __device__ __forceinline__ void mega_attention(const MegaParams& P, uint8_t* sme
             else *reinterpret_cast<uint4*>(P.vc + (size_t)kslot * P.vs + 8 * (lane - 16)) = krest;
         }
     }
-#if MEGA_GWARP
-    mbar_wait(gath_full, 0);   // the gather warp's K / V window rows (cp.async + its zero rows)
-#endif
     cp_wait_all();
-#if MEGA_LL
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");   // qs (generic reads) -> the o_proj weight TMAs into that region after att_in
-#endif
     named_bar_sync(1, NMATH);
     if (tid == 0) { BSTAMP(6); mbar_arrive(att_in); }
     // ---- S = Q K^T over this half's key tiles (verbatim attention_ks)
@@ -1351,18 +1076,8 @@ __device__ __forceinline__ void mega_attention(const MegaParams& P, uint8_t* sme
     }
 }
 
-// goal11 layer: the megakernel body as a device function. FUSED = phase 1 of layer_fused.cu's one-kernel SWA layer (attention block +
-// fused MoE): run by warps 0..10 of CTAs 0..127 of the 640-thread layer kernel (warps 11..19 and CTAs 128..131 mirror its two cluster
-// syncs). FUSED differences: the own rank's o_proj rows are pushed as LL messages into this rank's IN_RS like the peers' (no kernel
-// boundary orders P.partial any more), the math warps of CTAs 0..LAYER_TOKC-1 arrive on LAYER_PUSH_BAR once their pushes are issued (the
-// MoE token reduce runs on the layer kernel's idle warps 12..19 of those CTAs), and no early griddepcontrol.launch_dependents.
-constexpr int LAYER_TOKC = 32, LAYER_PUSH_BAR = 9;
-__device__ __forceinline__ void named_bar_arrive(int id, int n) { asm volatile("bar.arrive %0, %1;" :: "r"(id), "r"(n) : "memory"); }
-// ROLE: 0 = every role (standalone kernel); FUSED layer kernel: 1 = the 8 math warps, 2 = the 3 producer warps (separate inlined copies:
-// the layer kernel's setmaxnreg phases give them different register budgets, which ptxas assigns per disjoint branch)
-template <int WINDOW, bool FUSED, int ROLE = 0>
+template <int WINDOW>
 __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
-    constexpr bool R_MATH = ROLE != 2, R_PROD = ROLE != 1;
     uint64_t* wfull = reinterpret_cast<uint64_t*>(smem + MG_OFF_BAR);
     uint64_t* bfull = wfull + NS;
     uint64_t* sempty = bfull + NS;
@@ -1374,16 +1089,16 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
     uint64_t* bgo = xo_full + 1;
     uint64_t* gfull = bgo + 1;                 // [GNS_OTH] GEMM stage landed (W + x + sx)
     uint64_t* gempty = gfull + GNS_OTH;        // [GNS_OTH] GEMM stage consumed (the 4 warps of the consuming warpgroup)
-    uint64_t* gdone = gempty + GNS_OTH;        // this CTA's GEMM done (8 math warps): the ring region is free for the o_proj weights
+    uint64_t* gdone = gempty + GNS_OTH;        // this CTA's GEMM done (8 math warps; non-attention CTAs): the ring region is free for the o_proj weights
     uint64_t* xg_full = gdone + 1;             // the partner's K-half partial of my finalized rows landed (st.async)
     uint64_t* ep_bar = xg_full + 1;            // s_epoch written (o_proj producer lane 0, right after its griddepcontrol.wait)
     uint64_t* sx_full = ep_bar + 1;            // the K half's x scales landed (x producer)
     uint64_t* qready = sx_full + 1;            // this CTA's qkv rows stored (8 math warps) -> the W producer releases the CTA's flag
-    uint64_t* kt_seen = qready + 1;            // MEGA_KTREADY: the producers of o_proj k-tiles NS..NKT-1 seen (math lanes) -> producer lane 1
-    uint64_t* xgo = kt_seen + 1;               // x may be read (x producer: row flags seen or griddepcontrol.wait returned) -> W producer's rest
-    uint64_t* slot_ready = xgo + 1;            // MEGA_GWARP: the K / V window slots are in smem (math tid 0 after mega_gathers' barrier)
-    uint64_t* gath_full = slot_ready + 1;      // MEGA_GWARP: the gather warp's K / V rows landed (32 lanes' cp.async arrivals + 1 for its zero rows)
-    uint64_t* qrel = gath_full + 1;            // MEGA_OPW_LATE: this CTA's qkv flag released (W producer) -> o_proj weight producer
+    uint64_t* kt_seen = qready + 1;            // the producers of o_proj k-tiles NS..NKT-1 seen (math lanes) -> producer lane 1
+    uint64_t* xgo = kt_seen + 1;               // xgo, slot_ready, gath_full, qrel: no users (initialized only)
+    uint64_t* slot_ready = xgo + 1;
+    uint64_t* gath_full = slot_ready + 1;
+    uint64_t* qrel = gath_full + 1;
     unsigned* s_epoch = reinterpret_cast<unsigned*>(smem + MG_OFF_MISC);
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int c = blockIdx.x;
@@ -1391,14 +1106,14 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
     const int kbase = h * (KO / CL), rbase = p * PCOLS;
     const bool qonly = P.mode & MODE_QKV_ONLY;   // FA layers: the qkv GEMM alone (rows into qout), no attention / o_proj
     const bool att = c < NATT && !qonly;
-    const int gns = att ? MEGA_GNS_ATT : MEGA_GNS_OTH;   // ring stage / lap parity tracked incrementally (no runtime division)
+    const int gns = att ? GNS_ATT : GNS_OTH;   // ring stage / lap parity tracked incrementally (no runtime division)
     const int qrow0 = q_row0(p), qg = q_rows(p), qmid = (qg + 1) / 2;
     const int fin0 = h ? qmid : 0, fin1 = h ? qg : qmid;   // my qkv rows [qrow0, qrow0 + qg), the rows I finalize [fin0, fin1)
-    if (R_MATH && tid == 0) {
+    if (tid == 0) {
         BSTAMP(0);
         for (int i = 0; i < NS; ++i) { mbar_init(&wfull[i], 1); mbar_init(&bfull[i], 1); mbar_init(&sempty[i], NW); }
         for (int i = 0; i < GNS_OTH; ++i) { mbar_init(&gfull[i], 2); mbar_init(&gempty[i], 4); }   // gfull: W producer + x producer
-        mbar_init(gdone, NW); mbar_init(xg_full, 1); mbar_init(ep_bar, 1); mbar_init(sx_full, 1); mbar_init(qready, NW); mbar_init(kt_seen, NKT - NS); mbar_init(xgo, 1); mbar_init(slot_ready, 1); mbar_init(gath_full, 33 * (MEGA_GWARP ? MEGA_GWARP : 1)); mbar_init(qrel, 1);
+        mbar_init(gdone, NW); mbar_init(xg_full, 1); mbar_init(ep_bar, 1); mbar_init(sx_full, 1); mbar_init(qready, NW); mbar_init(kt_seen, NKT - NS); mbar_init(xgo, 1); mbar_init(slot_ready, 1); mbar_init(gath_full, 33); mbar_init(qrel, 1);
         mbar_init(att_in, 1); mbar_init(att_done, 1); mbar_init(xfull, 1); mbar_init(xm_full, 1); mbar_init(xo_full, 1); mbar_init(bgo, 1);
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         mbar_expect(xfull, COLS * M * 4);
@@ -1411,7 +1126,7 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
     for (int a = 0; a < NACC; ++a)
 #pragma unroll
         for (int i = 0; i < 16; ++i) d[a][i] = 0.f;
-    if (R_PROD && warp == NW) {
+    if (warp == NW) {
         auto issue_w = [&](int kt) {
             const int s = kt % NS;
             mbar_expect(&wfull[s], WT_BYTES);
@@ -1425,23 +1140,12 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
             mbar_arrive(ep_bar);
             // o_proj weights after this CTA's GEMM (its ring region); attention CTAs after their attention inputs are in smem
             if (!qonly) asm volatile("prefetch.tensormap [%0];" :: "l"(reinterpret_cast<uint64_t>(&P.tm_w)) : "memory");
-#if MEGA_OPF && !MEGA_LL
-            if (!qonly) {
-                mbar_wait(gdone, 0);   // GEMM loops done (attention CTAs arrive it too with MEGA_OPF)
-#pragma unroll 1
-                for (int kt = att ? NS0_ATT : NS; kt < NKT; ++kt)
-                    asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];"
-                                 :: "l"(reinterpret_cast<uint64_t>(&P.tm_w)), "r"(kbase + kt * KT), "r"(rbase) : "memory");
-            }
-#endif
-            // MEGA_ATT_EARLY_W: attention CTAs too take stages 0..7 right after their GEMM (only stages 8..12 hold their attention scratch)
-            if (qonly) {} else if (att && (MEGA_LL || !MEGA_ATT_EARLY_W)) mbar_wait(att_in, 0); else mbar_wait((MEGA_OPW_LATE && !MEGA_LL) ? qrel : gdone, 0);
+            if (qonly) {} else if (att) mbar_wait(att_in, 0); else mbar_wait(gdone, 0);
             for (int kt = 0; kt < NKT && !qonly; ++kt) {
                 const int s = kt % NS;
                 if (att && kt == NS0_ATT) mbar_wait(att_done, 0);
                 if (kt >= NS) mbar_wait(&sempty[s], ((kt / NS) - 1) & 1);
                 if (kt >= BLK_WD) mbar_wait(&wfull[(kt - BLK_WD) % NS], ((kt - BLK_WD) / NS) & 1);
-                if (MEGA_OPW_PACE && !MEGA_OPW_LATE && !att && kt >= 1 && kt < NS && !mbar_test(qrel, 0)) mbar_wait(&wfull[kt - 1], 0);
                 issue_w(kt);
             }
         } else if (lane == 1 && !qonly) {
@@ -1451,172 +1155,74 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
             for (int kt = NS; kt < NKT; ++kt) {
                 const int s = kt % NS;
                 mbar_wait(&sempty[s], ((kt / NS) - 1) & 1);
-#if MEGA_KTREADY
                 if (kt == NS) { mbar_wait(kt_seen, 0); asm volatile("fence.proxy.async.global;" ::: "memory"); }   // producers of k-tiles NS.. seen
-#endif
                 mbar_expect(&bfull[s], BT_BYTES);
                 tma_load_2d_nohint(smem + s * ST_BYTES + WT_BYTES, &P.tm_a, kbase + kt * KT, 0, &bfull[s]);
             }
         }
         __syncwarp();
-    } else if (R_PROD && warp == NW + 1) {
+    } else if (warp == NW + 1) {
         if (lane == 0) {
             // GEMM weight producer: independent of the previous kernel (qpre units before griddepcontrol.wait)
-            const CUtensorMap* wmap_q = (MEGA_SPLIT && p >= QSPLIT_P) ? &P.tm_qw2 : &P.tm_qw;
+            const CUtensorMap* wmap_q = p >= QSPLIT_P ? &P.tm_qw2 : &P.tm_qw;
             asm volatile("prefetch.tensormap [%0];" :: "l"(reinterpret_cast<uint64_t>(wmap_q)) : "memory");
             uint64_t pol;
             asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
             const int pre = P.qpre < gns ? P.qpre : gns;
-            const int kb0 = h * QKH, rot = MEGA_PSTAGE ? ((p * MEGA_ROT) % (QKH / 2)) * 2 : (p * MEGA_ROT) % QKH;
+            const int kb0 = h * QKH, rot = ((p * MEGA_ROT) % (QKH / 2)) * 2;
             const bool now_ = P.mode & MODE_DBG_GNOW;
             int s = 0, lp = 0;
-#if MEGA_PSTAGE
-            // pair j = k-blocks (kj, kj + 1) of the K half (rot even: never wraps inside a pair) -> pair stage j % (gns / 2), one 3D box
+            // pair j = k-blocks (kj, kj + 1) of the K half (rot even: never wraps inside a pair) -> pair stage j % (gns / 2), one 3D box: half
+            // the TMA issues of single k-block units (the x producer's TMA issue time bounded the loop) and one full barrier per pair
             const int nps = gns / 2, prep = pre / 2;
-            const unsigned wbytes = (MEGA_SPLIT && p >= QSPLIT_P) ? 2u * 32u * QBK : 2u * 64u * QBK;
-            MEGA_PROD_UNROLL
-            auto wprefetch = [&]() {
-#pragma unroll 1
-                for (int jj = prep < nps ? nps : prep; jj < QKH / 2; ++jj) {
-                    int kq = 2 * jj + rot; if (kq >= QKH) kq -= QKH;
-                    asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];"
-                                 :: "l"(reinterpret_cast<uint64_t>(wmap_q)), "r"(0), "r"(qrow0), "r"(kb0 + kq) : "memory");
-                }
-            };
-            if (MEGA_WPF == 2 && !now_) wprefetch();
+            const unsigned wbytes = p >= QSPLIT_P ? 2u * 32u * QBK : 2u * 64u * QBK;
             for (int j = 0; j < QKH / 2; ++j) {
                 int kj = 2 * j + rot; if (kj >= QKH) kj -= QKH;
-                if (j == prep) {
-                    if (MEGA_XFLAG) mbar_wait(xgo, 0); else griddep_wait();
-                    if (MEGA_WPF == 1 && !now_) wprefetch();
-                }
+                if (j == prep) griddep_wait();
                 if (j >= nps) mbar_wait(&gempty[s], lp ^ 1);
                 mbar_expect(&gfull[s], now_ ? 0u : wbytes);
                 if (!now_) tma_load_3d_pol(smem + s * 2 * G_ST, wmap_q, 0, qrow0, kb0 + kj, &gfull[s], pol);
-#if MEGA_LOOPDBG
-                if (j == 7) BSTAMP(26);
-                if (j == 0) BSTAMP(21);
-#endif
                 if (++s == nps) { s = 0; lp ^= 1; }
             }
-#if MEGA_LOOPDBG
-            BSTAMP(23);
-#endif
-            if (prep >= QKH / 2) { if (MEGA_XFLAG) mbar_wait(xgo, 0); else griddep_wait(); }
-#else
-            for (int i = 0; i < QKH; ++i) {
-                int ki = i + rot; if (ki >= QKH) ki -= QKH;
-                if (i == pre) { if (MEGA_XFLAG) mbar_wait(xgo, 0); else griddep_wait(); }
-                if (i >= gns) mbar_wait(&gempty[s], lp ^ 1);
-                mbar_expect(&gfull[s], now_ ? 0u : (unsigned)(qg * QBK));
-                if (!now_) tma_load_2d_pol(smem + s * G_ST, wmap_q, (kb0 + ki) * QBK, qrow0, &gfull[s], pol);
-#if MEGA_LOOPDBG
-                if (i == 15) BSTAMP(26);
-                if (i == 0) BSTAMP(21);
-#endif
-                if (++s == gns) { s = 0; lp ^= 1; }
-            }
-#if MEGA_LOOPDBG
-            BSTAMP(23);
-#endif
-            if (pre >= QKH) { if (MEGA_XFLAG) mbar_wait(xgo, 0); else griddep_wait(); }
-#endif
-#if !MEGA_LL
+            if (prep >= QKH / 2) griddep_wait();
             // the CTA's qkv-ready flag: released by THIS thread (no outstanding memory operations of its own -- the math threads that stored
             // the rows also issued cp.async gathers / the CTA has o_proj weight TMAs in flight, which a release fence there would wait for);
             // cumulative over the math warps' stores through the qready mbarrier (arrive = release.cta, wait = acquire.cta)
-            if (!(MEGA_REL_EARLY && att)) {   // MEGA_REL_EARLY: attention CTAs release from math tid 0
+            if (!att) {   // attention CTAs release from math tid 0
                 mbar_wait(ep_bar, 0);
                 mbar_wait(qready, 0);
                 st_release_gpu(&P.qflags[c * FLAG_STRIDE], s_epoch[0]);
                 if (P.dbg) P.dbg[blockIdx.x * NDBG + 9] = gtimer();
             }
-            if (MEGA_OPW_LATE || MEGA_OPW_PACE) mbar_arrive(qrel);
-#endif
         }
         __syncwarp();
-    } else if (R_PROD && warp == NW + 2) {
-#if MEGA_XFLAG
-        if (P.xflags) {
-            // fast path: the producing MoE's 32 row CTAs released x row t (+ its scales) with flag t = that launch's epoch = work[2] + 1 as read
-            // here while it still runs; once it has finished (work[2] already bumped) the flags never reach want and griddepcontrol.wait
-            // (o_proj producer, ep_bar) has returned or is about to -> slow path. Flags never exceed the running launch's epoch.
-            // Lane t polls flag t: ONE coalesced 128-B request per poll and CTA (128 CTAs poll one L2 line while the MoE tail runs).
-            const unsigned want = ld_acquire_gpu(reinterpret_cast<const unsigned*>(P.xwork + 2)) + 1u;
-            for (;;) {
-                const unsigned v = ld_relaxed_gpu(P.xflags + lane);
-                if (__all_sync(0xffffffffu, (int)(v - want) >= 0)) { asm volatile("fence.acq_rel.gpu;" ::: "memory"); break; }
-                if (mbar_test(ep_bar, 0)) break;
-                __nanosleep(MEGA_XFLAG_NS);
-            }
-            __syncwarp();
-        } else if (lane == 0) {
-            griddep_wait();
-        }
-#endif
+    } else if (warp == NW + 2) {
         if (lane == 0) {
-            // x producer: the K half's x scales (one 3-KB bulk copy), then one 32 x 128 x tile per unit, after griddepcontrol.wait
+            // x producer: the K half's x scales (one 3-KB bulk copy), then one 32 x 2 x 128 x box per k-block pair, after griddepcontrol.wait
             asm volatile("prefetch.tensormap [%0];" :: "l"(reinterpret_cast<uint64_t>(&P.tm_qx)) : "memory");
             uint64_t pol;
             asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(pol));
-            const int kb0 = h * QKH, rot = MEGA_PSTAGE ? ((p * MEGA_ROT) % (QKH / 2)) * 2 : (p * MEGA_ROT) % QKH;
+            const int kb0 = h * QKH, rot = ((p * MEGA_ROT) % (QKH / 2)) * 2;
             const bool nox = P.mode & MODE_DBG_GNOX;
-#if MEGA_XFLAG
-            asm volatile("fence.proxy.async.global;" ::: "memory");   // generic-proxy writes of the MoE -> this thread's TMA / bulk reads
-            mbar_arrive(xgo);
-#else
             griddep_wait();
-#endif
             if (P.dbg) P.dbg[blockIdx.x * NDBG + 7] = gtimer();
             mbar_expect(sx_full, QKH * M * 4);
             bulk_g2s(smem + MG_OFF_SX, P.qsx + (size_t)kb0 * P.qsx_ld, QKH * M * 4, sx_full);
             int s = 0, lp = 0;
-#if MEGA_PSTAGE
             const int nps = gns / 2;
-            MEGA_PROD_UNROLL
+            // a loop, not unrolled: the kernel's code is cold every launch (the MoE in between evicts it), and unrolled every TMA issue is
+            // fresh code
+#pragma unroll 1
             for (int j = 0; j < QKH / 2; ++j) {
                 int kj = 2 * j + rot; if (kj >= QKH) kj -= QKH;
                 if (j >= nps) mbar_wait(&gempty[s], lp ^ 1);
                 mbar_expect(&gfull[s], nox ? 0u : (unsigned)(2 * G_X));
                 if (!nox) tma_load_3d_pol(smem + s * 2 * G_ST + 2 * G_W, &P.tm_qx, 0, 0, kb0 + kj, &gfull[s], pol);
-#if MEGA_LOOPDBG
-                if (j == 7) BSTAMP(25);
-                if (j == 0) BSTAMP(22);
-#endif
                 if (++s == nps) { s = 0; lp ^= 1; }
             }
-            if (false)
-#endif
-            for (int i = 0; i < QKH; ++i) {
-                int ki = i + rot; if (ki >= QKH) ki -= QKH;
-                if (i >= gns) mbar_wait(&gempty[s], lp ^ 1);
-                mbar_expect(&gfull[s], nox ? 0u : (unsigned)G_X);
-                if (!nox) tma_load_2d_pol(smem + s * G_ST + G_W, &P.tm_qx, (kb0 + ki) * QBK, 0, &gfull[s], pol);
-#if MEGA_LOOPDBG
-                if (i == 15) BSTAMP(25);
-                if (i == 0) BSTAMP(22);
-#endif
-                if (++s == gns) { s = 0; lp ^= 1; }
-            }
-#if MEGA_LOOPDBG
-            BSTAMP(24);
-#endif
         }
         __syncwarp();
-#if MEGA_GWARP
-    } else if (warp >= NW + 3) {
-        if (att) {
-            // K / V window gathers of this key-split attention CTA into its scratch (pair stages 4..7 of the GEMM ring + above): wait for the
-            // slots (math warps) and for pairs 4..7 consumed (their stages never get a second lap), then cp.async; lane 0's plain arrive after
-            // the zero rows + 32 lanes' cp.async arrivals complete gath_full
-            mbar_wait(slot_ready, 0);
-#pragma unroll 1
-            for (int ps = 4; ps < 8; ++ps) mbar_wait(&gempty[ps], 0);
-            mega_gather_warp<WINDOW>(P, smem, h, (warp - NW - 3) * 32 + lane, gath_full);
-        }
-        __syncwarp();
-#endif
-    } else if (R_MATH) {
+    } else {
         // ================= math warps
         const int pb = (c / CL) / NHG, phg = (c / CL) % NHG;   // attention: request, head group (key half = h)
         float* s_qsw = reinterpret_cast<float*>(smem + MG_OFF_QSW);
@@ -1624,10 +1230,7 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
         if (tid < 2 * QKH) s_qsw[tid] = P.qsw[min(sbA + tid / QKH, QNB - 1) * QKB + h * QKH + tid % QKH];
         if (att) mega_gathers<WINDOW>(P, smem, pb, phg, h);   // contains a math-warp barrier
         else named_bar_sync(1, NMATH);
-#if MEGA_GWARP
-        if (att && tid == 0) mbar_arrive(slot_ready);   // the slots (written before mega_gathers' barrier) -> the gather warp
-#endif
-        // ---- phase 0: this CTA's K half of rows [qrow0, qrow0 + 53): warpgroup w = units w, w + 2, ..
+        // ---- phase 0: this CTA's K half of rows [qrow0, qrow0 + qg)
         {
             const int g = warp >> 2, ctid = tid & 127;
             const int frow = (ctid >> 5) * 16 + ((ctid & 31) >> 2), fcol = (ctid & 3) * 2;
@@ -1636,23 +1239,17 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
             float acc[16];
 #pragma unroll
             for (int r = 0; r < 16; ++r) acc[r] = 0.f;
-            const int rot = MEGA_PSTAGE ? ((p * MEGA_ROT) % (QKH / 2)) * 2 : (p * MEGA_ROT) % QKH;
+            const int rot = ((p * MEGA_ROT) % (QKH / 2)) * 2;
             const float* sxt = reinterpret_cast<const float*>(smem + MG_OFF_SX);
             const bool nomma = P.mode & MODE_DBG_GNOMMA;
-            // software pipeline over this warpgroup's 12 units (i = g, g + 2, ..): the wgmma group of unit i is in flight while unit i - 2 is
-            // promoted (acc += partial * sw * sx in unit order: the per-thread summation order is unchanged)
             // software pipeline over this warpgroup's unit PAIRS (warpgroup g: units 4 q + 2 g, 4 q + 2 g + 1, q = 0..5): one fence / commit /
             // wait per two k-blocks (the per-iteration warpgroup sync + barrier overhead was ~4x the m64n32k32 time); the group of pair q is in
-            // flight while pair q - 1 is promoted (acc += partial * sw * sx in unit order)
+            // flight while pair q - 1 is promoted (acc += partial * sw * sx in unit order: the per-thread summation order is unchanged)
             long long cw = 0, c0 = clock64();
             const uint32_t sbase = sa(smem) & 0x3FFFF;
-            int cs = 2 * g, cp = 0;   // stage / lap parity of the next unit to issue (2g < gns)
-            int fs = 2 * g;           // stage of the next unit to finish
-            auto adv = [&](int& st, int& par, int d) { st += d; if (st >= gns) { st -= gns; par ^= 1; } };
-#if MEGA_PSTAGE
             // pair stages: warpgroup g's pairs j = g, g + 2, .. live in pair stages j % (gns / 2) (always the same warpgroup: gns / 2 even)
             const int nps = gns / 2;
-            const uint32_t wsp = (MEGA_SPLIT && p >= QSPLIT_P) ? 32u * QBK : 64u * QBK;   // W tile b offset (box rows x 128 B)
+            const uint32_t wsp = p >= QSPLIT_P ? 32u * QBK : 64u * QBK;   // W tile b offset (box rows x 128 B)
             int ps_ = g, pp_ = 0;   // pair stage / lap parity of the next pair to issue
             int pf_ = g;            // pair stage of the next pair to finish
             auto issue = [&](int i, float* t0, float* t1) {
@@ -1662,6 +1259,7 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
                 const long long ca = clock64();
                 mbar_wait(&gfull[s0], p0);
                 cw += clock64() - ca;
+                // descriptor = {(addr >> 4) & 0x3FFF | 1 << 16, SBO 64 | swizzle 128B}: the k32 steps only add 2 to the low word (no carry)
                 const uint32_t lo0 = ((sbase + s0 * 2 * G_ST) >> 4) | (1u << 16), lo1 = lo0 + (wsp >> 4);
                 constexpr uint32_t HI = (1024 >> 4) | (1u << 30), XA = (2 * G_W) >> 4;
                 const uint32_t XB = (2 * G_W + G_X - wsp) >> 4;
@@ -1674,29 +1272,6 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
                 }
                 wg_commit();
             };
-#else
-            auto issue = [&](int i, float* t0, float* t1) {
-                (void)i;
-                const int s0 = cs, p0 = cp;
-                int s1 = cs, p1 = cp; adv(s1, p1, 1);
-                adv(cs, cp, 4);
-                const long long ca = clock64();
-                mbar_wait(&gfull[s0], p0);
-                mbar_wait(&gfull[s1], p1);
-                cw += clock64() - ca;
-                // descriptor = {(addr >> 4) & 0x3FFF | 1 << 16, SBO 64 | swizzle 128B}: the k32 steps only add 2 to the low word (no carry)
-                const uint32_t lo0 = ((sbase + s0 * G_ST) >> 4) | (1u << 16), lo1 = ((sbase + s1 * G_ST) >> 4) | (1u << 16);
-                constexpr uint32_t HI = (1024 >> 4) | (1u << 30), XO = G_W >> 4;
-                wg_fence();
-                if (!nomma) {
-#pragma unroll
-                    for (int k = 0; k < 4; ++k) wgmma_m64n32k32_e4m3(t0, desc_lo(lo0 + 2 * k, HI), desc_lo(lo0 + XO + 2 * k, HI), k > 0);
-#pragma unroll
-                    for (int k = 0; k < 4; ++k) wgmma_m64n32k32_e4m3(t1, desc_lo(lo1 + 2 * k, HI), desc_lo(lo1 + XO + 2 * k, HI), k > 0);
-                }
-                wg_commit();
-            };
-#endif
             auto finish1 = [&](int i, const float* t) {
                 int ki = i + rot; if (ki >= QKH) ki -= QKH;
                 const float sw0 = sw0p[ki], sw1 = sw1p[ki];
@@ -1709,17 +1284,11 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
             };
             auto finish = [&](int i, const float* t0, const float* t1) {
                 __syncwarp();
-#if MEGA_PSTAGE
                 if (lane == 0) mbar_arrive(&gempty[pf_]);
                 pf_ += 2; if (pf_ >= nps) pf_ -= nps;
-#else
-                if (lane == 0) { const int f1 = fs + 1 == gns ? 0 : fs + 1; mbar_arrive(&gempty[fs]); mbar_arrive(&gempty[f1]); }
-                fs += 4; if (fs >= gns) fs -= gns;
-#endif
                 finish1(i, t0);
                 finish1(i + 1, t1);
             };
-#if MEGA_PAIRS
             float tA0[16], tA1[16], tB0[16], tB1[16];
             mbar_wait(sx_full, 0);
             if (tid == 0) BSTAMP(8);
@@ -1727,80 +1296,22 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
 #pragma unroll 1
             for (int q = 0; q < NPAIR; q += 2) {
                 const int iA = 4 * q + 2 * g, iB = iA + 4;
-#if MEGA_LOOPDBG
-                if (tid == 0 && q == 2) BSTAMP(18);
-                if (tid == 0 && q == 4) BSTAMP(19);
-#endif
                 issue(iA, tA0, tA1);
-#if MEGA_LOOPDBG
-                if (tid == 0 && q == 0) BSTAMP(15);
-#endif
                 if (q > 0) { wg_wait<1>(); finish(iA - 4, tB0, tB1); }
-#if MEGA_MID_GATHER
-                if (att && q == NPAIR - 2) { named_bar_sync(1, NMATH); mega_gather_issue<WINDOW>(P, smem, h); }   // pairs 0..7 finished by both
-#endif
                 issue(iB, tB0, tB1);
                 wg_wait<1>();
                 finish(iA, tA0, tA1);
             }
             wg_wait<0>();
-#if MEGA_LOOPDBG
-            if (tid == 0) BSTAMP(20);
-#endif
             finish(4 * (NPAIR - 1) + 2 * g, tB0, tB1);
-#else
-            // single units, alternating warpgroups (units g, g + 2, ..): group of unit i in flight while unit i - 2 is promoted (as e4c5053e41)
-            int us_ = g, up_ = 0;   // stage / parity of the next unit to issue
-            auto issue1 = [&](float* t) {
-                const int s0 = us_, p0 = up_;
-                us_ += 2; if (us_ >= gns) { us_ -= gns; up_ ^= 1; }
-                const long long ca = clock64();
-                mbar_wait(&gfull[s0], p0);
-                cw += clock64() - ca;
-                const uint32_t lo0 = ((sbase + s0 * G_ST) >> 4) | (1u << 16);
-                constexpr uint32_t HI = (1024 >> 4) | (1u << 30), XO = G_W >> 4;
-                wg_fence();
-                if (!nomma) {
-#pragma unroll
-                    for (int k = 0; k < 4; ++k) wgmma_m64n32k32_e4m3(t, desc_lo(lo0 + 2 * k, HI), desc_lo(lo0 + XO + 2 * k, HI), k > 0);
-                }
-                wg_commit();
-            };
-            int fs1 = g;
-            auto finish_1 = [&](int i, const float* t) {
-                __syncwarp();
-                if (lane == 0) mbar_arrive(&gempty[fs1]);
-                fs1 += 2; if (fs1 >= gns) fs1 -= gns;
-                finish1(i, t);
-            };
-            float tA[16], tB[16];
-            mbar_wait(sx_full, 0);
-            if (tid == 0) BSTAMP(8);
-#pragma unroll 1
-            for (int j = 0; j < QKH / 2; j += 2) {
-                const int iA = g + 2 * j;
-                issue1(tA);
-                if (j > 0) { wg_wait<1>(); finish_1(iA - 2, tB); }
-                issue1(tB);
-                wg_wait<1>();
-                finish_1(iA, tA);
-            }
-            wg_wait<0>();
-            finish_1(g + QKH - 2, tB);
-#endif
             if (P.dbg && (tid & 127) == 0) { P.dbg[blockIdx.x * NDBG + 27 + g] = cw; P.dbg[blockIdx.x * NDBG + 29] = clock64() - c0; }
-#if MEGA_LATE_GATHER && !MEGA_MID_GATHER && !MEGA_GWARP
-            if (att && !MEGA_REL_EARLY) { named_bar_sync(1, NMATH); mega_gather_issue<WINDOW>(P, smem, h); }   // every unit consumed: the ring is dead
-#endif
             // warpgroup 1 -> smem -> warpgroup 0 (fixed order: wg 0 + wg 1)
             // the warpgroup-1 partial [64 rows][32 tok] fp32 lives in the attention-tile halves of o_proj stages 0 / 1 (rows 0..31 / 32..63): the
             // o_proj WEIGHT TMAs may start right after the loops (gdone), the attention tiles land there only after every attention flag
             auto red_at = [&](int row) { return reinterpret_cast<float*>(smem + (row >> 5) * ST_BYTES + WT_BYTES) + (row & 31) * M; };
-#if !MEGA_LL
             named_bar_sync(1, NMATH);   // both warpgroups' last wgmma retired: the ring (incl. its stage-0/1 parts) is dead
             __syncwarp();
-            if ((!att || MEGA_ATT_EARLY_W || MEGA_OPF) && lane == 0) mbar_arrive(gdone);
-#endif
+            if (!att && lane == 0) mbar_arrive(gdone);
             // both warpgroups send their partial of the PARTNER's finalized rows straight over DSMEM (slot g); warpgroup 1 hands its partial of
             // MY finalized rows to warpgroup 0 through smem; warpgroup 0 finalizes in the fixed order (K half 0: wg0 + wg1) + (K half 1: wg0 + wg1)
             const int pf0 = h ? 0 : qmid, pf1 = h ? qmid : qg;   // the partner's finalized rows
@@ -1821,7 +1332,6 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
                 if (tid == 0) BSTAMP(13);
                 const float* xs0 = reinterpret_cast<const float*>(smem + MG_OFF_XG);
                 const float* xs1 = xs0 + 30 * M;
-                __nv_bfloat16* fin = reinterpret_cast<__nv_bfloat16*>(smem + OFF_FIN);
 #pragma unroll
                 for (int r = 0; r < 16; r += 2) {
                     const int row = frow + ((r >> 1) & 1) * 8, tok = (r >> 2) * 8 + fcol;
@@ -1832,19 +1342,14 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
                         const float m0 = acc[r] + o1.x, m1 = acc[r + 1] + o1.y, p0 = q0.x + q1.x, p1 = q0.y + q1.y;   // mine / partner's K half
                         const float v0 = h ? p0 + m0 : m0 + p0, v1 = h ? p1 + m1 : m1 + p1;                             // K half 0 + K half 1
                         const __nv_bfloat16 b0 = __float2bfloat16_rn(v0), b1 = __float2bfloat16_rn(v1);
-                        if (MEGA_LL) {   // LL staging (stage 0's weight half: only MEGA_LL delays the o_proj weight TMAs past this point)
-                            fin[tok * 30 + (row - fin0)] = b0;
-                            fin[(tok + 1) * 30 + (row - fin0)] = b1;
-                        } else {         // staging for the coalesced row stores below
-                            __nv_bfloat16* stg = reinterpret_cast<__nv_bfloat16*>(smem + 2 * ST_BYTES + WT_BYTES);
-                            stg[tok * 32 + (row - fin0)] = b0;
-                            stg[(tok + 1) * 32 + (row - fin0)] = b1;
-                        }
+                        // staging for the coalesced row stores below
+                        __nv_bfloat16* stg = reinterpret_cast<__nv_bfloat16*>(smem + 2 * ST_BYTES + WT_BYTES);
+                        stg[tok * 32 + (row - fin0)] = b0;
+                        stg[(tok + 1) * 32 + (row - fin0)] = b1;
                     }
                 }
             }
         }
-#if !MEGA_LL
         // qkv rows: token t's (fin1 - fin0) finalized columns are contiguous in qout -> warp w writes tokens w, w + 8, .. (one 2-B store per lane)
         named_bar_sync(1, NMATH);
         {
@@ -1853,55 +1358,22 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
             for (int t = warp; t < M; t += NW)
                 if (lane < nfin) P.qout[(size_t)t * QN + qrow0 + fin0 + lane] = stg[t * 32 + lane];
         }
-#endif
         // the warpgroup-1 partial / staging (generic writes / reads) sit in attention-tile slots that the TMA (async proxy) overwrites later
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
         if (tid == 0) BSTAMP(14);
-#if !MEGA_LL
         __syncwarp();
         if (lane == 0) mbar_arrive(qready);
-#endif
         mbar_wait(ep_bar, 0);   // also orders the math warps after the o_proj producer's griddepcontrol.wait
         named_bar_sync(1, NMATH);
-#if MEGA_REL_EARLY && !MEGA_LL
         if (att) {
-            // every math thread's row stores precede the barrier above -> one gpu-scope release (cumulative) by tid 0, issued while this SM has no
-            // load in flight (the GEMM ring is drained, the o_proj weights start only after att_in; MEGA_EARLY_KV: the gathers landed long ago),
-            // THEN (late gathers) the K / V window gathers
+            // every math thread's row stores precede the barrier above -> one gpu-scope release (cumulative) by tid 0 BEFORE the attention
+            // CTA's K / V and o_proj traffic, issued while this SM has no load in flight (the GEMM ring is drained, the o_proj weights start
+            // only after att_in, the K / V gathers landed long ago): the release fence (MEMBAR.ALL.GPU) waits for the SM's in-flight loads
             if (tid == 0) { st_release_gpu(&P.qflags[c * FLAG_STRIDE], s_epoch[0]); if (P.dbg) P.dbg[blockIdx.x * NDBG + 9] = gtimer(); }
-#if MEGA_LATE_GATHER && !MEGA_MID_GATHER && !MEGA_GWARP
-            mega_gather_issue<WINDOW>(P, smem, h);
-#endif
         }
-#endif
-#if MEGA_LL
-        {
-            // LL messages: thread (t, j) of the first 192 writes {rows 6 j .. 6 j + 5 of token t, epoch}; lanes 2k / 2k + 1 = messages 2k', 2k' + 1
-            // of one token -> every 32-B sector of the buffer is written by ONE store instruction (the LL tearing rule)
-            if (tid < M * LL_MSG) {
-                const int t = tid / LL_MSG, j = tid - t * LL_MSG;
-                if (j < 5) {
-                    const uint32_t* f = reinterpret_cast<const uint32_t*>(smem + OFF_FIN) + (t * 30 + 6 * j) / 2;
-                    st_relaxed_v4(P.qll + ((size_t)t * NCTA + c) * LL_MSG + j, make_uint4(f[0], f[1], f[2], s_epoch[0]));
-                }
-            }
-            if (tid == 0) BSTAMP(9);
-        }
-#endif
-#if MEGA_LL
-        // LL: the staging tile lives in stage 0's weight half -> the o_proj weight TMAs of the non-attention CTAs only now
-        named_bar_sync(1, NMATH);
-        __syncwarp();
-        if (!att && lane == 0) mbar_arrive(gdone);
-#endif
         if (att) {
             // the row groups this attention CTA reads: both CTAs (K halves finalize different rows) of each group
-#if MEGA_PRELOAD
             const MegaPre mpre = mega_att_pre(P, pb, phg, h);   // inputs of earlier kernels: in flight during the poll
-#endif
-#if MEGA_LL
-            mega_ll_gather(P, smem, pb, phg, h, s_epoch[0]);
-#else
             int qa, qb, ka, kb;
             mega_groups(phg, h, qa, qb, ka, kb);
             const int nq = 2 * (qb - qa + 1), nk = ka <= kb ? 2 * (kb - ka + 1) : 0;
@@ -1915,12 +1387,8 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
                 }
             }
             named_bar_sync(1, NMATH);
-#endif
             if (tid == 0) BSTAMP(10);
-#if !MEGA_PRELOAD
-            const MegaPre mpre = mega_att_pre(P, pb, phg, h);
-#endif
-            mega_attention<WINDOW>(P, smem, pb, phg, h, att_in, xm_full, xo_full, gath_full, mpre);
+            mega_attention<WINDOW>(P, smem, pb, phg, h, att_in, xm_full, xo_full, mpre);
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             named_bar_sync(1, NMATH);
             if (tid == 0) {
@@ -1928,12 +1396,9 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
                 st_release_gpu(&P.flags[c * FLAG_STRIDE], s_epoch[0]);
                 BSTAMP(30);
             }
-            // next SWA layer's K / V window rows: the L2 prefetch moves to the kernel end (it delayed this CTA's attention-flag poll by
-            // ~0.5 us); the slot list is copied out of the attention scratch (the late o_proj weight TMAs overwrite it after att_done)
-#if MEGA_KVPF_END
-            if (P.nkc && phg == 0 && tid < 80) reinterpret_cast<int*>(smem + MG_OFF_XG)[tid] = mega_att(smem).s_slot[tid];
-#else
-            if (P.nkc && phg == 0) {   // right after the release (as attn_block_kernel)
+            // next SWA layer: same slots -> L2-prefetch (evict_last) its K / V window rows, right after the release (as attn_block_kernel) and
+            // before att_done (the slot list lives in the attention scratch the late o_proj weight TMAs overwrite)
+            if (P.nkc && phg == 0) {
                 const int* s_slot = mega_att(smem).s_slot;
                 const int NR = h ? (144 - 64) : 64;
                 for (int i = tid; i < NR * 5; i += NMATH) {
@@ -1945,7 +1410,6 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
                     asm volatile("prefetch.global.L2::evict_last [%0];" :: "l"(a));
                 }
             }
-#endif
             named_bar_sync(1, NMATH);
             if (tid == 0) mbar_arrive(att_done);
         }
@@ -1953,11 +1417,10 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
         {
             const unsigned epoch = s_epoch[0];
             if (tid == 0) BSTAMP(31);
-#if MEGA_KTREADY
+            // each o_proj attention k-tile is TMA'd as soon as ITS 4 producer CTAs released (not after all 64 attention flags):
             // k-tile kt (K elements [1024 h + 64 kt, +64) = head 8 h + kt / 2, dims 64 (kt % 2) ..) comes from the attention CTAs
-            // (request b, head pair 4 h + kt / 4, key half kt % 2), b = 0..3: lane 0 of warp kt % 8 (kt < 8) / lane 1 (kt >= 8) polls them
-            // (acquire by the issuing thread), then issues that k-tile's TMA; k-tiles NS.. are lane 1 of the producer warp's (after bgo)
-            // lanes 4 j .. 4 j + 3 of warp w: k-tile w + 8 j, one producer flag per lane (concurrent polls), then lane 4 j issues the TMA
+            // (request b, head pair 4 h + kt / 4, key half kt % 2), b = 0..3: lanes 4 j .. 4 j + 3 of warp w poll the producer flags of
+            // k-tile w + 8 j, one flag per lane (concurrent polls, acquire by the polling thread), then lane 4 j issues the TMA
             // (k-tiles 13..15: the stage is still busy -> lane 4 j arrives kt_seen and the producer warp's lane 1 issues them later)
             if (lane < 8) {
                 const int j = lane >> 2, kt = warp + NW * j, b = lane & 3;
@@ -1977,26 +1440,6 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
                 }
             }
             if (tid == 0) { BSTAMP(2); mbar_arrive(bgo); }
-#else
-            if (tid < NATT) {
-                const unsigned* fl = P.flags + tid * FLAG_STRIDE;
-                for (;;) {
-                    if (ld_acquire_gpu(fl) == epoch) break;
-                    __nanosleep(32);
-                }
-            }
-            named_bar_sync(1, NMATH);
-            if (tid == 0) {
-                asm volatile("fence.acq_rel.gpu;" ::: "memory");
-                BSTAMP(2);
-                asm volatile("fence.proxy.async.global;" ::: "memory");
-                for (int kt = 0; kt < NS; ++kt) {
-                    mbar_expect(&bfull[kt], BT_BYTES);
-                    tma_load_2d_nohint(smem + kt * ST_BYTES + WT_BYTES, &P.tm_a, kbase + kt * KT, 0, &bfull[kt]);
-                }
-                mbar_arrive(bgo);
-            }
-#endif
         }
         const int g = warp >> 2;
         const uint32_t sbase = sa(smem);
@@ -2064,47 +1507,26 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
         const uint32_t* w = reinterpret_cast<const uint32_t*>(outs + tok * COLS + 6 * g6);
         const uint32_t w0 = w[0], w1 = w[1], w2 = w[2];
         const int owner = tok % TP_NDEV;
-        if (!FUSED && (owner == P.my_rank || (P.mode & MODE_FULL_LOCAL))) {
+        if (owner == P.my_rank || (P.mode & MODE_FULL_LOCAL)) {
             uint32_t* dst = reinterpret_cast<uint32_t*>(P.partial + (size_t)tok * DIM + c0 + 6 * g6);
             dst[0] = w0; dst[1] = w1; dst[2] = w2;
         }
-        if ((FUSED || owner != P.my_rank) && !(P.mode & MODE_NO_PUSH)) {
+        if (owner != P.my_rank && !(P.mode & MODE_NO_PUSH)) {
             const int k = c0 / TP_KS, m = (c0 % TP_KS) / 6 + g6;
             st_ll(P.peer[owner] + tp_rs_idx(P.my_rank, tok, k, m), make_uint4(w0, w1, w2, epoch));
         }
-        if constexpr (FUSED) { if (c < LAYER_TOKC) named_bar_arrive(LAYER_PUSH_BAR, 2 * NMATH); }   // -> the layer kernel's token-reduce warps
         }   // !qonly
     }
-    if (R_MATH && MEGA_KVPF_END && att && P.nkc && ((c / CL) % NHG) == 0 && tid < NMATH) {
-        const int* sl_ = reinterpret_cast<const int*>(smem + MG_OFF_XG);
-        const int NR = h ? (144 - 64) : 64;
-        for (int i = tid; i < NR * 5; i += NMATH) {
-            const int lr = i / 5, part = i - lr * 5;
-            const int sl = sl_[lr];
-            if (sl < 0) continue;
-            const char* a = part < 3 ? reinterpret_cast<const char*>(P.nkc + (size_t)sl * P.ks) + part * 128
-                                     : reinterpret_cast<const char*>(P.nvc + (size_t)sl * P.vs) + (part - 3) * 128;
-            asm volatile("prefetch.global.L2::evict_last [%0];" :: "l"(a));
-        }
-    }
-    if (R_MATH && tid == 0) BSTAMP(5);
-    if constexpr (!FUSED) griddep_launch();
-    // FUSED: the layer kernel's MoE phase reuses this shared memory (generic and TMA writes): order this phase's generic smem writes
-    // before later async-proxy writes, and invalidate the mbarrier objects once both CTAs of the pair are past the end sync
-    if constexpr (FUSED && R_MATH) asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    if (tid == 0) BSTAMP(5);
+    griddep_launch();
     cluster_sync_relaxed();
-    if constexpr (FUSED && R_MATH) {
-        constexpr int MG_NBAR = 3 * NS + 6 + 2 * GNS_OTH + 10;   // wfull, bfull, sempty | att_in .. bgo | gfull, gempty | gdone .. qrel
-        static_assert(MG_NBAR * 8 <= MG_OFF_MISC - MG_OFF_BAR, "mega barrier region");
-        if (tid < MG_NBAR) asm volatile("mbarrier.inval.shared::cta.b64 [%0];" :: "r"(sa(wfull + tid)) : "memory");
-    }
 }
 
 template <int WINDOW>
 __global__ void __launch_bounds__(MG_NTHREADS, 1) attn_block_mega_kernel(const __grid_constant__ MegaParams P) {
     extern __shared__ uint8_t smem_raw[];
     uint8_t* smem = smem_raw + ((1024u - (sa(smem_raw) & 1023u)) & 1023u);
-    mega_body<WINDOW, false>(P, smem);
+    mega_body<WINDOW>(P, smem);
 }
 
 // ------------------------------------------------------------------------------------------------------------------ host
@@ -2240,19 +1662,7 @@ void attn_block_ext(torch::Tensor attn, torch::Tensor partial, torch::Tensor wma
 }
 
 // ------------------------------------------------------------------------------------------------------------------ mega host
-// fp8 (1-byte) row-major [rows][cols] -> CPU u8[128] tensor map, box {128 cols, box_rows}, SWIZZLE_128B
-static torch::Tensor make_map_u8(const void* base, int64_t rows, int64_t cols, int64_t row_stride_bytes, int box_rows) {
-    auto out = torch::zeros({(int64_t)sizeof(CUtensorMap)}, torch::dtype(torch::kUInt8));
-    const cuuint64_t dims[2] = {(cuuint64_t)cols, (cuuint64_t)rows};
-    const cuuint64_t strides[1] = {(cuuint64_t)row_stride_bytes};
-    const cuuint32_t box[2] = {(cuuint32_t)QBK, (cuuint32_t)box_rows}, estr[2] = {1, 1};
-    CUresult r = encode_tiled_fn()(reinterpret_cast<CUtensorMap*>(out.data_ptr()), CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<void*>(base), dims, strides, box,
-                                   estr, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-                                   CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-    TORCH_CHECK(r == CUDA_SUCCESS, "cuTensorMapEncodeTiled (u8) failed: ", (int)r);
-    return out;
-}
-// MEGA_PSTAGE: fp8 row-major [rows][cols] viewed as 3D {128 (k in block), rows, cols / 128 (k-block, stride 128 B)} -> box {128, box_rows, 2}:
+// fp8 row-major [rows][cols] viewed as 3D {128 (k in block), rows, cols / 128 (k-block, stride 128 B)} -> box {128, box_rows, 2}:
 // two consecutive k-blocks land as two [box_rows][128] SWIZZLE_128B tiles back to back
 static torch::Tensor make_map_u8_3d(const void* base, int64_t rows, int64_t cols, int64_t row_stride_bytes, int box_rows) {
     auto out = torch::zeros({(int64_t)sizeof(CUtensorMap)}, torch::dtype(torch::kUInt8));
@@ -2266,39 +1676,17 @@ static torch::Tensor make_map_u8_3d(const void* base, int64_t rows, int64_t cols
     return out;
 }
 static torch::Tensor make_qxmap(const torch::Tensor& x) {
-    return MEGA_PSTAGE ? make_map_u8_3d(x.data_ptr(), M, QK, x.stride(0), M) : make_map_u8(x.data_ptr(), M, QK, x.stride(0), M);
+    return make_map_u8_3d(x.data_ptr(), M, QK, x.stride(0), M);
 }
-// qkv weight fp8 [3392][6144] (contiguous rows) -> CPU u8[256] = two maps: box {128, 53 or 60 (MEGA_SPLIT)}, box {128, 32}
-// (MEGA_PSTAGE: 3D maps, box {128, 64, 2} / {128, 32, 2})
+// qkv weight fp8 [3392][6144] (contiguous rows) -> CPU u8[256] = two 3D maps: box {128, 64, 2} (pairs 0..49) / {128, 32, 2} (pairs 50..63)
 torch::Tensor make_qwmap(torch::Tensor w) {
     TORCH_CHECK(w.is_cuda() && w.element_size() == 1 && w.dim() == 2 && w.size(0) == QN && w.size(1) == QK && w.stride(1) == 1 && w.stride(0) % 16 == 0 &&
                 reinterpret_cast<uint64_t>(w.data_ptr()) % 16 == 0, "qkv weight must be fp8 [3392][6144], 16-B aligned rows");
-    if (MEGA_PSTAGE) return torch::cat({make_map_u8_3d(w.data_ptr(), QN, QK, w.stride(0), 64), make_map_u8_3d(w.data_ptr(), QN, QK, w.stride(0), 32)});
-    return torch::cat({make_map_u8(w.data_ptr(), QN, QK, w.stride(0), MEGA_SPLIT ? QG_E : QG), make_map_u8(w.data_ptr(), QN, QK, w.stride(0), QG_L)});
+    return torch::cat({make_map_u8_3d(w.data_ptr(), QN, QK, w.stride(0), 64), make_map_u8_3d(w.data_ptr(), QN, QK, w.stride(0), 32)});
 }
 
-// MEGA_XFLAG: xflags = the producing fused MoE's x-row flags (int32 [>= 32], device) + its work counters; empty = griddepcontrol.wait only
-static void set_xflags(MegaParams& P, const torch::Tensor& xflags, const torch::Tensor& xwork) {
-    P.xflags = nullptr; P.xwork = nullptr;
-    if (xflags.numel() == 0) return;
-    TORCH_CHECK(MEGA_XFLAG, "xflags given but this build has MEGA_XFLAG=0");
-    TORCH_CHECK(xflags.is_cuda() && xflags.scalar_type() == torch::kInt32 && xflags.numel() >= M && xflags.is_contiguous() &&
-                reinterpret_cast<uint64_t>(xflags.data_ptr()) % 16 == 0, "xflags must be a 16-B aligned contiguous device int32 [>= 32]");
-    TORCH_CHECK(xwork.is_cuda() && xwork.scalar_type() == torch::kInt32 && xwork.numel() >= 4, "xwork (fused MoE work counters)");
-    P.xflags = reinterpret_cast<const unsigned*>(xflags.data_ptr<int>());
-    P.xwork = xwork.data_ptr<int>();
-}
-
-#ifdef BLK_LAYER_CAPTURE
-// goal11 layer (layer_fused.cu): while g_mega_capture is set, attn_block_mega only builds its params (no launch); the layer kernel runs them
-struct MegaCapture { MegaParams P; int window; bool pdl; bool valid; };
-static MegaCapture* g_mega_capture = nullptr;
-#endif
 template <int WINDOW>
 static void launch_mega_t(const MegaParams& P, cudaStream_t stream, bool pdl) {
-#ifdef BLK_LAYER_CAPTURE
-    if (g_mega_capture) { g_mega_capture->P = P; g_mega_capture->window = WINDOW; g_mega_capture->pdl = pdl; g_mega_capture->valid = true; return; }
-#endif
     static bool configured[16] = {false};
     int dev = 0; cudaGetDevice(&dev);
     if (!configured[dev]) {
@@ -2318,18 +1706,16 @@ static void launch_mega_t(const MegaParams& P, cudaStream_t stream, bool pdl) {
 // view, row stride % 4 == 0) | qwmap = make_qwmap(qkv weight) | qsw [27][48] fp32 | qout bf16 [32][3392] (the qkv rows, scratch) |
 // qflags int32 >= 128 * 32 | qpre: weight units issued before griddepcontrol.wait | the rest = attn_block_swa's.
 void attn_block_mega(torch::Tensor x, torch::Tensor x_scale_t, torch::Tensor qwmap, torch::Tensor qsw, torch::Tensor qout, torch::Tensor qflags,
-                     torch::Tensor qll, int64_t qpre,
-                     torch::Tensor cos_sin, torch::Tensor positions, torch::Tensor loc, torch::Tensor kc, torch::Tensor vc,
+                     int64_t qpre, torch::Tensor cos_sin, torch::Tensor positions, torch::Tensor loc, torch::Tensor kc, torch::Tensor vc,
                      torch::Tensor pt, torch::Tensor seqlens, torch::Tensor sinks, torch::Tensor attn_out, torch::Tensor flags, torch::Tensor partial,
                      torch::Tensor wmap, torch::Tensor amap, torch::Tensor peers, torch::Tensor work, int64_t my_rank, double sm_scale, int64_t window, int64_t mode,
-                     int64_t pdl, torch::Tensor dbg, torch::Tensor slot_cache, torch::Tensor nkc, torch::Tensor nvc, torch::Tensor xflags, torch::Tensor xwork) {
+                     int64_t pdl, torch::Tensor dbg, torch::Tensor slot_cache, torch::Tensor nkc, torch::Tensor nvc) {
     TORCH_CHECK(x.is_cuda() && x.element_size() == 1 && x.dim() == 2 && x.size(0) == M && x.size(1) == QK && x.stride(1) == 1 && x.stride(0) % 16 == 0 &&
                 reinterpret_cast<uint64_t>(x.data_ptr()) % 16 == 0, "x must be fp8 [32][6144]");
     TORCH_CHECK(x_scale_t.scalar_type() == torch::kFloat32 && x_scale_t.dim() == 2 && x_scale_t.size(0) == QKB && x_scale_t.size(1) >= M &&
                 x_scale_t.stride(1) == 1 && x_scale_t.stride(0) == M && reinterpret_cast<uint64_t>(x_scale_t.data_ptr()) % 16 == 0, "x_scale_t [48][32] fp32 rows");
     TORCH_CHECK(qsw.scalar_type() == torch::kFloat32 && qsw.numel() == QNB * QKB && qsw.is_contiguous(), "qkv weight scale [27][48] fp32");
-    TORCH_CHECK(qout.numel() == 0 || (qout.scalar_type() == torch::kBFloat16 && qout.numel() == (int64_t)M * QN && qout.is_contiguous()), "qout bf16 [32][3392] or empty");
-    TORCH_CHECK(!MEGA_LL || (qll.is_cuda() && qll.numel() * qll.element_size() >= (int64_t)M * NCTA * LL_MSG * 16 && reinterpret_cast<uint64_t>(qll.data_ptr()) % 16 == 0), "qll >= 32 x 128 x 6 x 16 B");
+    TORCH_CHECK(qout.scalar_type() == torch::kBFloat16 && qout.numel() == (int64_t)M * QN && qout.is_contiguous(), "qout bf16 [32][3392]");
     TORCH_CHECK(qflags.numel() >= (int64_t)NCTA * FLAG_STRIDE && qflags.element_size() == 4, "qflags");
     TORCH_CHECK(qwmap.device().is_cpu() && qwmap.numel() == 2 * sizeof(CUtensorMap), "qwmap (make_qwmap)");
     TORCH_CHECK(cos_sin.scalar_type() == torch::kBFloat16 && cos_sin.size(1) == 64 && cos_sin.is_contiguous(), "cos_sin [P][64] bf16");
@@ -2353,12 +1739,9 @@ void attn_block_mega(torch::Tensor x, torch::Tensor x_scale_t, torch::Tensor qwm
     }
     P.qsx = x_scale_t.data_ptr<float>(); P.qsx_ld = (int)x_scale_t.stride(0);
     P.qsw = qsw.data_ptr<float>();
-    P.qout = qout.numel() ? reinterpret_cast<__nv_bfloat16*>(qout.data_ptr()) : nullptr;
-    TORCH_CHECK(MEGA_LL || P.qout, "MEGA_LL 0 needs the qout buffer");
-    P.qll = reinterpret_cast<uint4*>(qll.data_ptr());
+    P.qout = reinterpret_cast<__nv_bfloat16*>(qout.data_ptr());
     P.qflags = reinterpret_cast<unsigned*>(qflags.data_ptr());
     P.qpre = (int)std::max<int64_t>(0, std::min<int64_t>(qpre, GNS_OTH));
-    set_xflags(P, xflags, xwork);
     P.qkv = P.qout;
     P.cos_sin = reinterpret_cast<const __nv_bfloat16*>(cos_sin.data_ptr());
     P.positions = positions.data_ptr(); P.loc = loc.data_ptr();
@@ -2395,7 +1778,7 @@ void attn_block_mega(torch::Tensor x, torch::Tensor x_scale_t, torch::Tensor qwm
 
 // FA layers: the megakernel's qkv GEMM alone (MODE_QKV_ONLY): x [32][6144] fp8 + x_scale_t [48][32] -> qout bf16 [32][3392]
 void attn_block_qkv(torch::Tensor x, torch::Tensor x_scale_t, torch::Tensor qwmap, torch::Tensor qsw, torch::Tensor qout, torch::Tensor qflags,
-                    torch::Tensor work, int64_t qpre, int64_t pdl, torch::Tensor dbg, torch::Tensor xflags, torch::Tensor xwork) {
+                    torch::Tensor work, int64_t qpre, int64_t pdl, torch::Tensor dbg) {
     TORCH_CHECK(x.is_cuda() && x.element_size() == 1 && x.dim() == 2 && x.size(0) == M && x.size(1) == QK && x.stride(1) == 1 && x.stride(0) % 16 == 0 &&
                 reinterpret_cast<uint64_t>(x.data_ptr()) % 16 == 0, "x must be fp8 [32][6144]");
     TORCH_CHECK(x_scale_t.scalar_type() == torch::kFloat32 && x_scale_t.dim() == 2 && x_scale_t.size(0) == QKB && x_scale_t.size(1) >= M &&
@@ -2405,7 +1788,6 @@ void attn_block_qkv(torch::Tensor x, torch::Tensor x_scale_t, torch::Tensor qwma
     TORCH_CHECK(qflags.numel() >= (int64_t)NCTA * FLAG_STRIDE && qflags.element_size() == 4, "qflags");
     TORCH_CHECK(qwmap.device().is_cpu() && qwmap.numel() == 2 * sizeof(CUtensorMap), "qwmap (make_qwmap)");
     TORCH_CHECK(work.scalar_type() == torch::kInt32 && work.numel() >= 4, "work");
-    TORCH_CHECK(!MEGA_LL, "qkv-only mode needs the flag handoff build");
     MegaParams P{};
     std::memcpy(&P.tm_qw, qwmap.data_ptr(), sizeof(CUtensorMap));
     std::memcpy(&P.tm_qw2, reinterpret_cast<const uint8_t*>(qwmap.data_ptr()) + sizeof(CUtensorMap), sizeof(CUtensorMap));
@@ -2419,7 +1801,6 @@ void attn_block_qkv(torch::Tensor x, torch::Tensor x_scale_t, torch::Tensor qwma
     P.qkv = P.qout;
     P.qflags = reinterpret_cast<unsigned*>(qflags.data_ptr());
     P.qpre = (int)std::max<int64_t>(0, std::min<int64_t>(qpre, GNS_OTH));
-    set_xflags(P, xflags, xwork);
     P.work = work.data_ptr<int>();
     P.dbg = dbg.numel() >= (int64_t)NCTA * NDBG ? reinterpret_cast<unsigned long long*>(dbg.data_ptr()) : nullptr;
     P.mode = MODE_QKV_ONLY;
@@ -2428,7 +1809,6 @@ void attn_block_qkv(torch::Tensor x, torch::Tensor x_scale_t, torch::Tensor qwma
 
 }  // namespace blk
 
-#ifndef BLK_NO_PYBIND
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("attn_block_swa", &blk::attn_block_swa);
     m.def("make_wmap", &blk::make_wmap);
@@ -2449,9 +1829,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("MODE_DBG_GNOMMA") = blk::MODE_DBG_GNOMMA;
     m.attr("MODE_DBG_GNOX") = blk::MODE_DBG_GNOX;
     m.attr("MODE_DBG_GNOW") = blk::MODE_DBG_GNOW;
-    m.attr("MEGA_LL") = MEGA_LL;
-    m.attr("MEGA_SPLIT") = MEGA_SPLIT;
-    m.attr("MEGA_XFLAG") = MEGA_XFLAG;
-    m.attr("MEGA_PSTAGE") = MEGA_PSTAGE;
 }
-#endif  // BLK_NO_PYBIND

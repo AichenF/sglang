@@ -54,7 +54,6 @@ class Scratch:
         # qkv-only launches (FA layers) release their flags with a fixed epoch (dummy_work): they get their own flag lines so a
         # SWA megakernel launch polling ``qflags`` for epoch work[2] + 1 can never match a stale qkv-only release after wraparound
         self.qflags_qkv = torch.zeros(128 * 32, dtype=torch.int32, device=device)
-        self.qll = torch.zeros(32 * 128 * 6 * 4, dtype=torch.int32, device=device)   # LL messages {6 bf16, epoch} [32 tok][128 CTA][6]
         self.dummy_work = torch.zeros(8, dtype=torch.int32, device=device)   # qkv-only launches: epoch source (their flags are not polled)
 
 
@@ -138,13 +137,11 @@ def run_mega(
     nkv=None,
     qpre=0,
     qout=None,
-    xflags=None,
-    xwork=None,
 ):
     """attention megakernel: x [32][6144] e4m3 + x_scale [32][48] fp32 (deep_gemm column-major, stride (1, ld)) -> qkv_proj (qwmap =
     ext().make_qwmap(weight), qsw = weight_scale_inv [27][48]) + the fused block of run(); the qkv rows land in scratch.qout."""
     if qout is None:
-        qout = scratch.qout if not getattr(ext(), "MEGA_LL", 0) else _empty_bf16(x.device)
+        qout = scratch.qout
     ext().attn_block_mega(
         x,
         x_scale.t(),
@@ -152,7 +149,6 @@ def run_mega(
         qsw,
         qout,
         scratch.qflags,
-        scratch.qll,
         int(qpre),
         cos_sin,
         positions,
@@ -178,18 +174,14 @@ def run_mega(
         scratch.slots,
         nkv[0] if nkv is not None else _empty_bf16(x.device),
         nkv[1] if nkv is not None else _empty_bf16(x.device),
-        xflags if xflags is not None else _empty_i32(x.device),
-        xwork if xwork is not None else _empty_i32(x.device),
     )
 
 
-def run_qkv(x, x_scale, qwmap, qsw, out, scratch: Scratch, pdl=True, qpre=0, dbg=None, xflags=None, xwork=None):
+def run_qkv(x, x_scale, qwmap, qsw, out, scratch: Scratch, pdl=True, qpre=0, dbg=None):
     """FA layers: the megakernel's qkv GEMM alone -> out bf16 [32][3392] (x / x_scale = the norm-next (fp8, column-major scales) pair)."""
     ext().attn_block_qkv(
         x, x_scale.t(), qwmap, qsw, out, scratch.qflags_qkv, scratch.dummy_work, int(qpre), int(bool(pdl)),
         dbg if dbg is not None else _EMPTY_I64.setdefault(str(x.device), torch.empty(0, dtype=torch.int64, device=x.device)),
-        xflags if xflags is not None else _empty_i32(x.device),
-        xwork if xwork is not None else _empty_i32(x.device),
     )
 
 
@@ -205,23 +197,6 @@ def run_ext(attn, partial, wmap, peers_cpu, work, my_rank, mode=0, pdl=False, db
 _EMPTY = {}
 _EMPTY_I64 = {}
 _EMPTY_BF16 = {}
-
-
-_EMPTY_I32 = {}
-
-
-def _empty_i32(device):
-    return _EMPTY_I32.setdefault(str(device), torch.empty(0, dtype=torch.int32, device=device))
-
-
-def x_ready_flags(xq):
-    """goal11 mega (MEGA_XFLAG): the producing fused MoE's x-row flags + work counters attached to its norm-next x_fp8 buffer, or (None, None)."""
-    if not mega_xflag_enabled():
-        return None, None
-    xf, xw = getattr(xq, "_nn_xflags", None), getattr(xq, "_nn_work", None)
-    if xf is None or xw is None or not getattr(ext(), "MEGA_XFLAG", 0):
-        return None, None
-    return xf, xw
 
 
 def _empty_bf16(device):
@@ -531,7 +506,6 @@ class BlkLayer:
             return None
         partial = torch.empty(32, 6144, dtype=torch.bfloat16, device=xq.device)
         st = self.fmoe.shared
-        xf, xw = x_ready_flags(xq)
         run_mega(
             xq,
             xs,
@@ -558,8 +532,6 @@ class BlkLayer:
             dbg=self.dbg,
             nkv=self._next_kv(backend, keys, values),
             qpre=self.qpre,
-            xflags=xf,
-            xwork=xw,
         )
         partial._blk_prepushed = True
         _log_once("ran_mega", "attention megakernel running (layer %d)", layer.layer_id)
@@ -592,11 +564,6 @@ class BlkLayer:
         partial._blk_prepushed = True
         _log_once("ran_fa", "fused FA o_proj + push running")
         return partial
-
-
-def mega_xflag_enabled() -> bool:
-    # goal11 mega: start the qkv GEMM on the fused MoE's x-row flags (FMOE_NN_XFLAG / MEGA_XFLAG) instead of griddepcontrol.wait alone
-    return mega_enabled() and os.environ.get("SGLANG_MIMO_MEGA_XFLAG", "0") == "1"
 
 
 def mega_fa_enabled() -> bool:
@@ -670,6 +637,5 @@ class MegaQkv:
 
     def run(self, x):
         out = torch.empty(32, 3392, dtype=torch.bfloat16, device=x[0].device)
-        xf, xw = x_ready_flags(x[0])
-        run_qkv(x[0], x[1], self.qwmap, self.qsw, out, self.scratch, pdl=True, qpre=self.qpre, xflags=xf, xwork=xw)
+        run_qkv(x[0], x[1], self.qwmap, self.qsw, out, self.scratch, pdl=True, qpre=self.qpre)
         return out
