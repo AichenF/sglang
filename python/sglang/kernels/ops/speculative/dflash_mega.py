@@ -95,7 +95,7 @@ def default_plan() -> Dict[str, object]:
     qkv = _assign(QKV_TILES, qcaps[::-1], qorder)[::-1]
     plan["qkv"] = [[q, []] for q in qkv]
     # o_proj / down: 2 k-groups per cluster
-    # <= 4 tiles (2 slabs) per k-group everywhere: the phase lasts as long as its slowest group (slab boundaries ~1 us)
+    # <= 4 tiles (2 slabs) per k-group everywhere: the phase lasts as long as its slowest group
     gcaps = [4] * (2 * NCL)
     for name, n in (("o", O_TILES), ("dn", DN_TILES)):
         groups = _assign(n, gcaps)

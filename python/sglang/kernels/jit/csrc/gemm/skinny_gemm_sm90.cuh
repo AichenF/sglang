@@ -317,7 +317,7 @@ __global__ void __launch_bounds__(kThreads, 1) skinny_gemm_kernel(
     if constexpr (kMode == 1) {
       // per-channel mode: one accumulator chain over the whole K-slice; one unit's wgmma group stays in flight while
       // waiting for the next unit (wait_group 1), a unit's slot is released once its group retired. (Four independent
-      // accumulator chains measured no faster: at N = 32 the SS wgmma is smem-bound, ~0.25 us per 16 KB unit.)
+      // accumulator chains measured no faster: at N = 32 the SS wgmma is shared-memory bound.)
       for (int i = 0; i < n; ++i) {
         const int s = i % kStages;
         mbar_wait(&full[s], (i / kStages) & 1);

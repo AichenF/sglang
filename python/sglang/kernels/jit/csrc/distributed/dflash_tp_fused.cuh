@@ -1,10 +1,10 @@
-// TP8 decode fusions for the DFlash draft (hidden 6144, M <= 32 tokens), goal11-dense.
+// TP8 decode fusions (hidden 6144, M <= 32 tokens) for the DFlash draft and the target model's dense TP layer.
 //
 // tp_arnq: the row-parallel projection's partial output (o_proj / down_proj, [M, H] bf16 on every rank) ->
 //   reduce-scatter over the 8 ranks -> + residual (each rank keeps only its 768-column slice of the residual
 //   stream) -> RMSNorm -> per-token FP8 quant (or bf16) -> all-gather, in ONE kernel. Replaces the custom
-//   all-reduce (2-shot pull, 7-9 us), flashinfer fused_add_rmsnorm (5-6 us) and the per-token quant kernel
-//   (2 us) of the unfused path. The per-token RMS and amax need the full row: ranks exchange their slice's
+//   all-reduce (2-shot pull), flashinfer fused_add_rmsnorm and the per-token quant kernel of the unfused path.
+//   The per-token RMS and amax need the full row: ranks exchange their slice's
 //   (sum x^2, max |x * gamma|) and every rank derives the same rstd / scale (rank-order reductions).
 //
 // Transport: Lamport-style pushes into the peers' CUDA-IPC receive buffers (two phases, alternated per call
@@ -86,6 +86,7 @@ __device__ __forceinline__ unsigned long long gtime() {
 #define ARNQ_STAMP(k) do { if (p.stamps && threadIdx.x == 0) p.stamps[blockIdx.x * 16 + (k)] = gtime(); } while (0)
 
 __device__ __forceinline__ uint32_t nz(uint32_t w) { return w == 0u ? 0x80000000u : w; }  // +0.0 -> -0.0 (high half)
+// nz8 / poll_v4 / poll_v2 have no caller, but deleting them changes the generated code of tp_arnq_kernel<2, *>.
 __device__ __forceinline__ uint32_t nz8(uint32_t w) { return w == 0u ? 0x80000000u : w; } // 4 x e4m3: top byte -> -0
 __device__ __forceinline__ void st_v4(void* p, uint4 v) {
   asm volatile("st.global.v4.u32 [%0], {%1, %2, %3, %4};" ::"l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
@@ -160,7 +161,7 @@ __global__ void __launch_bounds__(THREADS) tp_arnq_kernel(const __grid_constant_
   const int rank = p.rank;
   uint8_t* const mine = p.peer[rank];
 #ifdef DFLASH_TP_STAMP_EDGES
-  if (p.stamps && tid == 0) p.stamps[blockIdx.x * 16 + 9] = gtime();  // goal11-post diag: CTA resident (before the PDL wait)
+  if (p.stamps && tid == 0) p.stamps[blockIdx.x * 16 + 9] = gtime();  // CTA resident (before the PDL wait)
 #endif
 
   device::PDLWaitPrimary<kUsePDL>();
@@ -174,9 +175,9 @@ __global__ void __launch_bounds__(THREADS) tp_arnq_kernel(const __grid_constant_
   __nv_bfloat16* const rrow = p.residual + static_cast<int64_t>(t) * H;  // full residual row (replicated, in place)
   const __nv_bfloat16* prow = p.partial + static_cast<int64_t>(t) * H;
   const int col = tid * 4;  // within the owned slice (tid < ACT)
-  // goal11-post: the phase-5 residual chunks and phase-7 gamma chunks of this thread are issued now (they do not
-  // depend on the exchange); their L2/HBM latency hides behind the two NVLink phases. In situ (layer-0 arnq after
-  // fa_block, residual and gamma cold) the norm + quant tail was 5.5 us of mostly dependent load latency.
+  // the phase-5 residual chunks and phase-7 gamma chunks of this thread are issued now (they do not depend on the
+  // exchange); their L2/HBM latency hides behind the two NVLink phases instead of forming a chain of dependent cold
+  // loads in the norm + quant tail.
   uint4 rpre[3], gpre[3];
 #pragma unroll
   for (int c = 0; c < 3; ++c) {
@@ -694,7 +695,7 @@ struct ArgmaxParams {
   int rank;
   int n;
   int group;            // > 1: output row r reads logits row (r / (group-1)) * group + 1 + r % (group-1) (skip block pos 0)
-  int64_t* cand;        // goal12-glue (group > 1, optional): verify candidates [blocks, group]: cand[b, 1 + j] = out of
+  int64_t* cand;        // (group > 1, optional) verify candidates [blocks, group]: cand[b, 1 + j] = out of
   const int64_t* cand_src;  //   row (b, j), cand[b, 0] = cand_src[b * group] (the block's bonus id)
 };
 
@@ -722,7 +723,7 @@ __global__ void __launch_bounds__(THREADS) argmax_ag_kernel(const __grid_constan
   if constexpr (sizeof(T) == 2) {
     if ((p.Vs & 7) == 0 && (p.ld & 7) == 0 && (reinterpret_cast<uintptr_t>(row) & 15) == 0) {
       // 16-byte vectors (8 bf16); per thread the columns still ascend, so strict '>' keeps the first index.
-      // goal11-glue: the first AX_UNR vectors of every thread are loaded up front (one memory latency instead of a
+      // The first AX_UNR vectors of every thread are loaded up front (one memory latency instead of a
       // dependent load -> compare chain per vector; Vs 19072 = 9.3 vectors per thread); the tail loop covers the rest.
       constexpr int AX_UNR = 10;
       const int nv = p.Vs >> 3;
@@ -830,9 +831,9 @@ struct EmbedParams {
   int64_t end[R];
   int rank;
   int M;
-  int local;                  // goal12-glue: weight is the FULL (replicated) table, start/end[rank] = [0, vocab): every
+  int local;                  // weight is the FULL (replicated) table, start/end[rank] = [0, vocab): every
                               // rank gathers its rows locally (no pushes, no receive polling, counters untouched)
-  int early;                  // goal12-glue: trigger the PDL secondary at entry (its pre-wait weight streaming overlaps
+  int early;                  // trigger the PDL secondary at entry (its pre-wait weight streaming overlaps
                               // this kernel; the secondary's griddepcontrol.wait still orders every read of our output)
 };
 
@@ -857,7 +858,7 @@ __global__ void __launch_bounds__(THREADS) embed_ag_kernel(const __grid_constant
   constexpr int NV = H / 8;  // 768 16-byte vectors
   if (owner == p.rank) {
     const __nv_bfloat16* src = p.weight + (id - p.start[p.rank]) * H;
-    // goal11-glue: all of this thread's row vectors are loaded up front (one HBM latency, not one per vector)
+    // all of this thread's row vectors are loaded up front (one HBM latency, not one per vector)
     constexpr int PER = NV / THREADS;  // 3
     uint4 dv[PER];
 #pragma unroll
@@ -951,7 +952,7 @@ __global__ void __launch_bounds__(THREADS) embed_nq_kernel(const __grid_constant
   __nv_bfloat16* orow = p.out + static_cast<int64_t>(t) * H;
   constexpr int NV = H / 8;          // 768 16-byte vectors
   constexpr int PER = NV / THREADS;  // 3
-  // goal11-post: the norm's gamma chunks issued up front (a dependent cold load at the kernel's tail otherwise)
+  // the norm's gamma chunks issued up front (a dependent cold load at the kernel's tail otherwise)
   uint4 gpre[3];
 #pragma unroll
   for (int c = 0; c < 3; ++c) gpre[c] = __ldg(reinterpret_cast<const uint4*>(q.gamma + c * THREADS * 8 + tid * 8));
@@ -960,7 +961,6 @@ __global__ void __launch_bounds__(THREADS) embed_nq_kernel(const __grid_constant
     const __nv_bfloat16* src = p.weight + (id - p.start[p.rank]) * H;
 #pragma unroll
     for (int j = 0; j < PER; ++j) d[j] = *reinterpret_cast<const uint4*>(src + (j * THREADS + tid) * 8);
-#pragma unroll
     if (!p.local) {
 #pragma unroll
       for (int j = 0; j < PER; ++j) {

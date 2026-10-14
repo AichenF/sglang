@@ -1,4 +1,4 @@
-// SiLU-and-mul + per-token-group-128 FP8 quant in ONE kernel (goal11-dense), for the dense-MLP decode path
+// SiLU-and-mul + per-token-group-128 FP8 quant in ONE kernel, for the dense-MLP decode path
 // (MiMo layer 0: gate_up [M, 2I] bf16 -> down_proj input).
 //
 // Bit-exact with the unfused pair it replaces when built with the same flags as the JIT activation kernel
