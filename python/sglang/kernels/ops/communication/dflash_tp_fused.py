@@ -105,7 +105,7 @@ class DFlashTPState:
         self.calls = torch.zeros(MAXT, dtype=torch.int32, device=device)
         self.acalls = torch.zeros(MAXT, dtype=torch.int32, device=device)
         self.ecalls = torch.zeros(MAXT, dtype=torch.int32, device=device)
-        self.stamps = None  # diagnostics: int64 cuda tensor [MAXT * 8]
+        self.stamps = None  # diagnostics: int64 cuda tensor [grid * 16] (indexed blockIdx.x * 16 + k)
         torch.cuda.synchronize(device)
 
     def arnq(

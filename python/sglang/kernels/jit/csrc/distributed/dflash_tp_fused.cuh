@@ -72,7 +72,7 @@ struct Params {
   float eps;
   int rank;
   int M;
-  unsigned long long* stamps;     // optional [MAXT][8] globaltimer (diagnostics)
+  unsigned long long* stamps;     // optional [gridDim.x][16] globaltimer (diagnostics; index blockIdx.x * 16 + k)
   int sx_ld;                      // mode 2: column-major group-scale row stride (>= M)
   int pre;                        // 1: the partial was already pushed into the RS slots by the producing GEMM's
                                   //    epilogue (skinny_gemm rs mode), own slice included; `partial` is unused
