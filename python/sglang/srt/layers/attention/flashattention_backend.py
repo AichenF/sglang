@@ -442,7 +442,11 @@ class FlashAttentionBackend(AttentionBackend):
             num_heads_k=self.num_kv_heads,
             headdim=self.head_dim,
             cache_seqlens=cache_seqlens,
-            qkv_dtype=self.kv_cache_dtype,
+            qkv_dtype=(
+                self.token_to_kv_pool.full_kv_pool.dtype
+                if isinstance(self.token_to_kv_pool, SWAKVPool)
+                else self.kv_cache_dtype
+            ),
             cu_seqlens_q=cu_seqlens_q,
             page_size=self.page_size,
             causal=True,
@@ -1399,8 +1403,13 @@ class FlashAttentionBackend(AttentionBackend):
         Optional[torch.Tensor],
     ]:
         k_descale = v_descale = None
+        kv_dtype = (
+            self.token_to_kv_pool.get_kv_dtype(layer.layer_id)
+            if isinstance(self.token_to_kv_pool, SWAKVPool)
+            else self.kv_cache_dtype
+        )
         if (
-            self.kv_cache_dtype_str != "auto"
+            (self.kv_cache_dtype_str != "auto" or kv_dtype != self.kv_cache_dtype)
             and layer.head_dim <= 256
             and not self.kv_cache_is_mxfp8
             and (not is_prefill or self.fa_impl_ver != 4)
@@ -1409,9 +1418,9 @@ class FlashAttentionBackend(AttentionBackend):
                 descale_shape = (logical_batch_size, kv_head_num)
                 k_descale = layer.k_scale.expand(descale_shape)
                 v_descale = layer.v_scale.expand(descale_shape)
-            q = q.to(self.kv_cache_dtype)
-            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
-            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+            q = q.to(kv_dtype)
+            q_rope = q_rope.to(kv_dtype) if q_rope is not None else None
+            k_rope = k_rope.to(kv_dtype) if k_rope is not None else None
         return q, q_rope, k_rope, k_descale, v_descale
 
     def dflash_mega_attn_args(self, layer: RadixAttention, forward_batch: ForwardBatch) -> Optional[dict]:

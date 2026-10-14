@@ -43,6 +43,7 @@ class SWAKVPool(BaseSWAKVPool):
         full_kv_pool_kwargs: Optional[dict] = None,
         swa_kv_pool_kwargs: Optional[dict] = None,
         enable_memory_saver: bool = False,
+        full_kv_dtype: Optional[torch.dtype] = None,
         **kwargs,
     ):
         self.size = size
@@ -92,7 +93,7 @@ class SWAKVPool(BaseSWAKVPool):
 
         self.full_kv_pool = full_kv_pool_class(
             size=size,
-            dtype=dtype,
+            dtype=full_kv_dtype or dtype,
             layer_num=self.full_layer_nums,
             **full_kv_pool_kwargs,
         )
@@ -128,6 +129,10 @@ class SWAKVPool(BaseSWAKVPool):
     def post_capture_active(self) -> bool:
         """True iff the sub-pools took the post-capture VA-backed path (both share the flag)."""
         return self.full_kv_pool.post_capture_active
+
+    def get_kv_dtype(self, layer_id: int) -> torch.dtype:
+        _, sliding = self.layers_mapping[layer_id]
+        return (self.swa_kv_pool if sliding else self.full_kv_pool).dtype
 
     @property
     def post_capture_backed_bytes(self) -> int:

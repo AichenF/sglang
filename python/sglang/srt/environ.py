@@ -1072,6 +1072,7 @@ class Envs:
     # for post-attention RMSNorm + router + top-8 + experts + TP all-reduce for batches of <= MAX_TOKENS tokens per rank.
     SGLANG_MIMO_FUSED_MOE = EnvBool(False)
     SGLANG_MIMO_FUSED_MOE_MAX_TOKENS = EnvInt(64)
+    SGLANG_MIMO_FULL_KV_FP8 = EnvBool(False)
 
     # ===================================================================
     # FlashInfer, FlashMLA, and TRT-LLM
