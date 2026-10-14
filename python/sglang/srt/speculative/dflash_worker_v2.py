@@ -1115,7 +1115,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         # goal12-glue: after both KV pools are sized (the replica comes out of the non-static reserve, the KV budget is
         # unchanged) and before the target graphs are captured
-        self._g12_init_embed_replica()
+        self._init_embed_replica()
 
     def init_attention_backends(self):
         with (
@@ -1915,11 +1915,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 list(self._full_embed_gpu.shape),
             )
 
-    def _g12_init_embed_replica(self) -> None:
-        """goal12-glue (SGLANG_G12_EMBED_LOCAL): replicate the full target embedding table on this rank so the TP8
+    def _init_embed_replica(self) -> None:
+        """goal12-glue (SGLANG_DFLASH_EMBED_LOCAL_REPLICA): replicate the full target embedding table on this rank so the TP8
         fused step-start embeddings (embed_nq of the verify, embed_ag of the draft block) gather locally instead of
         exchanging rows over NVLink. Collective over the TP group (every rank runs __init__ at the same point)."""
-        if not envs.SGLANG_G12_EMBED_LOCAL.get() or get_parallel().attn_dp_enabled or _is_npu or not is_cuda():
+        if not envs.SGLANG_DFLASH_EMBED_LOCAL_REPLICA.get() or get_parallel().attn_dp_enabled or _is_npu or not is_cuda():
             return
         if not envs.SGLANG_DFLASH_TP_EMBED.get():
             return
@@ -1952,7 +1952,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             nums[r] = int(si.org_vocab_end_index) - int(si.org_vocab_start_index)
         vocab = sum(nums)
         if nums[rank] != num_org or any(starts[r] != sum(nums[:r]) for r in range(tp_size)):
-            logger.warning("goal12 embed replica: unexpected shard layout %s / %s; disabled", starts, nums)
+            logger.warning("DFLASH embedding replica: unexpected shard layout %s / %s; disabled", starts, nums)
             return
         shard_t = w.data[:num_org].contiguous()
         if all(n == num_org for n in nums):
@@ -1965,20 +1965,20 @@ class DFlashWorkerV2(BaseSpecWorker):
             del parts
         del shard_t
         if not torch.equal(full[starts[rank] : starts[rank] + num_org], w.data[:num_org]):
-            raise RuntimeError("goal12 embed replica: own shard mismatch")
+            raise RuntimeError("DFLASH embedding replica: own shard mismatch")
         ranges = torch.zeros(2 * tp_size, dtype=torch.int64)
         ranges[tp_size + rank] = vocab
-        emb._g12_full_weight = full
-        emb._g12_local_ranges = ranges
+        emb._local_full_weight = full
+        emb._local_vocab_ranges = ranges
         # online weight updates would leave the replica (and the graphs reading it) stale: let the updater reject them
         emb._derived_weight_cache_error = (
-            "Online weight updates are not supported while the replicated embedding table (goal12 "
-            "SGLANG_G12_EMBED_LOCAL=1) is active: it is not refreshed by in-place weight loads. Restart with "
-            "SGLANG_G12_EMBED_LOCAL=0 to use online weight updates."
+            "Online weight updates are not supported while the replicated embedding table "
+            "(SGLANG_DFLASH_EMBED_LOCAL_REPLICA=1) is active: it is not refreshed by in-place weight loads. Restart with "
+            "SGLANG_DFLASH_EMBED_LOCAL_REPLICA=0 to use online weight updates."
         )
         if rank == 0:
             logger.info(
-                "goal12 embed replica: full table %s (%.2f GB/rank) -> local embed_nq / embed_ag",
+                "DFLASH embedding replica: full table %s (%.2f GB/rank) -> local embed_nq / embed_ag",
                 tuple(full.shape), full.numel() * full.element_size() / 1e9,
             )
 

@@ -1306,7 +1306,7 @@ class Envs:
     # sized -> taken from the non-static reserve, max_total_num_tokens unchanged) so the step-start embed_nq (verify) and
     # embed_ag (draft) are local gathers (no owner push / NVLink receive polling); bitwise identical rows.
     # E2E (333, B4 x 64k): -16..-26 us/step (core per-step mean), default ON
-    SGLANG_G12_EMBED_LOCAL = EnvBool(True)
+    SGLANG_DFLASH_EMBED_LOCAL_REPLICA = EnvBool(True)
     # goal12-glue: the target verify's replay prep (input copies, SWA write loc, FA metadata, page tables) is recorded
     # BEFORE the draft forward and runs in the SAME launch as the draft's prep (step_prep group); the draft graph's
     # fused argmax writes the verify candidates straight into the target's static input_ids -> no eager launch between

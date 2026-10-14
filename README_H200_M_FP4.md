@@ -76,7 +76,7 @@ Each feature can be switched off on its own (all default on):
 | Draft small-M FP8 GEMM / qk-norm + RoPE + KV store kernel | `SGLANG_DFLASH_TP_SKINNY=0` / `SGLANG_DFLASH_FUSED_QKNR_KV=0` |
 | Vocab-parallel argmax for the target verify (draft-KV materialization in the verify graph requires it) | `SGLANG_DFLASH_VP_ARGMAX=0` |
 | Vocab-parallel draft argmax / embedding | `SGLANG_DFLASH_TP_ARGMAX=0` / `SGLANG_DFLASH_TP_EMBED=0` |
-| Local embedding replica (see Memory) | `SGLANG_G12_EMBED_LOCAL=0` |
+| Local embedding replica (see Memory) | `SGLANG_DFLASH_EMBED_LOCAL_REPLICA=0` |
 | Draft-KV materialization inside the verify graph | `SGLANG_DFLASH_MAT_IN_VERIFY=0` |
 | One-launch replay preparation per CUDA graph | `SGLANG_STEP_PREP_FUSED=0` |
 | Other step-scheduling glue | `SGLANG_DFLASH_AUX_DEFER=0`, `SGLANG_DFLASH_FUSED_PUBLISH=0`, `SGLANG_DFLASH_TOKENS_IN_GRAPH=0`, `SGLANG_FA_SWA_WLOC_FUSED=0`, `SGLANG_DFLASH_MAT_FUSED_KV_WRITE=0`, `SGLANG_DFLASH_MAT_EARLY_FORK=0`, `SGLANG_DFLASH_EMBED_IN_GRAPH=0`, `SGLANG_MIMO_FINAL_CAPTURE_IN_NORM=0`, `SGLANG_FA_VERIFY_FUSED_SEQLENS=0` |
@@ -85,7 +85,7 @@ Each feature can be switched off on its own (all default on):
 
 The local embedding replica keeps a full copy of the target embedding table on every rank (+1.87 GB per rank),
 allocated after the KV pools are sized, so the KV capacity is unchanged. While it is active, online weight updates
-are rejected; set `SGLANG_G12_EMBED_LOCAL=0` to disable it.
+are rejected; set `SGLANG_DFLASH_EMBED_LOCAL_REPLICA=0` to disable it.
 
 ## Measured configuration
 
