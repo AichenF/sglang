@@ -1,9 +1,8 @@
 // Skinny (M <= 32) FP8 GEMM for Hopper decode: out[M, N] (bf16) = x[M, K] (e4m3) . w[N, K]^T (e4m3).
 //
-// Why: at M = 32 the decode GEMMs are weight streams (qkv_proj 20.8 MB, draft projections 12.6-25.2 MB per rank).
-// DeepGEMM's 1D2D kernel picks BLOCK 32x32 for M = 32 and walks the 48 K-blocks of a tile serially (wgmma wait +
-// promotion per K-block, ~0.3 us each) on 106 of 132 SMs -> ~13 GB/s per SM, 10-12 us for a 4.6 us weight stream.
-// CUTLASS fp8_scaled_mm (draft) tiles N by 64 and uses 36/64/96 CTAs.
+// Why: at M <= 32 the decode GEMMs are weight streams. DeepGEMM's 1D2D kernel picks BLOCK 32x32 for M = 32 and walks
+// the K-blocks of a tile serially (a wgmma wait + promotion per K-block) on fewer CTAs than SMs, far below the HBM
+// rate; CUTLASS fp8_scaled_mm tiles N by 64 and launches few CTAs as well.
 //
 // Design (swap-AB, cluster split-K):
 //  * the weight is the wgmma A operand (64 rows per m64 wgmma, 2 per 128-row block), the <= 32 tokens are the
@@ -18,7 +17,7 @@
 //  * scale modes: kMode 0 = DeepGEMM block scales (w: [ceil(N/128), K/128] fp32, x: per token per 128-K group,
 //    column-major [K/128][sx_ld]), promoted per K-block exactly like DeepGEMM (acc += partial * (sw * sx));
 //    kMode 1 = per-row weight scale (sw_stride 0 = per-tensor) x per-token activation scale, applied once in
-//    the epilogue (the wgmma chain accumulates the whole K-slice); kMode 2 = stream only (diagnostic).
+//    the epilogue (the wgmma chain accumulates the whole K-slice).
 #pragma once
 
 #include <sgl_kernel/tensor.h>
@@ -34,16 +33,9 @@
 #include <cstdint>
 #include <map>
 #include <tuple>
-#include <type_traits>
-
-#ifdef SKINNY_STAMP
-#define SKINNY_NS skinny_v_stamp
-#else
-#define SKINNY_NS skinny_v_plain
-#endif
 
 namespace sglang {
-inline namespace SKINNY_NS {
+inline namespace skinny_v_plain {
 namespace skinny_gemm {
 
 constexpr int BN = 128;              // weight rows per row block
@@ -74,39 +66,25 @@ struct Params {
   int sx_ld;
   int sw_stride;
   int depth;                  // max weight units in flight per CTA (<= kStages)
-  int warm;                   // unused (kept for the ABI)
+  int warm;                   // unused
   int preload;                // weight units issued before griddepcontrol.wait (<= depth)
-  unsigned long long* stamps; // SKINNY_STAMP builds: [grid][16] globaltimer ns
+  unsigned long long* stamps; // unused
   int l2pre;                  // further weight units L2-prefetched before griddepcontrol.wait (-1 = all the rest)
   // reduce-scatter epilogue (dflash_tp_fused.cuh tp_arnq "prepushed" mode): instead of storing out[t][n], push the
   // bf16 partial into the owner rank's RS slot (owner = n / 768) of the CUDA-IPC receive buffers, Lamport-marked
   // (+0.0 -> -0.0). rs_calls = the per-token call counters (phase = calls[t] & 1), nullptr = plain store.
+  // The host always passes nullptr now; the epilogue branch stays because removing it changes the kernel's code.
   const int* rs_calls;
   uint8_t* rs_peer[8];
   int rs_rank;
-  // goal11-post: L2 prefetch of the NEXT kernel's weights (nx_bytes from nx_ptr, split over the CTAs), issued by the
-  // producer right after its last weight TMA so HBM keeps streaming through this GEMM's tail (0 = off)
+  // L2 prefetch of the NEXT kernel's weights (nx_bytes from nx_ptr, split over the CTAs), issued by the producer
+  // right after its last weight TMA so HBM keeps streaming through this GEMM's tail (0 = off)
   const uint8_t* nx_ptr;
   int64_t nx_bytes;
 };
 // tp_arnq receive-buffer layout (keep in sync with distributed/dflash_tp_fused.cuh)
 constexpr int RS_R = 8, RS_SL = 768, RS_MAXT = 32;
 constexpr int64_t RS_SLOT_BYTES = RS_SL * 2;
-
-__device__ __forceinline__ unsigned long long gtimer() {
-  unsigned long long t;
-  asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t));
-  return t;
-}
-#ifdef SKINNY_STAMP
-#define STAMP(k) do { if (p.stamps) p.stamps[blockIdx.x * 16 + (k)] = gtimer(); } while (0)
-#define CLK(v) long long v = clock64()
-#define CSTAMP(k, v) do { if (p.stamps) p.stamps[blockIdx.x * 16 + (k)] = (v); } while (0)
-#else
-#define STAMP(k) do {} while (0)
-#define CLK(v) do {} while (0)
-#define CSTAMP(k, v) do {} while (0)
-#endif
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
@@ -157,17 +135,6 @@ __device__ __forceinline__ void bulk_load(void* dst, const void* src, uint32_t b
       "r"(smem_u32(bar))
       : "memory");
 }
-__device__ __forceinline__ void bulk_s2s_cluster(uint32_t dst_cluster, const void* src, uint32_t bytes, uint32_t mbar_cluster) {
-  asm volatile(
-      "cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(dst_cluster),
-      "r"(smem_u32(src)),
-      "r"(bytes),
-      "r"(mbar_cluster)
-      : "memory");
-}
-__device__ __forceinline__ void cluster_arrive_relaxed_wait() {
-  asm volatile("barrier.cluster.arrive.relaxed.aligned;\nbarrier.cluster.wait.aligned;\n" ::: "memory");
-}
 __device__ __forceinline__ void st_async_v4(uint32_t addr_cluster, float4 v, uint32_t mbar_cluster) {
   asm volatile(
       "st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.f32 [%0], {%1, %2, %3, %4}, [%5];" ::"r"(addr_cluster),
@@ -205,12 +172,6 @@ __device__ __forceinline__ void wgmma_m64n32k32_e4m3(float* d, uint64_t da, uint
         "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15])
       : "l"(da), "l"(db), "r"(scale_d));
 }
-__device__ __forceinline__ void named_bar_sync(int id, int n) {
-  asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(n) : "memory");
-}
-__device__ __forceinline__ void cluster_sync() {
-  asm volatile("barrier.cluster.arrive.release.aligned;\nbarrier.cluster.wait.acquire.aligned;\n" ::: "memory");
-}
 __device__ __forceinline__ uint32_t cluster_rank() {
   uint32_t r;
   asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(r));
@@ -226,57 +187,7 @@ __device__ __forceinline__ uint32_t mapa(uint32_t addr, uint32_t rank) {
   asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(r) : "r"(addr), "r"(rank));
   return r;
 }
-__device__ __forceinline__ float4 ld_dsmem_v4(uint32_t addr) {
-  float4 v;
-  asm volatile("ld.shared::cluster.v4.f32 {%0, %1, %2, %3}, [%4];"
-               : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
-               : "r"(addr)
-               : "memory");
-  return v;
-}
 
-// Accumulator fragment (m64nN, per warpgroup thread): register r -> row (within 64) and token column.
-__device__ __forceinline__ int frag_row(int ctid, int r) {
-  return (ctid >> 5) * 16 + ((ctid & 31) >> 2) + ((r >> 1) & 1) * 8;
-}
-__device__ __forceinline__ int frag_col(int ctid, int r) {
-  return (r >> 2) * 8 + (ctid & 3) * 2 + (r & 1);
-}
-
-template <int kMode>
-__device__ __forceinline__ void epilogue_store(
-    const Params& p, const float (&v)[2][kFragFloats], int rb, int ctid, __nv_bfloat16* sOut) {
-  // v: final fp32 sums of this 128-row block (fragment order) -> bf16 out rows [rb*128, rb*128+128).
-#pragma unroll
-  for (int h = 0; h < 2; ++h) {
-#pragma unroll
-    for (int r = 0; r < kFragFloats; ++r) {
-      const int row = h * 64 + frag_row(ctid, r);
-      const int col = frag_col(ctid, r);
-      float x = v[h][r];
-      if constexpr (kMode == 1) {
-        const int grow = rb * BN + row;
-        const float swv = (grow < p.N) ? __ldg(p.sw + static_cast<int64_t>(grow) * p.sw_stride) : 0.f;
-        const float sxv = (col < p.M) ? __ldg(p.sx + col) : 0.f;
-        x = x * swv * sxv;
-      }
-      sOut[col * BN + row] = __float2bfloat16_rn(x);
-    }
-  }
-  named_bar_sync(2, 128);
-  // 32 tokens x 16 chunks of 8 bf16
-#pragma unroll
-  for (int i = 0; i < (MT * BN / 8) / 128; ++i) {
-    const int idx = i * 128 + ctid;
-    const int tok = idx >> 4;
-    const int ch = idx & 15;
-    const int grow = rb * BN + ch * 8;
-    if (tok < p.M && grow < p.N) {
-      *reinterpret_cast<uint4*>(p.out + static_cast<int64_t>(tok) * p.out_ld + grow) =
-          *reinterpret_cast<const uint4*>(sOut + tok * BN + ch * 8);
-    }
-  }
-}
 
 template <int kMode, bool kUsePDL>
 __global__ void __launch_bounds__(kThreads, 1) skinny_gemm_kernel(
@@ -305,7 +216,6 @@ __global__ void __launch_bounds__(kThreads, 1) skinny_gemm_kernel(
   const int g_lo = (rank * 8) / S;
   const int g_hi = ((rank + 1) * 8) / S;
 
-  if (tid == 0) STAMP(0);
   if (tid == 0) {
     for (int s = 0; s < kStages; ++s) {
       mbar_init(&full[s], 1);
@@ -344,9 +254,7 @@ __global__ void __launch_bounds__(kThreads, 1) skinny_gemm_kernel(
         const int hi = p.l2pre < 0 ? n : (early + p.l2pre < n ? early + p.l2pre : n);
         for (int i = (early > pre ? early : pre); i < hi; ++i) tma_prefetch_l2_2d(&tmW, (kb_lo + i) * BK, rb * BN);
       }
-      STAMP(1);
       device::PDLWaitPrimary<kUsePDL>();
-      STAMP(2);
       for (int i = early; i < pre; ++i) {
         mbar_expect_tx(&full[i], stage_tx);
         tma_load_2d(&tmW, sW + i * kWBytes, &full[i], (kb_lo + i) * BK, rb * BN, pol_w);
@@ -413,8 +321,6 @@ __global__ void __launch_bounds__(kThreads, 1) skinny_gemm_kernel(
       for (int i = 0; i < n; ++i) {
         const int s = i % kStages;
         mbar_wait(&full[s], (i / kStages) & 1);
-        if (ctid == 0 && wg == 0 && i == 0) STAMP(3);
-        if (ctid == 0 && wg == 0 && i > 0 && i < 7) STAMP(7 + i);
         const uint64_t da = make_desc(sW + s * kWBytes) + wg * 512;
         const uint64_t db = make_desc(sX + s * kXBytes);
         wgmma_fence();
@@ -430,30 +336,20 @@ __global__ void __launch_bounds__(kThreads, 1) skinny_gemm_kernel(
       wgmma_wait<0>();
       __syncwarp();
       if (lane == 0 && n > 0) mbar_arrive(&empty[(n - 1) % kStages]);
-    }
-    for (int i = 0; kMode != 1 && i < n; ++i) {
-      const int s = i % kStages;
-      const int kb = kb_lo + i;
-      float swv = 0.f;
-      if constexpr (kMode == 0) swv = __ldg(p.sw + static_cast<int64_t>(rb) * p.KB + kb);
-      mbar_wait(&full[s], (i / kStages) & 1);
-      if (ctid == 0 && wg == 0 && i == 0) STAMP(3);
-      if constexpr (kMode != 2) {
+    } else {
+      // block-scale mode: each K-block's partial (tmp) is promoted into acc with sw * sx, like DeepGEMM
+      for (int i = 0; i < n; ++i) {
+        const int s = i % kStages;
+        const int kb = kb_lo + i;
+        const float swv = __ldg(p.sw + static_cast<int64_t>(rb) * p.KB + kb);
+        mbar_wait(&full[s], (i / kStages) & 1);
         const uint64_t da = make_desc(sW + s * kWBytes) + wg * 512;
         const uint64_t db = make_desc(sX + s * kXBytes);
         wgmma_fence();
 #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-          if constexpr (kMode == 0) {
-            wgmma_m64n32k32_e4m3(tmp, da + k * 2, db + k * 2, k > 0);
-          } else {
-            wgmma_m64n32k32_e4m3(acc, da + k * 2, db + k * 2, (k > 0) || (i > 0));
-          }
-        }
+        for (int k = 0; k < 4; ++k) wgmma_m64n32k32_e4m3(tmp, da + k * 2, db + k * 2, k > 0);
         wgmma_commit();
         wgmma_wait<0>();
-      }
-      if constexpr (kMode == 0) {
         float sxv[8];
 #pragma unroll
         for (int q = 0; q < 8; ++q) {
@@ -464,96 +360,86 @@ __global__ void __launch_bounds__(kThreads, 1) skinny_gemm_kernel(
         if (lane == 0) mbar_arrive(&empty[s]);
 #pragma unroll
         for (int r = 0; r < kFragFloats; ++r) acc[r] += tmp[r] * (swv * sxv[(r >> 2) * 2 + (r & 1)]);
-      } else {
-        __syncwarp();
-        if (lane == 0) mbar_arrive(&empty[s]);
       }
     }
-    if (ctid == 0) STAMP(4 + wg);
     device::PDLTriggerSecondary<kUsePDL>();
-    if constexpr (kMode != 2) {
-      if (!owner) {
-        asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
-        // send this warp's 16-row partial to the owner rank: recv[(g - g_lo(o)) * (S-1) + slot(rank)][lane][16]
-        int o = 0;
-        while (((o + 1) * 8) / S <= g) ++o;
-        const int og_lo = (o * 8) / S;
-        const int slot = rank < o ? rank : rank - 1;
-        const uint32_t off = static_cast<uint32_t>((((g - og_lo) * (S - 1) + slot) * 32 + lane) * kFragFloats * 4);
-        const uint32_t dst = mapa(smem_u32(sRecv), static_cast<uint32_t>(o)) + off;
-        const uint32_t bar = mapa(smem_u32(red_bar), static_cast<uint32_t>(o));
+    if (!owner) {
+      asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
+      // send this warp's 16-row partial to the owner rank: recv[(g - g_lo(o)) * (S-1) + slot(rank)][lane][16]
+      int o = 0;
+      while (((o + 1) * 8) / S <= g) ++o;
+      const int og_lo = (o * 8) / S;
+      const int slot = rank < o ? rank : rank - 1;
+      const uint32_t off = static_cast<uint32_t>((((g - og_lo) * (S - 1) + slot) * 32 + lane) * kFragFloats * 4);
+      const uint32_t dst = mapa(smem_u32(sRecv), static_cast<uint32_t>(o)) + off;
+      const uint32_t bar = mapa(smem_u32(red_bar), static_cast<uint32_t>(o));
 #pragma unroll
-        for (int r = 0; r < kFragFloats; r += 4)
-          st_async_v4(dst + r * 4, make_float4(acc[r], acc[r + 1], acc[r + 2], acc[r + 3]), bar);
-      } else {
-        if (S > 1) {
-          mbar_wait(red_bar, 0);
-          if (lane == 0 && wq == 0 && wg == 0) STAMP(6);
-          // sum in rank order: rank 0 .. S-1 (own partial at position `rank`)
-          float tot[kFragFloats];
-#pragma unroll
-          for (int r = 0; r < kFragFloats; ++r) tot[r] = 0.f;
-#pragma unroll 1
-          for (int src = 0; src < S; ++src) {
-            if (src == rank) {
-#pragma unroll
-              for (int r = 0; r < kFragFloats; ++r) tot[r] += acc[r];
-            } else {
-              const int slot = src < rank ? src : src - 1;
-              const float* rp = sRecv + (((g - g_lo) * (S - 1) + slot) * 32 + lane) * kFragFloats;
-#pragma unroll
-              for (int r = 0; r < kFragFloats; r += 4) {
-                const float4 v = *reinterpret_cast<const float4*>(rp + r);
-                tot[r] += v.x;
-                tot[r + 1] += v.y;
-                tot[r + 2] += v.z;
-                tot[r + 3] += v.w;
-              }
-            }
-          }
-#pragma unroll
-          for (int r = 0; r < kFragFloats; ++r) acc[r] = tot[r];
-        }
-        // ---- epilogue (warp-local): (scale) -> bf16 -> [token][16 rows] staging -> 32-byte row segments ----
-        __nv_bfloat16* sOut = sOutAll + (wg * 4 + wq) * (MT * 16);
-#pragma unroll
-        for (int r = 0; r < kFragFloats; ++r) {
-          const int row = (lane >> 2) + ((r >> 1) & 1) * 8;          // within the group's 16 rows
-          const int col = (r >> 2) * 8 + fcol + (r & 1);
-          float x = acc[r];
-          if constexpr (kMode == 1) x = x * srow[(r >> 1) & 1] * scol[(r >> 2) * 2 + (r & 1)];
-          sOut[col * 16 + row] = __float2bfloat16_rn(x);
-        }
-        __syncwarp();
-        const int grow = rb * BN + wg * 64 + wq * 16;
-        if (lane < p.M && grow < p.N) {
-          const uint4* src = reinterpret_cast<const uint4*>(sOut + lane * 16);
-          if (p.rs_calls != nullptr) {
-            const int phase = p.rs_calls[lane] & 1;
-            const int q = grow / RS_SL;
-            uint8_t* dst = p.rs_peer[q] + ((static_cast<int64_t>(phase) * RS_MAXT + lane) * RS_R + p.rs_rank) * RS_SLOT_BYTES +
-                           static_cast<int64_t>(grow - q * RS_SL) * 2;
-#pragma unroll
-            for (int h = 0; h < 2; ++h) {
-              uint4 v = src[h];
-              v.x = v.x == 0u ? 0x80000000u : v.x;
-              v.y = v.y == 0u ? 0x80000000u : v.y;
-              v.z = v.z == 0u ? 0x80000000u : v.z;
-              v.w = v.w == 0u ? 0x80000000u : v.w;
-              asm volatile("st.global.v4.u32 [%0], {%1, %2, %3, %4};" ::"l"(dst + h * 16), "r"(v.x), "r"(v.y), "r"(v.z),
-                           "r"(v.w)
-                           : "memory");
-            }
-          } else {
-            uint4* dstp = reinterpret_cast<uint4*>(p.out + static_cast<int64_t>(lane) * p.out_ld + grow);
-            dstp[0] = src[0];
-            dstp[1] = src[1];
-          }
-        }
-        if (lane == 0 && wq == 0 && wg == 0) STAMP(7);
-        if (S > 1) asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
-      }
+      for (int r = 0; r < kFragFloats; r += 4)
+        st_async_v4(dst + r * 4, make_float4(acc[r], acc[r + 1], acc[r + 2], acc[r + 3]), bar);
     } else {
+      if (S > 1) {
+        mbar_wait(red_bar, 0);
+        // sum in rank order: rank 0 .. S-1 (own partial at position `rank`)
+        float tot[kFragFloats];
+#pragma unroll
+        for (int r = 0; r < kFragFloats; ++r) tot[r] = 0.f;
+#pragma unroll 1
+        for (int src = 0; src < S; ++src) {
+          if (src == rank) {
+#pragma unroll
+            for (int r = 0; r < kFragFloats; ++r) tot[r] += acc[r];
+          } else {
+            const int slot = src < rank ? src : src - 1;
+            const float* rp = sRecv + (((g - g_lo) * (S - 1) + slot) * 32 + lane) * kFragFloats;
+#pragma unroll
+            for (int r = 0; r < kFragFloats; r += 4) {
+              const float4 v = *reinterpret_cast<const float4*>(rp + r);
+              tot[r] += v.x;
+              tot[r + 1] += v.y;
+              tot[r + 2] += v.z;
+              tot[r + 3] += v.w;
+            }
+          }
+        }
+#pragma unroll
+        for (int r = 0; r < kFragFloats; ++r) acc[r] = tot[r];
+      }
+      // ---- epilogue (warp-local): (scale) -> bf16 -> [token][16 rows] staging -> 32-byte row segments ----
+      __nv_bfloat16* sOut = sOutAll + (wg * 4 + wq) * (MT * 16);
+#pragma unroll
+      for (int r = 0; r < kFragFloats; ++r) {
+        const int row = (lane >> 2) + ((r >> 1) & 1) * 8;          // within the group's 16 rows
+        const int col = (r >> 2) * 8 + fcol + (r & 1);
+        float x = acc[r];
+        if constexpr (kMode == 1) x = x * srow[(r >> 1) & 1] * scol[(r >> 2) * 2 + (r & 1)];
+        sOut[col * 16 + row] = __float2bfloat16_rn(x);
+      }
+      __syncwarp();
+      const int grow = rb * BN + wg * 64 + wq * 16;
+      if (lane < p.M && grow < p.N) {
+        const uint4* src = reinterpret_cast<const uint4*>(sOut + lane * 16);
+        if (p.rs_calls != nullptr) {
+          const int phase = p.rs_calls[lane] & 1;
+          const int q = grow / RS_SL;
+          uint8_t* dst = p.rs_peer[q] + ((static_cast<int64_t>(phase) * RS_MAXT + lane) * RS_R + p.rs_rank) * RS_SLOT_BYTES +
+                         static_cast<int64_t>(grow - q * RS_SL) * 2;
+#pragma unroll
+          for (int h = 0; h < 2; ++h) {
+            uint4 v = src[h];
+            v.x = v.x == 0u ? 0x80000000u : v.x;
+            v.y = v.y == 0u ? 0x80000000u : v.y;
+            v.z = v.z == 0u ? 0x80000000u : v.z;
+            v.w = v.w == 0u ? 0x80000000u : v.w;
+            asm volatile("st.global.v4.u32 [%0], {%1, %2, %3, %4};" ::"l"(dst + h * 16), "r"(v.x), "r"(v.y), "r"(v.z),
+                         "r"(v.w)
+                         : "memory");
+          }
+        } else {
+          uint4* dstp = reinterpret_cast<uint4*>(p.out + static_cast<int64_t>(lane) * p.out_ld + grow);
+          dstp[0] = src[0];
+          dstp[1] = src[1];
+        }
+      }
       if (S > 1) asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
     }
   }
@@ -561,7 +447,6 @@ __global__ void __launch_bounds__(kThreads, 1) skinny_gemm_kernel(
     __syncwarp();
     asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
   }
-  if (tid == 0) STAMP(15);
 }
 
 inline CUtensorMap make_map_2d(const void* base, uint64_t inner, uint64_t outer, uint64_t row_bytes, uint32_t box_inner, uint32_t box_outer) {
@@ -587,10 +472,9 @@ inline CUtensorMap make_map_2d(const void* base, uint64_t inner, uint64_t outer,
   return map;
 }
 
-// Largest cluster size S <= 8 (and <= KB) whose NB clusters are all co-resident, with NB * S <= num_sms.
+// Largest cluster size S <= kMaxCluster (and <= KB) whose NB clusters are all co-resident, with NB * S <= num_sms.
 template <typename Kern>
-inline int pick_cluster(Kern kernel, int NB, int KB, int num_sms, int forced) {
-  if (forced > 0) return forced;
+inline int pick_cluster(Kern kernel, int NB, int KB, int num_sms) {
   static std::map<std::tuple<int, int, int>, int> cache;
   const auto key = std::make_tuple(NB, KB, num_sms);
   if (auto it = cache.find(key); it != cache.end()) return it->second;
@@ -623,11 +507,12 @@ inline int pick_cluster(Kern kernel, int NB, int KB, int num_sms, int forced) {
 
 template <int kMode, bool kUsePDL>
 struct SkinnyGemmKernel {
+  static_assert(kMode == 0 || kMode == 1);
   // x: [M, K] e4m3 (row stride multiple of 16 B), w: [N, K] e4m3 contiguous rows, out: [M, >= N] bf16.
   // mode 0: sx [K/128, sx_ld] fp32 viewed 2-D (column-major scales: x row t, group g at sx[g * sx_ld + t]),
   //         sw [ceil(N/128), K/128] fp32 contiguous.
   // mode 1: sx [M] fp32, sw [N] (per-row) or [1] (per-tensor) fp32.
-  // cluster: 0 = automatic (largest co-resident cluster size, NB * S <= num_sms).
+  // The cluster size is the largest co-resident one with NB * S <= num_sms.
   static void run(
       tvm::ffi::TensorView x,
       tvm::ffi::TensorView w,
@@ -635,15 +520,9 @@ struct SkinnyGemmKernel {
       tvm::ffi::TensorView sw,
       tvm::ffi::TensorView out,
       int64_t num_sms,
-      int64_t cluster,
       int64_t depth,
-      int64_t warm,
       int64_t preload,
-      int64_t stamps_addr,
       int64_t l2pre,
-      tvm::ffi::TensorView rs_peers,
-      int64_t rs_calls_addr,
-      int64_t rs_rank,
       int64_t smem_pad,
       int64_t nx_addr,
       int64_t nx_bytes) {
@@ -656,18 +535,12 @@ struct SkinnyGemmKernel {
     const int N = static_cast<int>(w.size(0));
     RuntimeCheck(M >= 1 && M <= MT, "skinny_gemm: M must be in [1, 32]");
     RuntimeCheck(w.size(1) == K && K % BK == 0 && N % 16 == 0);
-    const bool rs = rs_calls_addr != 0;
-    RuntimeCheck(x.dtype().bits == 8 && w.dtype().bits == 8 && (rs || out.dtype().bits == 16));
+    RuntimeCheck(x.dtype().bits == 8 && w.dtype().bits == 8 && out.dtype().bits == 16);
     RuntimeCheck(x.stride(1) == 1 && w.stride(1) == 1);
     RuntimeCheck((x.stride(0) % 16) == 0 && w.stride(0) == K);
-    if (!rs) {
-      RuntimeCheck(out.stride(1) == 1 && (out.stride(0) % 8) == 0);
-      RuntimeCheck(out.size(0) >= M && out.size(1) >= N);
-      RuntimeCheck(reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0);
-    } else {
-      RuntimeCheck(kMode == 1 && N == RS_R * RS_SL && rs_peers.numel() == RS_R && rs_rank >= 0 && rs_rank < RS_R,
-                   "skinny_gemm: reduce-scatter epilogue needs mode 1 and N = 6144 (TP8 slices of 768)");
-    }
+    RuntimeCheck(out.stride(1) == 1 && (out.stride(0) % 8) == 0);
+    RuntimeCheck(out.size(0) >= M && out.size(1) >= N);
+    RuntimeCheck(reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0);
     RuntimeCheck(sx.dtype().bits == 32 && sw.dtype().bits == 32);
     const int NB = (N + BN - 1) / BN;
     const int KB = K / BK;
@@ -685,13 +558,13 @@ struct SkinnyGemmKernel {
     auto kernel = skinny_gemm_kernel<kMode, kUsePDL>;
     static bool attr_set = false;
     if (!attr_set) {
-      // goal11-post: allow up to the 227-KB maximum (smem_pad steers placement: a padded CTA cannot share an SM with a
+      // allow up to the 227-KB maximum (smem_pad steers placement: a padded CTA cannot share an SM with a
       // co-resident NVLink-bound TP kernel CTA)
       RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 227 * 1024));
       RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
       attr_set = true;
     }
-    const int S = pick_cluster(kernel, NB, KB, static_cast<int>(num_sms), static_cast<int>(cluster));
+    const int S = pick_cluster(kernel, NB, KB, static_cast<int>(num_sms));
     RuntimeCheck(S >= 1 && S <= kMaxCluster && S <= KB);
     const CUtensorMap mw = make_map_2d(w.data_ptr(), K, N, static_cast<uint64_t>(K), BK, BN);
     const CUtensorMap mx = make_map_2d(x.data_ptr(), K, M, static_cast<uint64_t>(x.stride(0)), BK, MT);
@@ -709,28 +582,23 @@ struct SkinnyGemmKernel {
         .sx_ld = sx_ld,
         .sw_stride = sw_stride,
         .depth = static_cast<int>(depth),
-        .warm = static_cast<int>(warm),
+        .warm = 0,
         .preload = static_cast<int>(preload),
-        .stamps = reinterpret_cast<unsigned long long*>(stamps_addr),
+        .stamps = nullptr,
         .l2pre = static_cast<int>(l2pre),
-        .rs_calls = reinterpret_cast<const int*>(rs_calls_addr),
+        .rs_calls = nullptr,
         .rs_peer = {},
-        .rs_rank = static_cast<int>(rs_rank),
+        .rs_rank = 0,
         .nx_ptr = reinterpret_cast<const uint8_t*>(nx_addr),
         .nx_bytes = nx_bytes,
     };
     RuntimeCheck(nx_bytes >= 0 && nx_bytes % 16 == 0 && nx_addr % 16 == 0);
-    Params prm = params;
-    if (rs) {
-      const int64_t* pp = static_cast<const int64_t*>(rs_peers.data_ptr());
-      for (int i = 0; i < RS_R; ++i) prm.rs_peer[i] = reinterpret_cast<uint8_t*>(pp[i]);
-    }
     RuntimeCheck(smem_pad >= 0 && kSmemBytes + smem_pad <= 227 * 1024);
     LaunchKernel(dim3(NB * S), dim3(kThreads), x.device(), kSmemBytes + static_cast<int>(smem_pad))
         .enable_pdl(kUsePDL)
-        .enable_cluster(dim3(S, 1, 1))(kernel, mw, mx, prm);
+        .enable_cluster(dim3(S, 1, 1))(kernel, mw, mx, params);
   }
 };
 
-}  // inline namespace SKINNY_NS
+}  // inline namespace skinny_v_plain
 }  // namespace sglang
