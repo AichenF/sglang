@@ -161,10 +161,11 @@ class FaBlock:
             shared, push = fmoe.shared, True
         else:
             # dense-MLP layer (layer 0): the partial stays local (MODE_FULL_LOCAL), the dense TP path reduces it; the fused MoE state only
-            # supplies the epoch counter (it advances between any two FA-layer launches)
-            if os.environ.get("SGLANG_MIMO_FA2_DENSE", "1") != "1" or getattr(FL, "_shared", None) is None:
+            # supplies the epoch counter (it advances between any two FA-layer launches) and the input-TP peer table the launch takes
+            shared = getattr(FL, "_shared", None)
+            if os.environ.get("SGLANG_MIMO_FA2_DENSE", "1") != "1" or shared is None or not shared.input_tp:
                 return None
-            shared, push = FL._shared, False
+            push = False
         if not F.full_grid_ok(shared.device):   # 132 co-resident CTAs spin-wait on each other
             return None
         attn = decoder_layer.self_attn
