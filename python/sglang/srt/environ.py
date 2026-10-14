@@ -1228,98 +1228,77 @@ class Envs:
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
     SGLANG_DEEPGEMM_PDL = EnvBool(True)
-    # goal11-dense: M <= 32 decode FP8 GEMMs (block-scaled DeepGEMM path and per-token/per-channel CUTLASS path)
-    # run the skinny swap-AB cluster split-K kernel (kernels/jit/csrc/gemm/skinny_gemm_sm90.cuh) on sm90.
-    # default OFF: in situ the qkv_proj exposed time is unchanged without the weight preload (9.92 vs 9.98 us) and the
-    # fused MoE kernel ran +1.1 us/layer slower whenever the skinny qkv kernel was used (+1.8 with preload) -- cause not
-    # isolated (PDL residency of its cluster CTAs under the MoE tail / L2 policy); the draft keeps its own switch.
-    SGLANG_SKINNY_FP8_GEMM = EnvBool(False)
-    # the per-token x per-channel (CUTLASS channelwise) path: measured slower than CUTLASS in situ (draft GEMMs,
-    # 8.9 vs 7.4 us) -> off by default
-    SGLANG_SKINNY_FP8_GEMM_PT = EnvBool(False)
-    # goal11-dense: DFlash draft TP8 decode fusions (models/dflash_tp_fast.py)
+    # DFlash draft TP8 decode fusions (models/dflash_tp_fast.py)
     SGLANG_DFLASH_TP_FUSED = EnvBool(True)
-    # goal11-draft: the 5 DFlash draft layers at M = 32 as ONE persistent kernel (kernels/ops/speculative/dflash_mega.py)
+    # the 5 DFlash draft layers at M = 32 as one persistent kernel (kernels/ops/speculative/dflash_mega.py)
     SGLANG_DFLASH_MEGA = EnvBool(True)
-    # goal11-draft: first-use self-check of the draft megakernel against the fused-TP path (eager, once)
+    # first-use self-check of the draft megakernel against the fused-TP path (eager, once)
     SGLANG_DFLASH_MEGA_CHECK = EnvBool(True)
-    # goal11-dense: MiMo dense-MLP layer (layer 0) decode at M <= 32 on TP8 as fused AR+add+norm+quant / SiLU+quant kernels
+    # dense-MLP layer (layer 0) decode at M <= 32 on TP8 as fused all-reduce + add + norm + quant / SiLU + quant kernels
     SGLANG_MIMO_DENSE_TP = EnvBool(True)
-    # goal11-dense: layer-0 MLP GEMMs on the skinny block-scale GEMM with the full PDL weight preload behind the TP kernels
+    # layer-0 MLP GEMMs on the skinny block-scale GEMM with the PDL weight preload behind the TP kernels
     SGLANG_MIMO_DENSE_TP_SKINNY = EnvBool(True)
-    # goal11-dense: MiMo step start = fused embedding + layer 0 input norm + fp8 quant (TP8, M <= 32)
+    # step start = fused embedding + layer-0 input norm + fp8 quant (TP8, M <= 32)
     SGLANG_MIMO_EMBED_NQ = EnvBool(True)
-    # goal11-dense: DFlash final-layer capture taken from the final fused add+norm (no separate snapshot add)
+    # DFlash final-layer capture taken from the final fused add + norm (no separate snapshot add)
     SGLANG_MIMO_FINAL_CAPTURE_IN_NORM = EnvBool(True)
-    # goal10-p2 / goal11-dense: DFlash draft attention prologue (q/k RMSNorm + RoPE + value scale + KV-cache
-    # store) as one kernel (used by the TP fused path, also with an SWA draft KV pool).
+    # DFlash draft attention prologue (q/k RMSNorm + RoPE + value scale + KV-cache store) as one kernel (used by the
+    # TP fused path, also with an SWA draft KV pool)
     SGLANG_DFLASH_FUSED_QKNR_KV = EnvBool(True)
-    # goal11-dense: vocab-parallel greedy argmax (DFLASH verify + draft heads) as one kernel over CUDA IPC
+    # vocab-parallel greedy argmax (DFlash verify + draft heads) as one kernel over CUDA IPC
     SGLANG_DFLASH_TP_ARGMAX = EnvBool(True)
-    # goal11-dense: TP8 vocab-parallel embedding for <= 32 ids as an owner-push all-gather (no all-reduce)
+    # TP8 vocab-parallel embedding for <= 32 ids as an owner-push all-gather (no all-reduce)
     SGLANG_DFLASH_TP_EMBED = EnvBool(True)
-    # goal10-p2 / goal11-dense: the DFlash draft greedy head runs the LM head on every block row and the fused
-    # argmax skips block position 0 (no [:, 1:] gather copy)
+    # the DFlash draft greedy head runs the LM head on every block row and the fused argmax skips block position 0
+    # (no [:, 1:] gather copy)
     SGLANG_DFLASH_SAMPLER_NO_SLICE = EnvBool(True)
-    # goal11-dense: the DFlash TP fused path runs its fp8 GEMMs on the skinny kernel with PDL weight preload
+    # the DFlash TP fused path runs its fp8 GEMMs on the skinny kernel with the PDL weight preload
     SGLANG_DFLASH_TP_SKINNY = EnvBool(True)
     SGLANG_DFLASH_TP_SKINNY_PRELOAD = EnvInt(6)
     SGLANG_DFLASH_TP_SKINNY_DEPTH = EnvInt(6)
     SGLANG_DFLASH_TP_SKINNY_L2PRE = EnvInt(0)
-    # goal11-dense: the fused context-KV materialization commits every draft layer's K/V in one launch
+    # the fused context-KV materialization commits every draft layer's K/V in one launch
     SGLANG_DFLASH_KV_WRITE_ALL = EnvBool(True)
-    # goal11-glue: the DFlash draft-KV materialization of a verify step (fc + all-gather/hidden_norm + K/V projection +
+    # the DFlash draft-KV materialization of a verify step (fc + all-gather/hidden_norm + K/V projection +
     # k-norm/RoPE + KV write of every draft layer) runs INSIDE the target verify forward on a side stream, forked right
     # after the final norm (all aux captures written) and joined after the LM head / argmax, so it overlaps the LM head
-    # (100 of 132 SMs, HBM-bound at ~3.8 TB/s) instead of running eagerly after the accept. It writes every block row
-    # (no accept dependency); rows past the accepted prefix are rewritten by the next draft block before any read
-    # (the next block covers [prefix + commit, prefix + commit + block)). Only for <= MAT_MAX_TOKENS verify tokens.
+    # instead of running eagerly after the accept. It writes every block row (no accept dependency); rows past the
+    # accepted prefix are rewritten by the next draft block before any read (the next block covers
+    # [prefix + commit, prefix + commit + block)). Only for <= MAT_MAX_TOKENS verify tokens, and only with the
+    # vocab-parallel target argmax (SGLANG_DFLASH_VP_ARGMAX), which orders the side chain's cross-GPU all-gather
+    # against the LM head's logits all-gather.
     SGLANG_DFLASH_MAT_IN_VERIFY = EnvBool(True)
     SGLANG_DFLASH_MAT_MAX_TOKENS = EnvInt(32)
     # debug: re-run the eager materialization after an in-verify one and compare the accepted rows (host syncs)
     SGLANG_DFLASH_MAT_CHECK = EnvBool(False)
-    # goal11-glue: target-verify aux captures of fixed buffers (norm-next residual_new of the capture layers, the final
-    # updated residual) are not copied one by one; one Triton launch packs them on the main stream right before the
-    # LM head (on the side stream under the LM head it starved for SMs)
+    # target-verify aux captures of fixed buffers (norm-next residual_new of the capture layers, the final updated
+    # residual) are not copied one by one; one Triton launch packs them on the main stream right before the LM head
     SGLANG_DFLASH_AUX_DEFER = EnvBool(True)
-    # goal11-glue: the greedy Triton accept kernel also writes the overlap scheduler's FutureMap relay
-    # (new_seq_lens_buf / output_tokens_buf scatters of FutureMap.publish / stash): two index_put launches fewer per step
+    # the greedy Triton accept kernel also writes the overlap scheduler's FutureMap relay (new_seq_lens_buf /
+    # output_tokens_buf scatters of FutureMap.publish / stash): two index_put launches fewer per step
     SGLANG_DFLASH_FUSED_PUBLISH = EnvBool(True)
-    # goal11-glue: assemble the verify candidates [bonus, draft tokens] inside the draft CUDA graph (tail hook)
+    # assemble the verify candidates [bonus, draft tokens] inside the draft CUDA graph (tail hook)
     SGLANG_DFLASH_TOKENS_IN_GRAPH = EnvBool(True)
-    # goal11-glue: FA backend replay prep: the SWA write-loc refill (gather through full_to_swa_index_mapping + copy into
-    # the graph buffer + tail zero) as ONE kernel (kernels/ops/attention/swa_write_loc.py)
+    # FA backend replay prep: the SWA write-loc refill (gather through full_to_swa_index_mapping + copy into the graph
+    # buffer + tail zero) as one kernel (kernels/ops/attention/swa_write_loc.py)
     SGLANG_FA_SWA_WLOC_FUSED = EnvBool(True)
-    # goal11-post: the DFlash decode step's eager replay prep in front of each CUDA graph (draft: prepare_block + input
-    # copies + FA metadata + page table; verify: input copies + SWA write loc + FA metadata + page tables) recorded and
-    # run as ONE Triton launch per graph (kernels/ops/speculative/step_prep.py; exact eager fallback for anything else),
-    # plus no redundant input_ids / positions re-copy before a pre-planned verify replay
+    # the DFlash decode step's eager replay prep in front of each CUDA graph (draft: prepare_block + input copies + FA
+    # metadata + page table; verify: input copies + SWA write loc + FA metadata + page tables) recorded and run as one
+    # Triton launch per graph (kernels/ops/speculative/step_prep.py; exact eager fallback for anything else), plus no
+    # redundant input_ids / positions re-copy before a pre-planned verify replay
     SGLANG_STEP_PREP_FUSED = EnvBool(True)
     # debug: re-run the eager prep ops after every fused launch and compare bitwise (host syncs)
     SGLANG_STEP_PREP_CHECK = EnvBool(False)
-    # goal11-post: materialize-in-verify writes the draft KV rows from the k-norm/RoPE kernel itself (one launch instead of
+    # materialize-in-verify writes the draft KV rows from the k-norm/RoPE kernel itself (one launch instead of
     # norm_rope + set_kv_buffer_prefix_valid_multi_layer; bitwise, kernels/ops/speculative/mat_kv_write.py)
     SGLANG_DFLASH_MAT_FUSED_KV_WRITE = EnvBool(True)
-    # goal11-post: launch the materialize-in-verify side chain at the fork (before the LM head) instead of after it
+    # launch the materialize-in-verify side chain at the fork (before the LM head) instead of after it
     SGLANG_DFLASH_MAT_EARLY_FORK = EnvBool(True)
-    # goal12-glue: replicate the full target embedding table on every TP8 rank (1.87 GB/rank, built after the KV pools are
-    # sized -> taken from the non-static reserve, max_total_num_tokens unchanged) so the step-start embed_nq (verify) and
-    # embed_ag (draft) are local gathers (no owner push / NVLink receive polling); bitwise identical rows.
-    # E2E (333, B4 x 64k): -16..-26 us/step (core per-step mean), default ON
+    # replicate the full target embedding table on every TP8 rank (+1.87 GB per rank for a 6144-wide bf16 table, built
+    # after the KV pools are sized, so the KV capacity is unchanged) so the step-start embed_nq (verify) and embed_ag
+    # (draft) are local gathers (no owner push / NVLink receive polling); bitwise identical rows. Online weight updates
+    # are rejected while it is active.
     SGLANG_DFLASH_EMBED_LOCAL_REPLICA = EnvBool(True)
-    # goal12-glue: the target verify's replay prep (input copies, SWA write loc, FA metadata, page tables) is recorded
-    # BEFORE the draft forward and runs in the SAME launch as the draft's prep (step_prep group); the draft graph's
-    # fused argmax writes the verify candidates straight into the target's static input_ids -> no eager launch between
-    # the draft and the verify graph
-    SGLANG_G12_VERIFY_EARLY = EnvBool(False)
-    # goal12-glue (P9): embed_ag / embed_nq trigger their PDL secondary (dflash_mega with SGLANG_DFLASH_MEGA_PDL=1 /
-    # layer 0's qkv kernel) at entry instead of at exit, so its pre-wait weight streaming overlaps the embedding
-    SGLANG_G12_EMBED_EARLY_TRIGGER = EnvBool(False)
-    # goal12-glue diagnostics (bounds only, default 0): k empty eager kernels / k single-node graph launches inserted
-    # after the accept kernel every decode step; DUP_ARGMAX: every fused IPC argmax runs 1 + n times (same result)
-    SGLANG_G12_SLOPE_EAGER = EnvInt(0)
-    SGLANG_G12_SLOPE_GRAPH = EnvInt(0)
-    SGLANG_G12_DUP_ARGMAX = EnvInt(0)
     SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP = EnvBool(False)
 
     # ===================================================================
@@ -1512,20 +1491,14 @@ class Envs:
     # gather the draft fc (target-hidden projection) output with the
     # multimem symm-mem all-gather instead of the NCCL ring.
     SGLANG_DFLASH_FC_MULTIMEM = EnvBool(True)
-    # unmeasured, default off: embed the DFLASH draft block inside the
-    # draft cuda graph (model.forward_embed = target embedding * noise scale)
-    # instead of the eager embedding + all-reduce + copy into the graph buffer.
-    # goal11-dense: on (the block embedding is one fused owner-push kernel inside the draft graph)
+    # embed the DFLASH draft block inside the draft cuda graph (model.forward_embed = target embedding * noise
+    # scale; one fused owner-push kernel) instead of the eager embedding + all-reduce + copy into the graph buffer.
     SGLANG_DFLASH_EMBED_IN_GRAPH = EnvBool(True)
-    # goal10-p2: the fused draft-KV materialization applies the draft attention
-    # value scale (MiMo-V2.6 attention_value_scale) to the context V rows, like
-    # DFlashAttention.forward / kv_proj_only do (0 = previous behavior: unscaled).
+    # the fused draft-KV materialization applies the draft attention value scale (attention_value_scale) to the
+    # context V rows, like DFlashAttention.forward / kv_proj_only do (0 = previous behavior: unscaled).
     SGLANG_DFLASH_FUSED_KV_VSCALE = EnvBool(True)
-    # goal10-p2: fp8 copy of the borrowed LM head for the DFlash draft greedy
-    # head only (draft-only numerics; the target verify keeps bf16).
-    SGLANG_DFLASH_DRAFT_HEAD_FP8 = EnvBool(False)
-    # goal10-p2: fp8 draft (--speculative-draft-model-quantization fp8): keep the
-    # fused context-KV materialization on a dequantized bf16 K/V weight slice.
+    # fp8 draft (--speculative-draft-model-quantization fp8): keep the fused context-KV materialization on a
+    # dequantized bf16 K/V weight slice.
     SGLANG_DFLASH_FUSED_KV_DEQUANT = EnvBool(True)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)

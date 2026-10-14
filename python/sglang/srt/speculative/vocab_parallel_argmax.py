@@ -148,7 +148,7 @@ class VocabParallelGreedyHead:
             if self.tp_size == 1
             else ("multimem" if self._state is not None else "nccl")
         )
-        # goal11-dense: TP8 rows <= 32 -> local argmax + IPC exchange + select in one kernel
+        # TP8 rows <= 32 -> local argmax + IPC exchange + select in one kernel
         self._fused = None
         if self.tp_size == 8 and envs.SGLANG_DFLASH_TP_ARGMAX.get():
             try:
@@ -247,11 +247,3 @@ class VocabParallelGreedyHead:
             num_warps=2,
         )
         return out
-
-
-def reference_argmax_from_shard(logits_shard: torch.Tensor, tp_group) -> torch.Tensor:
-    """Slow reference: NCCL all-gather of the shard + torch.argmax (test/self-check)."""
-    if tp_group is None or tp_group.world_size == 1:
-        return torch.argmax(logits_shard, dim=-1)
-    full = tp_group.all_gather(logits_shard.contiguous(), dim=-1)
-    return torch.argmax(full, dim=-1)

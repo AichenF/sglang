@@ -1234,31 +1234,6 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     return output.to(dtype=input_2d.dtype).view(*output_shape)
 
 
-# goal11-dense: skinny (M <= 32) swap-AB cluster split-K FP8 GEMM for decode (sm90).
-_skinny_mod = None
-
-
-def _skinny():
-    global _skinny_mod
-    if _skinny_mod is None:
-        from sglang.kernels.ops.gemm import skinny_gemm
-
-        _skinny_mod = skinny_gemm
-    return _skinny_mod
-
-
-def _skinny_enabled(M: int, N: int, K: int) -> bool:
-    return (
-        M <= 32
-        and M >= 1
-        and N % 16 == 0
-        and K % 128 == 0
-        and _is_cuda
-        and get_platform().is_sm90
-        and envs.SGLANG_SKINNY_FP8_GEMM.get()
-    )
-
-
 def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -1283,15 +1258,6 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             f"(got {tuple(weight.shape)})"
         )
         input_2d = input.view(-1, input.shape[-1])
-        if (
-            bias is None
-            and list(block_size) == [128, 128]
-            and _skinny_enabled(input_2d.shape[0], weight.shape[0], weight.shape[1])
-            and input_scale.stride(0) == 1
-            and input_scale.stride(1) <= 32
-        ):
-            output = _skinny().skinny_fp8_block_gemm(input_2d, input_scale, weight, weight_scale)
-            return output.view(*input.shape[:-1], weight.shape[0])
         output = w8a8_block_fp8_matmul_deepgemm(
             input_2d,
             weight,
@@ -1341,17 +1307,6 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             block_size[1],
         )
 
-    if (
-        bias is None
-        and output_dtype == torch.bfloat16
-        and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-        and not _is_musa
-        and _skinny_enabled(q_input.shape[0], weight.shape[0], weight.shape[1])
-        and x_scale.stride(0) == 1
-        and x_scale.stride(1) <= 32
-    ):
-        output = _skinny().skinny_fp8_block_gemm(q_input, x_scale, weight, weight_scale)
-        return output.view(*output_shape)
     output = w8a8_block_fp8_matmul_deepgemm(
         q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype
     )
@@ -2364,20 +2319,6 @@ def apply_fp8_linear(
                     qinput, x_scale = per_token_group_quant_fp8(
                         input_2d, group_size=input_2d.shape[1]
                     )
-
-    if (
-        channelwise_cutlass
-        and bias is None
-        and output_dtype == torch.bfloat16
-        and qinput.dim() == 2
-        and x_scale.numel() == qinput.shape[0]
-        and x_scale.is_contiguous()
-        and weight.t().is_contiguous()
-        and envs.SGLANG_SKINNY_FP8_GEMM_PT.get()
-        and _skinny_enabled(qinput.shape[0], weight.shape[1], weight.shape[0])
-    ):
-        output = _skinny().skinny_fp8_pt_gemm(qinput, x_scale, weight.t(), weight_scale)
-        return output.view(*output_shape)
 
     if channelwise_cutlass:
         # A tuned config exists only for shapes where tuned Triton beat the

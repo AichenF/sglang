@@ -1,4 +1,4 @@
-"""TP8 decode fusions for the DFlash draft (csrc/distributed/dflash_tp_fused.cuh), goal11-dense.
+"""TP8 decode fusions for the DFlash draft (csrc/distributed/dflash_tp_fused.cuh).
 
 ``DFlashTPState`` owns this rank's CUDA-IPC receive buffer and the peers' mapped addresses (one collective at
 creation over the TP group's CPU group; every rank must create it at the same point) and the per-token call
@@ -43,22 +43,7 @@ def _module(use_pdl: bool):
 def _stamp_edges() -> bool:
     import os
 
-    return os.environ.get("SGLANG_MIMO_DENSE_TP_STAMPS", "0") == "1"  # goal11-post diagnostics
-
-
-@functools.lru_cache(maxsize=None)
-def _early() -> int:
-    """goal12-glue SGLANG_G12_EMBED_EARLY_TRIGGER: the embedding kernels trigger their PDL secondary at entry (flag bit 1)."""
-    from sglang.srt.environ import envs
-
-    return 2 if envs.SGLANG_G12_EMBED_EARLY_TRIGGER.get() else 0
-
-
-@functools.lru_cache(maxsize=None)
-def _dup_argmax() -> int:
-    from sglang.srt.environ import envs
-
-    return max(0, int(envs.SGLANG_G12_DUP_ARGMAX.get()))
+    return os.environ.get("SGLANG_MIMO_DENSE_TP_STAMPS", "0") == "1"  # diagnostics
 
 
 @functools.lru_cache(maxsize=None)
@@ -116,23 +101,15 @@ class DFlashTPState:
         eps: float,
         out: torch.Tensor,
         out_scale: Optional[torch.Tensor],
-        prepushed: bool = False,
     ):
-        """out e4m3 [M, H] (+ out_scale [M] fp32) -> mode 0; out bf16 [M, H] -> mode 1 (out_scale ignored).
-        prepushed: the producing GEMM already pushed the partial into the reduce-scatter slots (skinny_fp8_pt_gemm
-        rs=state.rs()); `partial` then only gives M (pass any [M, H] bf16 tensor, e.g. the residual)."""
+        """out e4m3 [M, H] (+ out_scale [M] fp32) -> mode 0; out bf16 [M, H] -> mode 1 (out_scale ignored)."""
         mode = 0 if out.dtype == torch.float8_e4m3fn else 1
         if out_scale is None:
             out_scale = self.calls  # unused placeholder (mode 1)
         _module(_pdl()).arnq(
             partial, residual, gamma, out.view(torch.uint8) if mode == 0 else out, out_scale, self.calls,
-            self.peers, float(eps), self.rank, mode, 0 if self.stamps is None else self.stamps.data_ptr(),
-            1 if prepushed else 0,
+            self.peers, float(eps), self.rank, mode, 0 if self.stamps is None else self.stamps.data_ptr(), 0,
         )
-
-    def rs(self):
-        """(peers, calls, rank) for skinny_fp8_pt_gemm(rs=...): the GEMM epilogue pushes into the next arnq's slots."""
-        return (self.peers, self.calls, self.rank)
 
 
     def arnq_g128(
@@ -151,27 +128,12 @@ class DFlashTPState:
             self.peers, float(eps), self.rank, 2, 0 if self.stamps is None else self.stamps.data_ptr(), 0,
         )
 
-    def argmax(
-        self,
-        logits: torch.Tensor,
-        out: torch.Tensor,
-        vocab_start: int,
-        group: int = 0,
-        cand: Optional[torch.Tensor] = None,
-        cand_src: Optional[torch.Tensor] = None,
-    ) -> None:
+    def argmax(self, logits: torch.Tensor, out: torch.Tensor, vocab_start: int, group: int = 0) -> None:
         """Vocab-parallel greedy argmax of this rank's logits shard [n <= 32, Vs] -> out int64 [n] (global ids, bit-exact
         torch.argmax of the full row), local argmax + IPC exchange + select in one kernel. group > 1: logits hold blocks
-        of `group` rows and only rows 1..group-1 of each block are reduced (DFlash draft head, no slice copy).
-        cand / cand_src (goal12-glue, group > 1, contiguous int64): also write the verify candidates
-        cand[b * group + 1 + j] = result of row (b, j) and cand[b * group] = cand_src[b * group]."""
-        cp = sp = 0
-        if cand is not None:
-            assert group > 1 and cand_src is not None and cand.dtype == torch.int64 and cand_src.dtype == torch.int64
-            assert cand.is_contiguous() and cand_src.is_contiguous()
-            cp, sp = cand.data_ptr(), cand_src.data_ptr()
-        for _ in range(1 + _dup_argmax()):  # goal12-glue diagnostics: SGLANG_G12_DUP_ARGMAX extra identical launches
-            _module(_pdl()).argmax(logits, out, self.acalls, self.peers, int(vocab_start), self.rank, int(group), cp, sp)
+        of `group` rows and only rows 1..group-1 of each block are reduced (DFlash draft head, no slice copy)."""
+        # the trailing (0, 0): no candidate-buffer write
+        _module(_pdl()).argmax(logits, out, self.acalls, self.peers, int(vocab_start), self.rank, int(group), 0, 0)
 
 
     def ag_norm(self, x_slice: torch.Tensor, gamma: torch.Tensor, eps: float, out: torch.Tensor) -> None:
@@ -184,14 +146,8 @@ class DFlashTPState:
     ) -> None:
         """Vocab-parallel embedding [M <= 32] without the all-reduce: the owner of each row pushes it to every peer.
         ranges: host int64 [2 * R] = every rank's [start, end) org vocab range.
-        local (goal12-glue): weight is the full replicated table and ranges = local_ranges(vocab): a local gather."""
-        _module(_pdl()).embed(ids, weight, out, self.ecalls, self.peers, ranges, self.rank, (1 if local else 0) | _early())
-
-    def local_ranges(self, vocab: int) -> torch.Tensor:
-        """ranges for local=True: this rank owns [0, vocab) of the replicated table, every other rank nothing."""
-        r = torch.zeros(2 * R, dtype=torch.int64)
-        r[R + self.rank] = int(vocab)
-        return r
+        local: weight is the full replicated table and ranges gives this rank [0, vocab): a local gather."""
+        _module(_pdl()).embed(ids, weight, out, self.ecalls, self.peers, ranges, self.rank, 1 if local else 0)
 
 
     def embed_nq(
@@ -210,7 +166,7 @@ class DFlashTPState:
         bf16 embedding rows, out_q [>= M, H] e4m3, out_scale_t [H/128, ld >= M] fp32 (bit-exact sgl rmsnorm + group quant)."""
         _module(_pdl()).embed_nq(
             ids, weight, out, out_q.view(torch.uint8), out_scale_t, gamma, float(eps), self.ecalls, self.peers, ranges, self.rank,
-            (1 if local else 0) | _early(),
+            1 if local else 0,
         )
 
 

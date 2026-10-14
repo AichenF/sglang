@@ -38,7 +38,6 @@ from sglang.srt.layers.attention.kv_shard_hooks import (
     get_kv_shard_pool,
     prepare_kv_shard_forward,
 )
-from sglang.srt.layers.attention.mimo_rope_kv import run_deferred_mimo_rope_kv
 from sglang.srt.layers.attention.local_attention import (
     LocalAttentionMetadata,
     LocalAttentionMetadataBuilder,
@@ -80,7 +79,7 @@ from sglang.kernels.ops.attention.flash_attention import (
 )
 
 
-# goal10-p2: fused target-verify replay seqlens/cu_seqlens metadata (A/B knob).
+# fused target-verify replay seqlens/cu_seqlens metadata (A/B knob).
 _VERIFY_FUSED_SEQLENS = os.environ.get("SGLANG_FA_VERIFY_FUSED_SEQLENS", "1") == "1"
 
 
@@ -551,7 +550,7 @@ class FlashAttentionBackend(AttentionBackend):
             self._init_full_cg_decode_metadata(forward_batch, in_capture)
 
     def _fused_swa_wloc_mapping(self):
-        """goal11-glue (SGLANG_FA_SWA_WLOC_FUSED): the plain full->SWA index mapping when the SWA write loc is a pure
+        """SGLANG_FA_SWA_WLOC_FUSED: the plain full->SWA index mapping when the SWA write loc is a pure
         gather of it (SWAKVPool.translate_loc_from_full_to_swa), else None."""
         from sglang.srt.environ import envs
 
@@ -613,7 +612,7 @@ class FlashAttentionBackend(AttentionBackend):
             )
             mapping = self._fused_swa_wloc_mapping() if not in_capture else None
             if mapping is not None:
-                # goal11-glue: one launch for the translate + copy + tail zero (3 eager ops before every replay)
+                # one launch for the translate + copy + tail zero (3 eager ops before every replay)
                 from sglang.kernels.ops.attention.swa_write_loc import fill_swa_write_loc
 
                 fill_swa_write_loc(self.cuda_graph_swa_out_cache_loc, swa_out_cache_loc, mapping)
@@ -1415,7 +1414,7 @@ class FlashAttentionBackend(AttentionBackend):
         return q, q_rope, k_rope, k_descale, v_descale
 
     def dflash_mega_attn_args(self, layer: RadixAttention, forward_batch: ForwardBatch) -> Optional[dict]:
-        """goal11-draft: the inputs forward_extend would hand bidir_decode_attention (+ the KV write location of
+        """The inputs forward_extend would hand bidir_decode_attention (+ the KV write location of
         dflash_qknr_kv) for a DFlash draft layer, or None when forward_extend would take another path (the draft
         megakernel then must not run). Mirrors forward_extend's selection; keep in sync."""
         if self.use_mla or self.fa_skip_kv_cache or self.kv_cache_is_mxfp8 or self.kv_cache_dtype_str != "auto":
@@ -1491,10 +1490,6 @@ class FlashAttentionBackend(AttentionBackend):
             raise NotImplementedError("MLA extend does not return an LSE.")
         extend_lse = None
         cp_active = is_cp_active(forward_batch)
-        # Full-attention layer whose RoPE + KV store were deferred to the fa_verify kernel (mimo_rope_kv).
-        fav_rope = getattr(forward_batch, "_fav_rope", None)
-        if fav_rope is not None:
-            forward_batch._fav_rope = None
 
         if k is not None:
             assert v is not None
@@ -1653,9 +1648,6 @@ class FlashAttentionBackend(AttentionBackend):
             cu_seqlens_k = metadata.cu_seqlens_k
 
         # Use Flash Attention for prefill
-        if fav_rope is not None and self.use_mla:
-            run_deferred_mimo_rope_kv(fav_rope)
-            fav_rope = None
         if not self.use_mla:
             # Do multi-head attention
             key_cache, value_cache = self.get_paged_mha_kv_cache(
@@ -1685,10 +1677,6 @@ class FlashAttentionBackend(AttentionBackend):
                     kwargs=kwargs,
                 )
             )
-            if fav_rope is not None and not fav_ok:
-                # RoPE + KV store were deferred to fa_verify but another path runs: do them now.
-                run_deferred_mimo_rope_kv(fav_rope)
-                fav_rope = None
             if layer.is_cross_attention:
                 page_table = metadata.encoder_page_table
                 cache_seqlens = metadata.encoder_lens_int32
@@ -1795,9 +1783,7 @@ class FlashAttentionBackend(AttentionBackend):
                     cache_seqlens,
                     sm_scale=layer.scaling,
                     out=_fa_out,
-                    rope=(fav_rope[0], fav_rope[1]) if fav_rope is not None else None,
                 )
-                fav_rope = None
             elif (
                 not use_cascade_attn
                 and not use_local_attn
@@ -3255,7 +3241,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.cache_seqlens_int32.copy_(geometry.cache_seqlens_int32)
                     metadata.cu_seqlens_q.copy_(geometry.cu_seqlens_q)
                 elif _VERIFY_FUSED_SEQLENS and seq_lens.dim() == 1:
-                    # goal10-p2: cache_seqlens = seq_lens + N and cu_seqlens_k = [0, cumsum]
+                    # cache_seqlens = seq_lens + N and cu_seqlens_k = [0, cumsum]
                     # in one single-block kernel (was add + cast copy + cub scan (2) + copy).
                     normal_decode_set_metadata(
                         metadata.cache_seqlens_int32,

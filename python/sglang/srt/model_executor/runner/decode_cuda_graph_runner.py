@@ -501,12 +501,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._metadata_glue = (
             MetadataGlueGraph(self.device) if enable_metadata_glue else None
         )
-        # goal11-post (SGLANG_STEP_PREP_FUSED): DFlash-family replays record their padding-free full-path prep and run
+        # SGLANG_STEP_PREP_FUSED: DFlash-family replays record their padding-free full-path prep and run
         # it as one launch (kernels/ops/speculative/step_prep.py); _sp_plan_sig marks a pre-planned replay whose
         # input_ids / positions copies are still current (no other load_batch / replay since)
         self._sp_ok = bool(model_runner.spec_algorithm.is_dflash_family())
         self._sp_plan_sig = None
-        self._g12_early_sig = None
 
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
@@ -1365,14 +1364,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
             sp_sig, self._sp_plan_sig = self._sp_plan_sig, None
-            # goal12-glue (SGLANG_G12_VERIFY_EARLY): planned before the draft forward; the draft's prep writes the same
-            # positions and the draft graph writes the candidates into input_ids, so the generation bump in between is
-            # expected (the worker sets this only when the planned input_ids copy was a self-copy of the static buffer)
-            early, self._g12_early_sig = self._g12_early_sig, None
-            cur_sig = self._sp_sig(forward_batch)
-            if early is not None and cur_sig is not None and early == cur_sig[:-1]:
-                pass
-            elif sp_sig is None or sp_sig != cur_sig:
+            if sp_sig is None or sp_sig != self._sp_sig(forward_batch):
                 self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
                 self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
@@ -1441,7 +1433,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 bs=bs, num_tokens=padded_num_tokens
             )
 
-        # goal11-post: open (or continue -- the DFlash worker may have deferred its prepare_block into it) the fused
+        # open (or continue -- the DFlash worker may have deferred its prepare_block into it) the fused
         # replay-prep window; anything recorded but not eligible here runs eagerly first
         from sglang.kernels.ops.speculative import step_prep
 

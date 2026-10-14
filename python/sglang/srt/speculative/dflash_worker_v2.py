@@ -163,36 +163,6 @@ class _DflashDraftSampler:
         max_tokens = int(max_bs) * (self.block_size - 1)
         device = weight.device
         self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
-        # goal10-p2: optional fp8 (per-output-channel, dynamic activation scale) copy
-        # of the borrowed target LM head for the DRAFT greedy head only (halves its
-        # weight traffic; the target verify keeps the bf16 head). Draft-only numerics.
-        self._fp8_head = None
-        if envs.SGLANG_DFLASH_DRAFT_HEAD_FP8.get() and is_cuda():
-            try:
-                from sglang.srt.layers.quantization.fp8 import (
-                    Fp8Config,
-                    Fp8LinearMethod,
-                )
-
-                method = Fp8LinearMethod(Fp8Config(is_checkpoint_fp8_serialized=False))
-                holder = torch.nn.Module()
-                holder.weight = torch.nn.Parameter(
-                    weight.data[: self.num_org], requires_grad=False
-                )
-                method.process_weights_after_loading(holder)
-                self._fp8_head = (method, holder)
-                logger.info(
-                    "DFLASH draft greedy head: fp8 LM-head copy %s (scale %s).",
-                    tuple(holder.weight.shape),
-                    tuple(holder.weight_scale.shape),
-                )
-            except Exception as e:
-                logger.warning("DFLASH draft fp8 LM head disabled: %s", e)
-                self._fp8_head = None
-        # goal12-glue (SGLANG_G12_VERIFY_EARLY): the fused argmax also writes the verify candidates into the target
-        # runner's static input_ids (g12_cand); g12_cand_bs = the draft graph sizes captured that way
-        self.g12_cand = None
-        self.g12_cand_bs = set()
         # fused shard argmax + 16-B pair multimem all-gather + select
         # (one Triton reduce, one symm-mem gather, one tiny select) instead of
         # torch.max + two NCCL all-gathers + argmax + gather.
@@ -229,9 +199,6 @@ class _DflashDraftSampler:
             )
 
     def _logits(self, hs):
-        if self._fp8_head is not None:
-            method, holder = self._fp8_head
-            return method.apply(holder, hs)
         return torch.matmul(hs, self.weight[: self.num_org].T)
 
     def __call__(self, hidden_states, input_ids=None):
@@ -246,27 +213,12 @@ class _DflashDraftSampler:
             and bs * (self.block_size - 1) <= 32
             and envs.SGLANG_DFLASH_SAMPLER_NO_SLICE.get()
         ):
-            # goal11-dense: the LM head on every block row (same weight traffic, no [:, 1:] gather copy) and the
+            # The LM head runs on every block row (same weight traffic, no [:, 1:] gather copy) and the
             # fused IPC argmax skips block position 0 through a row map.
             hs = hidden_states
             if hs.dtype != self.weight.dtype:
                 hs = hs.to(self.weight.dtype)
-            cand = self.g12_cand
-            n_tok = int(hidden_states.shape[0])
-            use_cand = (
-                cand is not None
-                and input_ids is not None
-                and input_ids.dtype == torch.int64
-                and input_ids.is_contiguous()
-                and int(input_ids.numel()) >= n_tok
-                and int(cand.numel()) >= n_tok
-            )
-            fused.argmax(
-                self._logits(hs), self.out, self.org_vocab_start, group=self.block_size,
-                cand=cand if use_cand else None, cand_src=input_ids if use_cand else None,
-            )
-            if use_cand and torch.cuda.is_current_stream_capturing():
-                self.g12_cand_bs.add(bs)
+            fused.argmax(self._logits(hs), self.out, self.org_vocab_start, group=self.block_size)
             return
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :].reshape(
             -1, hidden_states.shape[-1]
@@ -606,7 +558,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._maybe_merge_trained_mask_embedding()
         self._cache_full_embed_weight()
-        self._g12_init_slope_diag()
         if get_parallel().tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
@@ -695,7 +646,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._fused_publish_done = False
 
     # ------------------------------------------------------------------
-    # goal11-glue: draft-KV materialization inside the target verify forward
+    # draft-KV materialization inside the target verify forward
     # ------------------------------------------------------------------
     def _init_mat_in_verify(self) -> None:
         """Fork the draft-KV materialization onto a side stream inside the target verify forward (overlaps the LM
@@ -789,7 +740,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # (in a captured graph the earlier-created branch is launched first; the fc GEMM's 132 CTAs would otherwise
         # take every SM and delay the LM head's 100 CTAs).
         # deferred aux captures (SGLANG_DFLASH_AUX_DEFER) are packed HERE on the main stream (one ~1.5-us launch with
-        # the whole GPU): on the side stream under the LM head the 960-CTA pack starved for SMs (15 us, g11g_g7prof_ma)
+        # the whole GPU): on the side stream under the LM head the 960-CTA pack starved for SMs (15 us)
         # and delayed the fc
         pend = getattr(aux_hidden_states, "_aux_pending", None)
         aux_hidden_states._aux_pending = None
@@ -801,7 +752,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         ev.record(torch.cuda.current_stream())
         self._mat_req = (ev, aux_hidden_states, forward_batch, bs, n, positions, out_cache_loc, None)
         if envs.SGLANG_DFLASH_MAT_EARLY_FORK.get():
-            # goal11-post: launch the side chain BEFORE the LM head: the fc gets the whole GPU first (~14 us), then the
+            # launch the side chain BEFORE the LM head: the fc gets the whole GPU first (~14 us), then the
             # LM head streams alone while ag_norm / K/V GEMM / norm-RoPE / KV write run on the SMs it leaves free
             self._mat_launch()
 
@@ -820,7 +771,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             ctx_hidden = self._project_target_hidden(aux_hidden_states)
             # the fc all-gather (ag_norm) is a spinning cross-rank collective: the main stream's vocab-parallel argmax
             # (another one) waits for it, so the two never run concurrently (concurrent spinning collectives on two
-            # streams can deadlock across ranks once blocked CTAs hold the SMs -- seen as a hang in g11g_g3prof)
+            # streams can deadlock across ranks once blocked CTAs hold the SMs -- seen as a hang)
             self._mat_ag_event = torch.cuda.Event()
             self._mat_ag_event.record(side)
             self._mat_write_kv(
@@ -879,7 +830,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         cos_sin_cache = h._ensure_rope_cache(h.max_position_hint)
         proj = torch.mm(ctx_hidden, h.flat_kv_weight_t)
         if envs.SGLANG_DFLASH_MAT_FUSED_KV_WRITE.get():
-            # goal11-post: k-norm/RoPE/v-scale + the KV write of every draft layer in one launch (full commit only)
+            # k-norm/RoPE/v-scale + the KV write of every draft layer in one launch (full commit only)
             pool = self.draft_model_runner.token_to_kv_pool
             attns = [layer.self_attn.attn for layer in self.draft_model.layers]
             tables = _kv_write_tables(pool, attns, h.n_layers, h.num_kv_heads, h.head_dim, ctx_hidden.dtype)
@@ -978,7 +929,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def _step_prep_bs_ok(self, bs: int) -> bool:
-        """goal11-post: open a fused-prep window only for a padding-free graph replay of both runners (anything else
+        """Open a fused-prep window only for a padding-free graph replay of both runners (anything else
         would only replay the recorded ops eagerly, paying the recording's host time for nothing)."""
         cache = getattr(self, "_sp_bs_cache", None)
         if cache is None:
@@ -1113,8 +1064,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        # goal12-glue: after both KV pools are sized (the replica comes out of the non-static reserve, the KV budget is
-        # unchanged) and before the target graphs are captured
+        # after both KV pools are sized (the replica comes out of the non-static reserve, the KV budget is unchanged)
+        # and before the target graphs are captured
         self._init_embed_replica()
 
     def init_attention_backends(self):
@@ -1181,7 +1132,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         make_draft_sampler_capture_hook(self._draft_sampler)
                     )
                     if envs.SGLANG_DFLASH_TOKENS_IN_GRAPH.get() and not self._is_domino:
-                        # goal11-glue: the verify candidates [bonus, draft tokens] are assembled inside the draft graph
+                        # the verify candidates [bonus, draft tokens] are assembled inside the draft graph
                         # (2 eager copies fewer per step) into a fixed buffer sized for the largest graph
                         try:
                             cap_bs = max(get_exec().graph.cuda_graph_config.decode.bs)
@@ -1191,27 +1142,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                             self._graph_tokens_buf = torch.empty(
                                 (cap_bs, int(self.block_size)), dtype=torch.long, device=self.device
                             )
-                            # goal11-post: with SGLANG_STEP_PREP_FUSED the candidates are assembled by the verify's fused
+                            # with SGLANG_STEP_PREP_FUSED the candidates are assembled by the verify's fused
                             # replay prep instead (it reads the bonus column + the sampler output directly)
                             if not step_prep.enabled():
                                 self.draft_model_runner.capture_tail_hooks.append(self._draft_tokens_capture_hook)
-                    self._g12_init_verify_early()
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
-            if get_parallel().tp_rank == 0:
-                # goal12-glue: the process-wide input-buffer pool aliases same-sized static inputs of the draft and the
-                # target runners -> any prep of one runner concurrent with the other's graph races on them
-                try:
-                    tb = self._target_worker.model_runner.decode_cuda_graph_runner.buffers
-                    db = self.draft_model_runner.decode_cuda_graph_runner.buffers
-                    logger.info(
-                        "goal12 static input aliasing draft/target: %s",
-                        {k: getattr(tb, k).data_ptr() == getattr(db, k).data_ptr()
-                         for k in ("input_ids", "positions", "out_cache_loc", "req_pool_indices", "seq_lens")},
-                    )
-                except Exception as e:
-                    logger.info("goal12 static input aliasing check failed: %r", e)
 
     def _prewarm_batch_size(self, block_size: int) -> int:
         """Largest batch the non-greedy verify path can see in one step."""
@@ -1482,7 +1419,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 if not eligible:
                     dequant = self._dequant_fp8_kv_weight(attn)
                     if dequant is not None:
-                        # goal10-p2: fp8 draft (online per-channel quant): the fused
+                        # fp8 draft (online per-channel quant): the fused
                         # context-KV path runs on a dequantized bf16 copy of the K/V
                         # slice (draft-only numerics) instead of falling back to the
                         # per-layer sequential path.
@@ -1916,7 +1853,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
     def _init_embed_replica(self) -> None:
-        """goal12-glue (SGLANG_DFLASH_EMBED_LOCAL_REPLICA): replicate the full target embedding table on this rank so the TP8
+        """SGLANG_DFLASH_EMBED_LOCAL_REPLICA: replicate the full target embedding table on this rank so the TP8
         fused step-start embeddings (embed_nq of the verify, embed_ag of the draft block) gather locally instead of
         exchanging rows over NVLink. Collective over the TP group (every rank runs __init__ at the same point)."""
         if not envs.SGLANG_DFLASH_EMBED_LOCAL_REPLICA.get() or get_parallel().attn_dp_enabled or _is_npu or not is_cuda():
@@ -1980,61 +1917,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             logger.info(
                 "DFLASH embedding replica: full table %s (%.2f GB/rank) -> local embed_nq / embed_ag",
                 tuple(full.shape), full.numel() * full.element_size() / 1e9,
-            )
-
-    def _g12_init_verify_early(self) -> None:
-        """goal12-glue (SGLANG_G12_VERIFY_EARLY): point the draft sampler's candidate write at the target runner's static
-        input_ids (before the draft graphs are captured)."""
-        self._g12_cand_buf = None
-        if not envs.SGLANG_G12_VERIFY_EARLY.get() or not step_prep.enabled() or self._draft_sampler is None:
-            return
-        if self._is_domino or self.selector is not None or self.lilicorr is not None or self._need_mamba_verify_commit:
-            return
-        tr = getattr(self._target_worker.model_runner, "decode_cuda_graph_runner", None)
-        buf = getattr(getattr(tr, "buffers", None), "input_ids", None)
-        if buf is None or buf.dtype != torch.int64 or not buf.is_contiguous() or buf.dim() != 1:
-            logger.warning("goal12 verify-early: no usable target static input_ids; disabled")
-            return
-        self._g12_cand_buf = buf
-        self._draft_sampler.g12_cand = buf
-        if get_parallel().tp_rank == 0:
-            logger.info("goal12 verify-early: draft argmax writes the verify candidates into the target input_ids %s",
-                        tuple(buf.shape))
-
-    def _g12_verify_early_ok(self, batch, bs: int) -> bool:
-        buf = getattr(self, "_g12_cand_buf", None)
-        return (
-            buf is not None
-            and bs in self._draft_sampler.g12_cand_bs
-            and int(buf.numel()) >= bs * int(self.block_size)
-            and self._step_prep_bs_ok(bs)
-            and not batch.has_grammar
-            and not self._need_mamba_verify_commit
-            and not get_parallel().attn_dp_enabled
-            and not batch.is_extend_in_batch
-            and SIMULATE_ACC_LEN <= 0
-        )
-
-    def _g12_init_slope_diag(self) -> None:
-        """goal12-glue diagnostics: per-step k empty eager kernels / k single-node graph launches after the accept."""
-        self._g12_slope_eager = int(envs.SGLANG_G12_SLOPE_EAGER.get())
-        self._g12_slope_graph = int(envs.SGLANG_G12_SLOPE_GRAPH.get())
-        self._g12_slope_buf = None
-        self._g12_slope_g = None
-        if self._g12_slope_eager <= 0 and self._g12_slope_graph <= 0:
-            return
-        self._g12_slope_buf = torch.zeros(4, dtype=torch.int32, device=self.device)
-        if self._g12_slope_graph > 0:
-            torch.cuda.synchronize()
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g):
-                self._g12_slope_buf.zero_()
-            torch.cuda.synchronize()
-            self._g12_slope_g = g
-        if get_parallel().tp_rank == 0:
-            logger.info(
-                "goal12 slope diag: %d eager + %d graph launches per decode step", self._g12_slope_eager,
-                self._g12_slope_graph,
             )
 
     def _resolve_mask_token_id(
@@ -2717,7 +2599,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
 
         def _write_all_layers_kv(cache_k: torch.Tensor, cache_v: torch.Tensor) -> bool:
-            # goal11-dense: the per-layer prefix-valid commits as ONE launch (plain bf16 3-D MHA pool only)
+            # the per-layer prefix-valid commits as ONE launch (plain bf16 3-D MHA pool only)
             if ctx_cache_loc_2d is None or commit_lens is None or not envs.SGLANG_DFLASH_KV_WRITE_ALL.get():
                 return False
             return _commit_all_layers_kv(
@@ -3105,7 +2987,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         gatherer = self._fc_gatherer
         fused_fc = getattr(self.draft_model, "_fc_ag_norm", None)
         if fused_fc is not None and target_hidden.ndim == 2:
-            # goal11-dense: fc local slice + one-kernel all-gather + hidden_norm (TP8, <= 32 tokens)
+            # fc local slice + one-kernel all-gather + hidden_norm (TP8, <= 32 tokens)
             out = fused_fc(target_hidden)
             if out is not None:
                 return out
@@ -3271,7 +3153,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         new_seq_lens: torch.Tensor,
     ) -> DFlashDraftInputV2:
         di = make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
-        # goal11-post: the overlap resolve leaves the bonus gather to this worker's fused draft prep
+        # the overlap resolve leaves the bonus gather to this worker's fused draft prep
         di.defer_bonus_gather = self._step_prep_defer_ok()
         return di
 
@@ -3449,7 +3331,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         prefix_lens = batch.seq_lens
         positions_2d = self._draft_block_positions_buf[:bs]
         verify_out_cache_loc_2d = self._draft_verify_out_cache_loc_buf[:bs]
-        # goal11-post (SGLANG_STEP_PREP_FUSED): prepare_block is deferred into the draft runner's fused replay prep
+        # SGLANG_STEP_PREP_FUSED: prepare_block is deferred into the draft runner's fused replay prep
         # (one launch with the input copies, FA metadata and page table); nothing below reads its outputs eagerly
         # before the draft runner's load_batch (embedding in the graph, no compact cache, no early verify prep)
         sp_defer = self._step_prep_defer_ok() and self._step_prep_bs_ok(bs)
@@ -3625,28 +3507,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         use_gt = gt_buf is not None and bs <= int(gt_buf.shape[0])
         draft_tokens = (gt_buf if use_gt else self._draft_block_tokens_buf)[:bs]
 
-        # goal12-glue (SGLANG_G12_VERIFY_EARLY): plan the target verify now; its replay prep is held and launched with
-        # the draft's (one kernel), the draft graph's argmax writes the candidates into the target's static input_ids
-        g12_early = None
-        if sp_defer and step_prep.is_recording() and self._g12_verify_early_ok(batch, bs):
-            cand_view = self._g12_cand_buf[: bs * block_size].view(bs, block_size)
-            step_prep.group_begin()
-            g12_early = self._prepare_verify_forward(
-                batch=batch,
-                draft_tokens=cand_view,
-                positions=positions,
-                verify_out_cache_loc=verify_out_cache_loc,
-                draft_input=draft_input,
-                block_size=block_size,
-            )
-            draft_tokens = cand_view
-            tr = self._target_worker.model_runner.decode_cuda_graph_runner
-            sig = getattr(tr, "_sp_plan_sig", None)
-            if g12_early[1] and sig is not None and step_prep.held_self_copy(self._g12_cand_buf):
-                tr._g12_early_sig = sig[:-1]
-            else:
-                tr._g12_early_sig = None
-
         with (
             torch.inference_mode(),
             draft_tp_context(self.draft_owns_attention),
@@ -3774,18 +3634,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                     lm_head=lm_head,
                 ).view(bs, int(self.block_size) - 1)
 
-        if g12_early is not None and not draft_out.can_run_graph:
-            # the draft ran eagerly: no in-graph candidate write -> stage them into the static buffer now
-            draft_tokens[:, 0].copy_(block_ids[:, 0])
-            draft_tokens[:, 1:].copy_(draft_next)
-        tokens_in_graph = g12_early is not None or (
+        tokens_in_graph = (
             use_gt
             and self._draft_sampler is not None
             and draft_out.can_run_graph
             and bool(self._tokens_graph_bs)
             and not self._is_domino
         )
-        # goal11-post (SGLANG_STEP_PREP_FUSED): the candidates copy joins the target runner's fused replay prep
+        # SGLANG_STEP_PREP_FUSED: the candidates copy joins the target runner's fused replay prep
         # (opened here, flushed at the end of the verify load_batch); nothing reads draft_tokens before that
         sp_verify = (
             not tokens_in_graph
@@ -3808,17 +3664,14 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # --- 2) Target verify.
         sampling_info = batch.sampling_info
-        if g12_early is not None:
-            verify_forward_batch, verify_decode_graph, seq_lens_pre_verify = g12_early
-        else:
-            verify_forward_batch, verify_decode_graph, seq_lens_pre_verify = self._prepare_verify_forward(
-                batch=batch,
-                draft_tokens=draft_tokens,
-                positions=positions,
-                verify_out_cache_loc=verify_out_cache_loc,
-                draft_input=draft_input,
-                block_size=block_size,
-            )
+        verify_forward_batch, verify_decode_graph, seq_lens_pre_verify = self._prepare_verify_forward(
+            batch=batch,
+            draft_tokens=draft_tokens,
+            positions=positions,
+            verify_out_cache_loc=verify_out_cache_loc,
+            draft_input=draft_input,
+            block_size=block_size,
+        )
         if step_prep.pending() or step_prep.is_recording():
             step_prep.flush("verify (after prepare)")  # paths that did not reach an eligible load_batch
 
@@ -3888,7 +3741,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             grammar_mask.apply(logits_output.next_token_logits)
 
         candidates = draft_tokens
-        # goal11-glue: the greedy Triton accept also performs the overlap scheduler's FutureMap relay writes
+        # the greedy Triton accept also performs the overlap scheduler's FutureMap relay writes
         # (publish's new_seq_lens scatter + stash's bonus scatter) in the same launch
         self._fused_publish_target = self._fused_publish_target_for(on_publish, bs)
         self._fused_publish_done = False
@@ -3908,12 +3761,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             bs=bs,
             target_predict=target_predict_fast,
         )
-
-        if self._g12_slope_buf is not None:
-            for _ in range(self._g12_slope_eager):
-                self._g12_slope_buf.zero_()
-            for _ in range(self._g12_slope_graph):
-                self._g12_slope_g.replay()
 
         if SIMULATE_ACC_LEN > 0:
             if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
@@ -3996,7 +3843,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
-        # goal11-glue: skipped when the verify forward already materialized it on its side stream.
+        # skipped when the verify forward already materialized it on its side stream.
         mat_done = self._mat_done_for_verify(verify_forward_batch, verify_decode_graph, can_run_cuda_graph)
         mat_check = mat_done and envs.SGLANG_DFLASH_MAT_CHECK.get()
         if mat_check:
@@ -4041,7 +3888,7 @@ _kv_tables = {}
 
 
 def _kv_write_tables(pool, attns, n_layers, num_kv_heads, head_dim, dtype):
-    """goal11-post: (k base table, v base table, row stride in elements) of the plain bf16 MHATokenToKVPool's draft layers
+    """(k base table, v base table, row stride in elements) of the plain bf16 MHATokenToKVPool's draft layers
     for mat_kv_write.norm_rope_kv_write, or None (unsupported pool -> the two-kernel path)."""
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
@@ -4071,7 +3918,7 @@ def _kv_write_tables(pool, attns, n_layers, num_kv_heads, head_dim, dtype):
 
 
 def _commit_all_layers_kv(pool, attns, loc_2d, commit_lens, cache_k, cache_v) -> bool:
-    """goal11-dense: set_kv_buffer_prefix_valid for every draft layer in one Triton launch. Only for the plain bf16
+    """set_kv_buffer_prefix_valid for every draft layer in one Triton launch. Only for the plain bf16
     MHATokenToKVPool (3-D per-layer buffers, equal K/V rows, no quantization); False -> caller falls back."""
     from sglang.kernels.ops.kvcache.cache_move import set_kv_buffer_prefix_valid_multi_layer
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
