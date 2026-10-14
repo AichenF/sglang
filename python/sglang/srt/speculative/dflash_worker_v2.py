@@ -716,6 +716,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             reason = "no fused KV helper"
         elif getattr(self._fused_kv_helper, "max_position_hint", None) is None:
             reason = "no rope position hint"
+        elif self._target_greedy_head is None:
+            # The side chain's fc all-gather spins across GPUs; only the in-graph vocab-parallel argmax keeps it from
+            # running concurrently with the LM head's logits all-gather (deadlock otherwise).
+            if get_parallel().tp_rank == 0:
+                logger.warning(
+                    "DFLASH materialize-in-verify disabled: it requires the vocab-parallel target argmax "
+                    "(SGLANG_DFLASH_VP_ARGMAX), which is off for this model/configuration."
+                )
+            return
         else:
             from sglang.srt.models.mimo_v2 import MiMoV2ForCausalLM
 
