@@ -1,19 +1,22 @@
-// goal11 "blk": MiMo-V2 SWA target-verify attention block in ONE kernel (exact M = 32 = 4 requests x 8 verify tokens, TP8, sm_90a):
+// MiMo-V2 SWA target-verify attention block in ONE kernel (exact M = 32 = 4 requests x 8 verify tokens, TP8, sm_90a):
 //   RoPE (NeoX, 64 of 192 dims) + KV-cache store of the 8 new tokens + sliding-window attention (window 128/129, 1 KV head, per-head sink)
 //   + o_proj (bf16, K = 16 heads x 128 = 2048 per rank, N = 6144) + the TP reduce-scatter PUSH of the o_proj partial straight into the
 //   fused MoE kernel's entry receive buffers (IN_RS region of every peer's prologue IPC buffer, owner-reduce layout, {6 bf16, epoch}
 //   LL messages). The following fused MoE launch skips its own entry push (prepushed mode bit) and finds the messages landed.
 //
-// v2 grid: 128 CTAs = 64 clusters of 2 (1 CTA per SM, 8 math warps + 1 TMA producer warp). Cluster p owns o_proj columns [96p, 96p + 96);
+// Grid: 128 CTAs = 64 clusters of 2 (1 CTA per SM, 8 math warps + 1 TMA producer warp). Cluster p owns o_proj columns [96p, 96p + 96);
 // its CTA h (cluster rank) multiplies the K half [1024h, 1024h + 1024) (= heads 8h..8h+7), so each SM ingests 192 KB of weight + only
 // 64 KB of the attention output; the two fp32 partials meet over DSMEM and CTA h finalizes columns [96p + 48h, +48).
-// CTAs 0..31 first run the attention of (request c / 8, heads 2 (c % 8), +1): the swa_decode_mma kernel's code (8 warps, mma.m16n8k16,
-// same reduction order -> bitwise its output) with the RoPE + KV store of rope_kv fused in front (bitwise rope_kv: bf16 fma/mul).
+// Clusters 0..31 (CTAs 0..63) first run the attention of (request p / 8, heads 2 (p % 8), +1), split over the pair by keys: CTA h takes
+// the key rows [0, 64) (h 0) or [64, 144) (h 1) of the window, the row maxima and the PV partials meet over DSMEM (attention_ks). The
+// math is swa_decode_mma's (8 warps, mma.m16n8k16; P bitwise its P, only the fp32 order of the two halves' PV sum differs), with the
+// RoPE + KV store of rope_kv fused in front (bitwise rope_kv: bf16 fma/mul).
 // Smem: a 13-stage ring, stage = {weight k-tile [96 rows][64] SW128 12 KB | attention k-tile [32 tok][64] SW128 4 KB}. The producer warp
-// fills the weight halves from kernel start (L2-resident: the MoE tail prefetched them), waits for the 32 attention-ready flags (epoch,
-// no reset), then TMA-loads the attention k-tiles (all 13 at once: the per-SM ingress needs depth) and the last 3 weight k-tiles.
-// Attention CTAs keep stages 6..12 (their attention scratch) out until the attention is done, and issue stages 0..5 only after their
-// own gathers landed (an SM's loads queue behind its outstanding TMA bytes).
+// streams the weight halves from kernel start (L2-resident when the MoE tail prefetched them). The math warps poll the 64 attention-ready
+// flags (epoch, no reset; one flag per thread) and TMA-load attention k-tiles 0..12 at once (the per-SM ingress needs depth); the
+// producer warp issues the last 3 attention k-tiles as stages free up. Attention CTAs keep stages 8..12 (their attention scratch) out
+// until the attention is done, and issue stages 0..7 only after their own gathers landed (an SM's loads queue behind its outstanding
+// TMA bytes).
 // Epilogue: fp32 -> bf16 RN, 256 threads build the 32 x 8 messages; a warp writes 32 consecutive messages = whole 32-B sectors
 // (the LL tearing rule: every 16-B store carries the epoch tag, and no 32-B sector is shared by two store instructions).
 #include <torch/extension.h>
@@ -30,13 +33,7 @@ namespace blk {
 
 constexpr int DIM = 6144, NH = 16, DQK = 192, DV = 128, KO = NH * DV, QKVW = NH * DQK + DQK + DV;   // 2048, 3392
 constexpr int VT = 8, NREQ = 4, M = VT * NREQ;   // verify tokens per request, requests, rows
-#ifndef BLK_KS_MAXX
-#define BLK_KS_MAXX 1                         // key-split attention: 1 = exchange the row maxima first (P bitwise swa_mma's, one more DSMEM round
-#endif                                        //    trip); 0 = split-softmax combine (local maxima, rescaled in the single exchange)
-#ifndef BLK_KSPLIT
-#define BLK_KSPLIT 1                          // 1: every (request, head pair) attention runs on a cluster PAIR, each CTA half of the key window
-#endif                                        //    (64 attention CTAs; row maxima and PV partials meet over DSMEM). 0: one CTA per pair (bitwise swa_mma)
-constexpr int HP = 2, NHG = NH / HP, NATT = NREQ * NHG * (BLK_KSPLIT ? 2 : 1);   // heads per attention CTA, head groups, attention CTAs
+constexpr int HP = 2, NHG = NH / HP, NATT = NREQ * NHG * 2;   // heads per attention CTA, head groups, attention CTAs (a cluster pair each)
 constexpr int NW = 8, NMATH = NW * 32, NTHREADS = NMATH + 32;   // 8 math warps + 1 producer warp
 constexpr int CL = 2, PCOLS = 96, COLS = PCOLS / CL, NCTA = CL * (DIM / PCOLS);   // cluster pairs: 96 columns per pair, 48 finalized per CTA
 constexpr int KT = 64, NKT = KO / KT / CL;    // 16 k-tiles of 64 per CTA (its K half)
@@ -44,14 +41,14 @@ constexpr int WT_BYTES = PCOLS * KT * 2;      // 12288: one SW128 weight k-tile 
 constexpr int BT_BYTES = M * KT * 2;          // 4096: one SW128 attention k-tile (32 tokens x 128 B)
 constexpr int ST_BYTES = WT_BYTES + BT_BYTES; // 16384 per stage
 constexpr int NS = 13;                        // ring stages
-constexpr int NS0_ATT = BLK_KSPLIT ? 8 : 6;
+constexpr int NS0_ATT = 8;                    // attention CTAs: stages NS0_ATT..NS-1 hold the attention scratch until the attention is done
 constexpr int FLAG_STRIDE = 32;               // attention-ready flags one per 128-B line (u32 index c * FLAG_STRIDE)
 #ifndef NACC
 #define NACC 4                                // independent wgmma accumulator chains per warpgroup (N = 32: one chain is latency-bound)
 #endif
 #ifndef BLK_WD
 #define BLK_WD 3                              // weight k-tiles in flight per SM (Little: deeper queues only add latency to everyone's loads)
-#endif                    // stages an attention CTA fills during its attention (6..12 hold the attention scratch)
+#endif
 constexpr int OFF_ATT = NS0_ATT * ST_BYTES;   // 98304
 constexpr int OFF_X = NS * ST_BYTES;          // 212992: [48 rows][32 tok] fp32: the partner's partial of my final rows (DSMEM st.async)
 constexpr int OFF_BAR = OFF_X + COLS * M * 4;    // 219136
@@ -126,8 +123,8 @@ constexpr int NDBG = 32;
 #define BSTAMP(k) do { if (P.dbg) P.dbg[blockIdx.x * NDBG + (k)] = gtimer(); } while (0)
 #define CSTAMP(k) do { if (P.dbg && (P.mode & MODE_DBG_ATTONLY)) { long long ck_; asm volatile("mov.u64 %0, %%clock64;" : "=l"(ck_) :: "memory"); P.dbg[blockIdx.x * NDBG + (k)] = ck_; } } while (0)
 __device__ __forceinline__ void griddep_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
-// exp2 / reciprocal as --use_fast_math emits them (ex2.approx.ftz / rcp.approx.ftz): the same instructions whether or not the including
-// translation unit is built with fast math (goal11 layer: layer_fused.cu includes this file next to the fused MoE, which must not be)
+// exp2 / reciprocal as --use_fast_math emits them (ex2.approx.ftz / rcp.approx.ftz): the same instructions whether or not the translation
+// unit is built with fast math
 __device__ __forceinline__ float fast_ex2(float x) { float y; asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x)); return y; }
 __device__ __forceinline__ float fast_rcp(float x) { float y; asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x)); return y; }
 __device__ __forceinline__ void griddep_launch() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
@@ -158,15 +155,6 @@ __device__ __forceinline__ void wgmma_m64n32k16(float* d, uint64_t da, uint64_t 
                    "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15])
                  : "l"(da), "l"(db), "r"(scale_d));
 }
-// RS form: A (64 x 16, m16n8k16 A-fragment layout per warp: rows 16 (warp % 4) + lane / 4 (+8), k 2 (lane % 4) (+1, +8)) in registers
-__device__ __forceinline__ void wgmma_rs_m64n32k16(float* d, const uint32_t* a, uint64_t db, int scale_d) {
-    asm volatile("{\n .reg .pred p;\n setp.ne.b32 p, %21, 0;\n"
-                 " wgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 "
-                 "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, {%16,%17,%18,%19}, %20, p, 1, 1, 0;\n}"
-                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
-                   "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(db), "r"(scale_d));
-}
 __device__ __forceinline__ long long ld_idx(const void* p, int i, bool i64) {
     return i64 ? reinterpret_cast<const long long*>(p)[i] : (long long)reinterpret_cast<const int*>(p)[i];
 }
@@ -176,279 +164,8 @@ __device__ __forceinline__ void rope_pair(__nv_bfloat16 x, __nv_bfloat16 y, __nv
     hi = __hfma(y, c, __hmul(x, s));
 }
 
-// ------------------------------------------------------------------------------------------------------------------ attention
-// swa_mma_kernel<8, 2, WINDOW, 8> with the KV for key rows NKEY-8 .. NKEY-1 (the 8 new tokens) taken from qkv after RoPE (the
-// unfused path reads the same bf16 values back from the cache rope_kv wrote) and rows outside the sequence zero-filled instead of
-// gathered from arbitrary pages (their logits are -inf and their probabilities exact 0 either way).
-template <int WINDOW>
-__device__ __forceinline__ void attention(const Params& P, uint8_t* smem, int b, int hg, uint64_t* att_in) {
-    constexpr int W = VT;
-    constexpr int NKEY = WINDOW - 1 + W, NPAD = (NKEY + 15) / 16 * 16, MR = W * HP, MPAD = 16;
-    constexpr int KP = DQK + 8, VP = DV + 8, PP = NPAD + 8;
-    constexpr int QKT = DQK / 16, NT8 = NPAD / 8, NKT2 = NPAD / 16, DT8 = DV / 8;
-    constexpr int NTW = (NT8 + NW - 1) / NW, DTW = (DT8 + NW - 1) / NW;
-    constexpr int KCH = DQK / 8, VCH = DV / 8;
-    constexpr int NOLD = NKEY - W;   // key rows 0 .. NOLD-1 come from the cache
-    static_assert(MR == 16, "one m16 tile");
-    static_assert((MPAD * KP + NPAD * KP + NPAD * VP + MPAD * PP) * 2 + 2 * NW * MPAD * 4 + NPAD * 4 <= OFF_X - OFF_ATT, "attention scratch fits");
-    __nv_bfloat16* Qs = reinterpret_cast<__nv_bfloat16*>(smem + OFF_ATT);
-    __nv_bfloat16* Ks = Qs + MPAD * KP;
-    __nv_bfloat16* Vs = Ks + NPAD * KP;
-    __nv_bfloat16* Ps = Vs + NPAD * VP;
-    float* rmax = reinterpret_cast<float*>(Ps + MPAD * PP);
-    float* rsum = rmax + NW * MPAD;
-    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    int* s_slot = reinterpret_cast<int*>(rsum + NW * MPAD);   // [NPAD] cache slot of key row r (-1: zero / new row)
-    if (tid == 0) BSTAMP(20);
-    const bool pos64 = P.mode & MODE_POS64;
-    // ---- independent loads first: seqlen, positions (Q-row token / new-key token of this thread), sinks, cached slots
-    const int qr = tid >> 4, qq = tid & 15;                 // Q: row qr (token b*8 + qr/2, head 2 hg + qr%2), pairs 2qq, 2qq+1, dims 64 + 8qq ..
-    const int qtok = b * W + qr / HP, qh = hg * HP + (qr % HP);
-    const int ktok = b * W + warp;                          // new key / value row NOLD + warp (lane: pair lane, dims 64 + 8 lane / V 8 (lane-16))
-    const int seqlen = P.seqlens[b];
-    const long long qpos = ld_idx(P.positions, qtok, pos64), kpos = ld_idx(P.positions, ktok, pos64);
-    const long long kslot = ld_idx(P.loc, ktok, P.mode & MODE_LOC64);
-    float sk0 = 0.f, sk1 = 0.f;
-    if (P.mode & MODE_SINK) { sk0 = P.sinks[hg * HP + ((lane >> 2) % HP)] * LOG2E; sk1 = P.sinks[hg * HP + (((lane >> 2) + 8) % HP)] * LOG2E; }
-    const bool slots_read = P.mode & MODE_SLOTS_READ;
-    int cslot = 0;
-    if (slots_read && tid < NPAD) cslot = P.slot_cache[b * NPAD + tid];
-    const int base_pos = seqlen - W - (WINDOW - 1);
-    if (tid < NPAD) {
-        int v;
-        if (slots_read) v = cslot;
-        else {
-            const int p = base_pos + tid;
-            v = (tid < NOLD && p >= 0) ? P.pt[b * P.pt_stride + p] : ((tid >= NKEY && (P.mode & MODE_DBG_GARB)) ? tid : -1);
-            if ((P.mode & MODE_SLOTS_WRITE) && hg == 0) P.slot_cache[b * NPAD + tid] = v;
-        }
-        s_slot[tid] = v;
-    }
-    // ---- qkv (previous kernel): raw Q / new K, V loads issued now, consumed after the gather issue loop (in flight meanwhile)
-    griddep_wait();
-    if (tid == 0) *reinterpret_cast<unsigned*>(smem + OFF_MISC) = (unsigned)(*reinterpret_cast<const volatile int*>(P.work + 2)) + 1u;
-    const __nv_bfloat16* qsrc = P.qkv + (size_t)qtok * QKVW + (size_t)qh * DQK;
-    const __nv_bfloat16* ksrc = P.qkv + (size_t)ktok * QKVW + NH * DQK;
-    const __nv_bfloat16* qcs = P.cos_sin + (size_t)qpos * 64;
-    const __nv_bfloat16* kcs = P.cos_sin + (size_t)kpos * 64;
-    __nv_bfloat16 qx[2], qy[2], qc[2], qs[2];
-#pragma unroll
-    for (int e = 0; e < 2; ++e) { const int i = 2 * qq + e; qx[e] = qsrc[i]; qy[e] = qsrc[i + 32]; qc[e] = qcs[i]; qs[e] = qcs[32 + i]; }
-    const uint4 qrest = *reinterpret_cast<const uint4*>(qsrc + 64 + 8 * qq);
-    const __nv_bfloat16 kx = ksrc[lane], ky = ksrc[lane + 32], kc_ = kcs[lane], ks_ = kcs[32 + lane];
-    const uint4 krest = *reinterpret_cast<const uint4*>(lane < 16 ? ksrc + 64 + 8 * lane : ksrc + DQK + 8 * (lane - 16));
-    named_bar_sync(1, NMATH);
-    if (tid == 0) BSTAMP(22);
-    {
-        // fixed 16-B chunk per thread (c = tid % 40: K chunk 0..23 | V chunk 0..15), rows gq, gq + 6, ... (gq = tid / 40 < 6): no per-chunk
-        // division / dependent slot lookup in the issue loop (the q-strided loop was instruction-latency bound: 2.4 vs 1.4 us, ub/gath.cu)
-        constexpr int CPR = KCH + VCH, NG = NMATH / CPR, RPG = (NPAD + NG - 1) / NG;   // 40 chunks per row, 6 row groups, 24 rows each
-        const int c = tid % CPR, gq = tid / CPR;
-        if (gq < NG) {
-            const bool isk = c < KCH;
-            const __nv_bfloat16* gbase = isk ? P.kc + c * 8 : P.vc + (c - KCH) * 8;
-            const long long gstr = isk ? P.ks : P.vs;
-            __nv_bfloat16* sbase = isk ? Ks + c * 8 : Vs + (c - KCH) * 8;
-            const int sstr = isk ? KP : VP;
-            int sl[RPG];
-#pragma unroll
-            for (int i = 0; i < RPG; ++i) sl[i] = (gq + NG * i < NPAD) ? s_slot[gq + NG * i] : -2;
-#pragma unroll
-            for (int i = 0; i < RPG; ++i) {
-                const int r = gq + NG * i;
-                if (sl[i] >= 0) cp16(sbase + r * sstr, gbase + (size_t)sl[i] * gstr);
-                else if (sl[i] == -1 && (r < NOLD || r >= NKEY)) *reinterpret_cast<uint4*>(sbase + r * sstr) = make_uint4(0u, 0u, 0u, 0u);
-            }
-        }
-    }
-    cp_commit();
-    for (int i = tid; i < (MPAD - MR) * KP; i += NMATH) Qs[MR * KP + i] = __float2bfloat16(0.f);
-    if (tid == 0) BSTAMP(27);   // gathers issued
-    // ---- RoPE of Q / the new key rows (rope_kv's bf16 ops), new V rows, KV-cache store
-#pragma unroll
-    for (int e = 0; e < 2; ++e) {
-        const int i = 2 * qq + e;
-        __nv_bfloat16 lo, hi;
-        rope_pair(qx[e], qy[e], qc[e], qs[e], lo, hi);
-        Qs[qr * KP + i] = lo; Qs[qr * KP + i + 32] = hi;
-    }
-    *reinterpret_cast<uint4*>(&Qs[qr * KP + 64 + 8 * qq]) = qrest;
-    {
-        const int r = NOLD + warp;
-        __nv_bfloat16 lo, hi;
-        rope_pair(kx, ky, kc_, ks_, lo, hi);
-        Ks[r * KP + lane] = lo; Ks[r * KP + lane + 32] = hi;
-        if (lane < 16) *reinterpret_cast<uint4*>(&Ks[r * KP + 64 + 8 * lane]) = krest;
-        else *reinterpret_cast<uint4*>(&Vs[r * VP + 8 * (lane - 16)]) = krest;
-        if (hg == 0 && kslot > 0 && kslot < P.kv_rows) {   // KV-cache store (rope_kv semantics: slot 0 is the padding slot, never written)
-            __nv_bfloat16* kd = P.kc + (size_t)kslot * P.ks;
-            kd[lane] = lo; kd[lane + 32] = hi;
-            if (lane < 16) *reinterpret_cast<uint4*>(kd + 64 + 8 * lane) = krest;
-            else *reinterpret_cast<uint4*>(P.vc + (size_t)kslot * P.vs + 8 * (lane - 16)) = krest;
-        }
-    }
-    if (tid == 0) BSTAMP(24);   // Q / new K, V written, KV stored (issue)
-    cp_wait_all();
-    named_bar_sync(1, NMATH);
-    if (tid == 0) { BSTAMP(6); mbar_arrive(att_in); }   // attention inputs in smem -> the producer may start this SM's weight TMAs
-
-    // ---- S = Q K^T (verbatim swa_mma)
-    if (tid == 0) CSTAMP(8);
-    const int rA = lane >> 2, rB = rA + 8, cA = (lane & 3) * 2;
-    unsigned qa[QKT][4];
-#pragma unroll
-    for (int kk = 0; kk < QKT; ++kk) ldm4(qa[kk], &Qs[(lane & 15) * KP + kk * 16 + (lane >> 4) * 8]);
-    if (tid == 0) CSTAMP(9);
-    // kk outer / n-tile inner: the NTW chains of 12 dependent mma (24 clk latency each) interleave instead of running back to back;
-    // every output keeps its k order -> bitwise swa_mma
-    float acc[NTW][4];
-#pragma unroll
-    for (int ti = 0; ti < NTW; ++ti)
-#pragma unroll
-        for (int i = 0; i < 4; ++i) acc[ti][i] = 0.f;
-    // explicit software pipeline: the fragment loads of k-step kk + 2 are issued before the mma of step kk (the asm statements are
-    // volatile, so the compiler keeps program order: written naively every mma waited for the ldmatrix right in front of it)
-    unsigned kb[2][NTW][4];
-#pragma unroll
-    for (int ti = 0; ti < NTW; ++ti) {
-        const int nt = warp + ti * NW;
-        if (nt < NT8) ldm4(kb[0][ti], &Ks[(nt * 8 + (lane & 7)) * KP + (lane >> 3) * 8]);
-    }
-#pragma unroll
-    for (int kk = 0; kk < QKT; kk += 2) {
-        const int cur = (kk >> 1) & 1;
-        if (kk + 2 < QKT) {
-#pragma unroll
-            for (int ti = 0; ti < NTW; ++ti) {
-                const int nt = warp + ti * NW;
-                if (nt < NT8) ldm4(kb[cur ^ 1][ti], &Ks[(nt * 8 + (lane & 7)) * KP + (kk + 2) * 16 + (lane >> 3) * 8]);
-            }
-        }
-#pragma unroll
-        for (int ti = 0; ti < NTW; ++ti) {
-            const int nt = warp + ti * NW;
-            if (nt < NT8) { mma16816(acc[ti], qa[kk], kb[cur][ti]); mma16816(acc[ti], qa[kk + 1], kb[cur][ti] + 2); }
-        }
-    }
-    if (tid == 0) { CSTAMP(10); BSTAMP(25); }   // QK done (warp 0)
-    // ---- softmax (verbatim)
-    const float scale2 = P.sm_scale * LOG2E;
-    float mx0 = -INFINITY, mx1 = -INFINITY;
-#pragma unroll
-    for (int ti = 0; ti < NTW; ++ti) {
-        const int nt = warp + ti * NW;
-        if (nt >= NT8) continue;
-        const int n0 = nt * 8;
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const int r = (i < 2) ? rA : rB;
-            const int j = n0 + cA + (i & 1);
-            const int t = r / HP;
-            const bool ok = (r < MR) && (j >= t) && (j <= t + (WINDOW - 1)) && (j < NKEY) && (base_pos + j >= 0);
-            acc[ti][i] = ok ? acc[ti][i] * scale2 : -INFINITY;
-        }
-        mx0 = fmaxf(mx0, fmaxf(acc[ti][0], acc[ti][1]));
-        mx1 = fmaxf(mx1, fmaxf(acc[ti][2], acc[ti][3]));
-    }
-    mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 1));
-    mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 2));
-    mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 1));
-    mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 2));
-    if ((lane & 3) == 0) { rmax[warp * MPAD + rA] = mx0; rmax[warp * MPAD + rB] = mx1; }
-    if (tid == 0) CSTAMP(11);
-    named_bar_sync(1, NMATH);
-    if (tid == 0) CSTAMP(12);
-    float m0 = -INFINITY, m1 = -INFINITY;
-#pragma unroll
-    for (int w = 0; w < NW; ++w) { m0 = fmaxf(m0, rmax[w * MPAD + rA]); m1 = fmaxf(m1, rmax[w * MPAD + rB]); }
-    const bool has_sink = P.mode & MODE_SINK;
-    if (has_sink) {   // sk0 / sk1 loaded at entry (rA = lane / 4, rB = rA + 8)
-        m0 = fmaxf(m0, sk0);
-        m1 = fmaxf(m1, sk1);
-    }
-    if (!isfinite(m0)) m0 = 0.f;
-    if (!isfinite(m1)) m1 = 0.f;
-    float s0 = 0.f, s1 = 0.f;
-#pragma unroll
-    for (int ti = 0; ti < NTW; ++ti) {
-        const int nt = warp + ti * NW;
-        if (nt >= NT8) continue;
-        const int n0 = nt * 8;
-        const float p0 = fast_ex2(acc[ti][0] - m0), p1 = fast_ex2(acc[ti][1] - m0);
-        const float p2 = fast_ex2(acc[ti][2] - m1), p3 = fast_ex2(acc[ti][3] - m1);
-        s0 += p0 + p1;
-        s1 += p2 + p3;
-        *reinterpret_cast<unsigned*>(&Ps[rA * PP + n0 + cA]) = pack_bf16(p0, p1);
-        *reinterpret_cast<unsigned*>(&Ps[rB * PP + n0 + cA]) = pack_bf16(p2, p3);
-    }
-    s0 += __shfl_xor_sync(0xffffffff, s0, 1); s0 += __shfl_xor_sync(0xffffffff, s0, 2);
-    s1 += __shfl_xor_sync(0xffffffff, s1, 1); s1 += __shfl_xor_sync(0xffffffff, s1, 2);
-    if ((lane & 3) == 0) { rsum[warp * MPAD + rA] = s0; rsum[warp * MPAD + rB] = s1; }
-    if (tid == 0) CSTAMP(13);
-    named_bar_sync(1, NMATH);
-    float l0 = 0.f, l1 = 0.f;
-#pragma unroll
-    for (int w = 0; w < NW; ++w) { l0 += rsum[w * MPAD + rA]; l1 += rsum[w * MPAD + rB]; }
-    if (has_sink) { l0 += fast_ex2(sk0 - m0); l1 += fast_ex2(sk1 - m1); }
-    if (tid == 0) { CSTAMP(14); BSTAMP(26); }   // softmax done
-    // ---- O = P V (verbatim), output row (token b*8 + t, head h) -> attn_out[tok][h * 128 + d]
-    unsigned pa[NKT2][4];
-#pragma unroll
-    for (int kk = 0; kk < NKT2; ++kk) ldm4(pa[kk], &Ps[(lane & 15) * PP + kk * 16 + (lane >> 4) * 8]);
-    float o[DTW][4];
-#pragma unroll
-    for (int di = 0; di < DTW; ++di)
-#pragma unroll
-        for (int i = 0; i < 4; ++i) o[di][i] = 0.f;
-    unsigned vb[2][DTW][4];
-#pragma unroll
-    for (int di = 0; di < DTW; ++di) {
-        const int dt = warp + di * NW;
-        if (dt < DT8) ldm4t(vb[0][di], &Vs[lane * VP + dt * 8]);
-    }
-#pragma unroll
-    for (int kk = 0; kk < NKT2; kk += 2) {   // kk outer, value tile inner, next step's V fragments loaded ahead (per-output k order unchanged)
-        const int cur = (kk >> 1) & 1;
-        if (kk + 2 < NKT2) {
-#pragma unroll
-            for (int di = 0; di < DTW; ++di) {
-                const int dt = warp + di * NW;
-                if (dt < DT8) ldm4t(vb[cur ^ 1][di], &Vs[((kk + 2) * 16 + lane) * VP + dt * 8]);
-            }
-        }
-#pragma unroll
-        for (int di = 0; di < DTW; ++di) {
-            const int dt = warp + di * NW;
-            if (dt < DT8) {
-                mma16816(o[di], pa[kk], vb[cur][di]);
-                if (kk + 1 < NKT2) mma16816(o[di], pa[kk + 1], vb[cur][di] + 2);
-            }
-        }
-    }
-    if (tid == 0) CSTAMP(15);
-    const float inv0 = (l0 > 0.f) ? fast_rcp(l0) : 0.f;
-    const float inv1 = (l1 > 0.f) ? fast_rcp(l1) : 0.f;
-#pragma unroll
-    for (int di = 0; di < DTW; ++di) {
-        const int dt = warp + di * NW;
-        if (dt >= DT8) continue;
-        const int n0 = dt * 8;
-        if (rA < MR) {
-            const int t = rA / HP, h = hg * HP + (rA % HP);
-            *reinterpret_cast<unsigned*>(&P.attn_out[(size_t)(b * W + t) * KO + (size_t)h * DV + n0 + cA]) = pack_bf16(o[di][0] * inv0, o[di][1] * inv0);
-        }
-        if (rB < MR) {
-            const int t = rB / HP, h = hg * HP + (rB % HP);
-            *reinterpret_cast<unsigned*>(&P.attn_out[(size_t)(b * W + t) * KO + (size_t)h * DV + n0 + cA]) = pack_bf16(o[di][2] * inv1, o[di][3] * inv1);
-        }
-    }
-}
-
 // ------------------------------------------------------------------------------------------------------------------ kernel
 __device__ __forceinline__ uint32_t mapa(uint32_t a, uint32_t rank) { uint32_t r; asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(rank)); return r; }
-__device__ __forceinline__ float4 ld_dsmem_f4(uint32_t a) {
-    float4 v; asm volatile("ld.shared::cluster.v4.f32 {%0,%1,%2,%3}, [%4];" : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w) : "r"(a) : "memory"); return v;
-}
 __device__ __forceinline__ void cluster_sync_relaxed() { asm volatile("barrier.cluster.arrive.relaxed.aligned;\nbarrier.cluster.wait.aligned;" ::: "memory"); }
 __device__ __forceinline__ void st_async_f32(uint32_t addr, float a, uint32_t bar) {
     asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];" :: "r"(addr), "r"(__float_as_uint(a)), "r"(bar) : "memory");
@@ -458,7 +175,6 @@ __device__ __forceinline__ void st_async_v2(uint32_t addr, float a, float b, uin
 }
 __device__ __forceinline__ unsigned cluster_rank() { unsigned r; asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(r)); return r; }
 
-
 // slot list of the key-split attention scratch (same layout arithmetic as attention_ks)
 __device__ __forceinline__ const int* attention_ks_slots(const uint8_t* smem) {
     constexpr int MPAD = 16, NRMAX = 80, KP = DQK + 8, VP = DV + 8, PP = NRMAX + 8;
@@ -467,7 +183,7 @@ __device__ __forceinline__ const int* attention_ks_slots(const uint8_t* smem) {
     const float* rmax = reinterpret_cast<const float*>(Ps + MPAD * PP);
     return reinterpret_cast<const int*>(rmax + 2 * NW * MPAD);
 }
-// ---- key-split attention (BLK_KSPLIT): CTA kh of a cluster pair takes key rows [0, 64) (kh 0) or [64, 144) (kh 1) of the window; the row
+// ---- key-split attention: CTA kh of a cluster pair takes key rows [0, 64) (kh 0) or [64, 144) (kh 1) of the window; the row
 // maxima are exchanged first (so P = exp2(s - m) is bitwise swa_mma's), then each half's PV partial for the partner's 64 output dims and its
 // row sums go over DSMEM; CTA kh finalizes dims [64 kh, 64 kh + 64). Only the fp32 order of (half 0 + half 1) differs from swa_mma.
 template <int WINDOW>
@@ -649,14 +365,10 @@ __device__ __forceinline__ void attention_ks(const Params& P, uint8_t* smem, int
     float m0 = -INFINITY, m1 = -INFINITY;
 #pragma unroll
     for (int w = 0; w < NW; ++w) { m0 = fmaxf(m0, rmax[w * MPAD + rA]); m1 = fmaxf(m1, rmax[w * MPAD + rB]); }
-#if BLK_KS_MAXX
     if (warp == 0 && (lane & 3) == 0) { st_async_f32(pxm + rA * 4, m0, pbm); st_async_f32(pxm + rB * 4, m1, pbm); }
     mbar_wait(xm_full, 0);
-#endif
     if (tid == 0) CSTAMP(11);
-#if BLK_KS_MAXX
     m0 = fmaxf(m0, xm[rA]); m1 = fmaxf(m1, xm[rB]);
-#endif
     const bool has_sink = P.mode & MODE_SINK;
     if (has_sink) { m0 = fmaxf(m0, sk0); m1 = fmaxf(m1, sk1); }   // the sink only lowers / keeps exp2 terms: harmless in a local max
     if (!isfinite(m0)) m0 = 0.f;
@@ -714,28 +426,13 @@ __device__ __forceinline__ void attention_ks(const Params& P, uint8_t* smem, int
     st_async_v2(pxo + (rB * 64 + 8 * warp + cA) * 4, osd[2], osd[3], pbo);
     if (warp == 0 && (lane & 3) == 0) {
         st_async_f32(pxl + rA * 4, l0, pbo); st_async_f32(pxl + rB * 4, l1, pbo);
-#if !BLK_KS_MAXX
-        st_async_f32(pxm + rA * 4, m0, pbo); st_async_f32(pxm + rB * 4, m1, pbo);
-#endif
     }
     if (tid == 0) CSTAMP(14);
     mbar_wait(xo_full, 0);
     if (tid == 0) CSTAMP(15);
-#if BLK_KS_MAXX
     // fixed order (half 0 + half 1) for l so both CTAs of the pair use the same row sum
     float lt0 = kh ? xl[rA] + l0 : l0 + xl[rA], lt1 = kh ? xl[rB] + l1 : l1 + xl[rB];
     if (has_sink) { lt0 += fast_ex2(sk0 - m0); lt1 += fast_ex2(sk1 - m1); }
-    const float c0s = 1.f, c1s = 1.f, p0s = 1.f, p1s = 1.f;
-#else
-    // split-softmax combine: m = max(m_mine, m_partner) (both already include the sink); rescale both halves by exp2(m_h - m), in the
-    // fixed order (half 0 + half 1) so both CTAs of the pair use the same row sum
-    const float pm0 = xm[rA], pm1 = xm[rB];
-    const float M0 = fmaxf(m0, pm0), M1 = fmaxf(m1, pm1);
-    const float c0s = fast_ex2(m0 - M0), c1s = fast_ex2(m1 - M1), p0s = fast_ex2(pm0 - M0), p1s = fast_ex2(pm1 - M1);
-    float lt0 = kh ? xl[rA] * p0s + l0 * c0s : l0 * c0s + xl[rA] * p0s;
-    float lt1 = kh ? xl[rB] * p1s + l1 * c1s : l1 * c1s + xl[rB] * p1s;
-    if (has_sink) { lt0 += fast_ex2(sk0 - M0); lt1 += fast_ex2(sk1 - M1); }
-#endif
     const float inv0 = (lt0 > 0.f) ? fast_rcp(lt0) : 0.f;
     const float inv1 = (lt1 > 0.f) ? fast_rcp(lt1) : 0.f;
     const float2 pa0 = *reinterpret_cast<const float2*>(xo + rA * 64 + 8 * warp + cA);
@@ -744,12 +441,12 @@ __device__ __forceinline__ void attention_ks(const Params& P, uint8_t* smem, int
     {
         const int t = rA / HP, h = hg * HP + (rA % HP);
         *reinterpret_cast<unsigned*>(&P.attn_out[(size_t)(b * W + t) * KO + (size_t)h * DV + dim]) =
-            pack_bf16((okp[0] * c0s + pa0.x * p0s) * inv0, (okp[1] * c0s + pa0.y * p0s) * inv0);
+            pack_bf16((okp[0] + pa0.x) * inv0, (okp[1] + pa0.y) * inv0);
     }
     {
         const int t = rB / HP, h = hg * HP + (rB % HP);
         *reinterpret_cast<unsigned*>(&P.attn_out[(size_t)(b * W + t) * KO + (size_t)h * DV + dim]) =
-            pack_bf16((okp[2] * c1s + pa1.x * p1s) * inv1, (okp[3] * c1s + pa1.y * p1s) * inv1);
+            pack_bf16((okp[2] + pa1.x) * inv1, (okp[3] + pa1.y) * inv1);
     }
 }
 
@@ -780,9 +477,9 @@ __global__ void __launch_bounds__(NTHREADS, 1) attn_block_kernel(const __grid_co
         mbar_init(att_in, 1); mbar_init(att_done, 1); mbar_init(xfull, 1); mbar_init(xm_full, 1); mbar_init(xo_full, 1); mbar_init(bgo, 1);
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         mbar_expect(xfull, COLS * M * 4);   // armed before the partner can see the barrier (cluster sync below)
-        if (BLK_KSPLIT && att) {
-            if (BLK_KS_MAXX) mbar_expect(xm_full, 16 * 4);
-            mbar_expect(xo_full, 16 * 64 * 4 + 16 * 4 + (BLK_KS_MAXX ? 0 : 16 * 4));
+        if (att) {
+            mbar_expect(xm_full, 16 * 4);
+            mbar_expect(xo_full, 16 * 64 * 4 + 16 * 4);
         }
     }
     cluster_sync_relaxed();   // barrier inits visible cluster-wide (the partner st.asyncs into my xfull later)
@@ -838,11 +535,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) attn_block_kernel(const __grid_co
     } else {
         // ================= math warps
         if (att) {
-#if BLK_KSPLIT
             attention_ks<WINDOW>(P, smem, (c / CL) / NHG, (c / CL) % NHG, h, att_in, xm_full, xo_full);   // contains griddepcontrol.wait
-#else
-            attention<WINDOW>(P, smem, c / NHG, c % NHG, att_in);   // contains griddepcontrol.wait
-#endif
             if (P.mode & MODE_DBG_ATTONLY) { if (tid == 0) BSTAMP(1); return; }
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");   // generic-proxy attention scratch accesses -> the TMA writes over it
             named_bar_sync(1, NMATH);
@@ -851,7 +544,6 @@ __global__ void __launch_bounds__(NTHREADS, 1) attn_block_kernel(const __grid_co
                 st_release_gpu(&P.flags[c * FLAG_STRIDE], s_epoch[0]);   // one release (cumulative over the CTA's stores via the barrier above), BEFORE
                 BSTAMP(30);                                 // this SM's remaining weight TMAs are triggered
             }
-#if BLK_KSPLIT
             // next SWA layer: same slots -> L2-prefetch (evict_last) its K / V window rows. AFTER the release (a fence waits for outstanding
             // prefetches too) and before att_done (the slot list lives in the attention scratch the late weight TMAs overwrite)
             if (P.nkc && ((c / CL) % NHG) == 0) {
@@ -868,7 +560,6 @@ __global__ void __launch_bounds__(NTHREADS, 1) attn_block_kernel(const __grid_co
                 }
             }
             named_bar_sync(1, NMATH);
-#endif
             if (tid == 0) mbar_arrive(att_done);
         }
         else {
@@ -910,7 +601,6 @@ __global__ void __launch_bounds__(NTHREADS, 1) attn_block_kernel(const __grid_co
         const bool dbg_now = P.mode & MODE_DBG_NOW, dbg_nob = P.mode & MODE_DBG_NOB;
 #pragma unroll
         for (int kt = 0; kt < NKT; ++kt) {
-            constexpr int dummy = 0; (void)dummy;
             const int s = kt % NS;
             const unsigned ph = (kt / NS) & 1;
             if (!dbg_now) mbar_wait(&wfull[s], ph);
@@ -1014,7 +704,7 @@ static_assert(QSPLIT_P * QG_E + (64 - QSPLIT_P) * QG_L == QN, "mega split");
 __device__ __forceinline__ int q_rows(int p) { return MEGA_SPLIT ? (p < QSPLIT_P ? QG_E : QG_L) : QG; }
 __device__ __forceinline__ int q_row0(int p) { return MEGA_SPLIT ? (p < QSPLIT_P ? QG_E * p : QG_E * QSPLIT_P + QG_L * (p - QSPLIT_P)) : QG * p; }
 __device__ __forceinline__ int q_pair(int r) { return MEGA_SPLIT ? (r < QG_E * QSPLIT_P ? r / QG_E : QSPLIT_P + (r - QG_E * QSPLIT_P) / QG_L) : r / QG; }
-constexpr int G_W = 8192, G_X = M * QBK, G_SX = M * 4, G_ST = 12288;   // <= 60 x 128 B weight box (1024-aligned slot) + x tile
+constexpr int G_W = 8192, G_X = M * QBK, G_ST = 12288;   // <= 60 x 128 B weight box (1024-aligned slot) + x tile
 #ifndef MEGA_LL
 #define MEGA_LL 0                              // 1: qkv rows handed to the attention CTAs as LL messages {6 bf16, epoch} (no release fence, no flag
 #endif                                         //    round trip: the consumers' tag polls ARE the data loads); 0: bf16 rows + per-CTA release flags
@@ -1159,9 +849,6 @@ struct MegaParams : Params {
     const int* xwork;                  // that MoE's work counters (work[2] = launches completed)
 };
 
-__device__ __forceinline__ uint64_t desc_sw128_q(uint32_t addr) {   // fp8 K-major SW128 (128-B rows, 8-row atoms: SBO 1024)
-    return (uint64_t)((addr & 0x3FFFF) >> 4) | ((uint64_t)1 << 16) | ((uint64_t)(1024 >> 4) << 32) | ((uint64_t)1 << 62);
-}
 __device__ __forceinline__ uint64_t desc_lo(uint32_t lo, uint32_t hi) { uint64_t d; asm("mov.b64 %0, {%1, %2};" : "=l"(d) : "r"(lo), "r"(hi)); return d; }
 __device__ __forceinline__ void wgmma_m64n32k32_e4m3(float* d, uint64_t da, uint64_t db, int scale_d) {
     asm volatile("{\n .reg .pred p;\n setp.ne.b32 p, %18, 0;\n"
@@ -1170,11 +857,6 @@ __device__ __forceinline__ void wgmma_m64n32k32_e4m3(float* d, uint64_t da, uint
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
                    "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15])
                  : "l"(da), "l"(db), "r"(scale_d));
-}
-__device__ __forceinline__ void tma_load_2d_last(void* dst, const CUtensorMap* map, int c0, int c1, uint64_t* bar) {
-    asm volatile("{ .reg .b64 policy;\n createpolicy.fractional.L2::evict_last.b64 policy, 1.0;\n"
-                 " cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1, {%2, %3}], [%4], policy;\n}"
-                 :: "r"(sa(dst)), "l"(reinterpret_cast<uint64_t>(map)), "r"(c0), "r"(c1), "r"(sa(bar)) : "memory");
 }
 __device__ __forceinline__ void tma_load_2d_pol(void* dst, const CUtensorMap* map, int c0, int c1, uint64_t* bar, uint64_t pol) {
     asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1, {%2, %3}], [%4], %5;"
@@ -2660,7 +2342,6 @@ void attn_block_mega(torch::Tensor x, torch::Tensor x_scale_t, torch::Tensor qwm
     TORCH_CHECK(wmap.device().is_cpu() && wmap.numel() == sizeof(CUtensorMap) && amap.device().is_cpu() && amap.numel() == sizeof(CUtensorMap), "maps");
     TORCH_CHECK(peers.device().is_cpu() && peers.scalar_type() == torch::kInt64 && peers.numel() == TP_NDEV, "peers CPU int64[8]");
     TORCH_CHECK(work.scalar_type() == torch::kInt32 && work.numel() >= 4, "work");
-    TORCH_CHECK(BLK_KSPLIT == 1, "mega needs the key-split attention build");
     MegaParams P{};
     std::memcpy(&P.tm_w, wmap.data_ptr(), sizeof(CUtensorMap));
     std::memcpy(&P.tm_a, amap.data_ptr(), sizeof(CUtensorMap));
