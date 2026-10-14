@@ -343,7 +343,7 @@ class TestMiMoFusedMoE(CustomTestCase):
         f = self.kernel
         fields = (
             "xn_buf xq_buf xs_buf xflags rpart topk ssq union_out h_buf cs_buf "
-            "h_flags rs_ptrs ag_ptrs work part_buf part_flags"
+            "h_flags rs_ptrs ag_ptrs work part_flags"
         ).split()
         state = SimpleNamespace(device="cpu", **{name: object() for name in fields})
         weights = {

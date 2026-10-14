@@ -59,7 +59,7 @@ def ext():
                     raise
         extra = (
             os.environ.get("FMOE_NVCC_FLAGS", "").split()
-        )  # e.g. "-DFMOE_DIAG" or "-DFMOE_KSPLIT=2" (separate build cache per flag set)
+        )  # e.g. "-DFMOE_PHASE_STAMPS" (separate build cache per flag set)
         name = "fused_moe_wgmma" + (
             "_" + "".join(c if c.isalnum() else "_" for c in "".join(extra))
             if extra
@@ -391,13 +391,6 @@ class RankState:
             self.work = torch.zeros(
                 4 + N_FC2_TILES, dtype=torch.int32, device=device
             )  # fc1 front/back queues, completion counter, epoch (self-resetting), per-tile fc2 expert counters
-            ksplit = ext().KSPLIT
-            # fc1 K-split fp32 partials: KSPLIT=2 legacy (50 MB), else the one-wave K-split's 132 x [512 consumer threads][8 floats] (2.1 MB)
-            self.part_buf = torch.zeros(
-                max_union * 2 * 2 * 64 * 128 if ksplit == 2 else 132 * 512 * 8,
-                dtype=torch.float32,
-                device=device,
-            )
             self.part_flags = torch.zeros(
                 max_union * 2, dtype=torch.int32, device=device
             )
@@ -569,7 +562,6 @@ def run_fused(
         state.work,
         reserve,
         parts,
-        state.part_buf,
         state.part_flags,
     )
 
@@ -650,7 +642,6 @@ def run_fused_full(
         state.work,
         reserve,
         parts,
-        state.part_buf,
         state.part_flags,
     )
 
@@ -806,7 +797,6 @@ def run_fused_full_tp(
         state.work,
         reserve,
         parts,
-        state.part_buf,
         state.part_flags,
         state.pro_cpu,
         state.rs_cpu,
