@@ -60,7 +60,7 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
     if dsts and dsts[0].is_cuda:
         from sglang.kernels.ops.speculative import step_prep
 
-        if step_prep.is_recording():  # goal11-post: fused replay prep (step_prep.py)
+        if step_prep.is_recording():  # fused replay prep (step_prep.py)
             step_prep.record("copy", dsts=list(dsts), srcs=list(srcs), fn=_grouped_foreach_copy_)
             return
         from sglang.kernels.ops.memory.small_copy import try_small_copy

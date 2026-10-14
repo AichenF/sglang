@@ -44,7 +44,7 @@ class AuxHiddenStatePacker:
         self._buffer = out
         self._feature_size: Optional[int] = None
         self._idx = 0
-        # goal11-glue: capture_stable() records (slot start, source) instead of copying; finalize() hands the list to
+        # capture_stable() records (slot start, source) instead of copying; finalize() hands the list to
         # flush_aux_pending (one launch for every deferred capture, possibly on a side stream)
         self._defer = bool(defer_stable)
         self._pending: List = []
@@ -132,7 +132,7 @@ def pack_aux_hidden_states(aux_hidden_states: AuxHiddenStates) -> torch.Tensor:
     return torch.cat(aux_hidden_states, dim=-1)
 
 
-# ---- goal11-glue: deferred aux captures, packed in one launch ----
+# ---- deferred aux captures, packed in one launch ----
 _AUX_PACK_MAX = 5
 
 

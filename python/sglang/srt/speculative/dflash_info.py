@@ -110,7 +110,7 @@ class DFlashVerifyInput(SpecInput):
             )
         )
         if not can_run_cuda_graph or _is_npu:
-            # goal11-post: a recorded (deferred) replay-prep op must run before any eager path reads it
+            # a recorded (deferred) replay-prep op must run before any eager path reads it
             from sglang.kernels.ops.speculative import step_prep
 
             if step_prep.pending() or step_prep.is_recording():

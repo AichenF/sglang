@@ -513,7 +513,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         return output_parallel
 
     def _fused_embed_state(self, input_):
-        """goal11-dense: TP8 decode (<= 32 ids) -> one kernel where the owner rank of each row pushes it to every
+        """TP8 decode (<= 32 ids) -> one kernel where the owner rank of each row pushes it to every
         peer over CUDA IPC (dflash_tp_fused.embed) instead of the zero-padded local gather + all-reduce."""
         st = getattr(self, "_fused_embed", None)
         if st is False:
@@ -584,7 +584,7 @@ class VocabParallelEmbedding(torch.nn.Module):
                 )
                 full = getattr(self, "_local_full_weight", None)
                 if full is not None:
-                    # goal12-glue: replicated table -> local gather (no owner push / receive polling)
+                    # replicated table (SGLANG_DFLASH_EMBED_LOCAL_REPLICA): local gather, no owner push / receive polling
                     st.embed(ids, full, out, self._local_vocab_ranges, local=True)
                 else:
                     st.embed(ids, self.weight, out, self._fused_embed_ranges)

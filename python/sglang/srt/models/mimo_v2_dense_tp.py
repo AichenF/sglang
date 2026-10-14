@@ -1,4 +1,4 @@
-"""goal11-dense: fused TP8 decode path for MiMo-V2's dense-MLP decoder layer (layer 0), M <= 32 tokens.
+"""Fused TP8 decode path for MiMo-V2's dense-MLP decoder layer (layer 0), M <= 32 tokens.
 
 Unfused (stage-boundary) path after the attention's o_proj partial: custom all-reduce (2-shot) -> flashinfer
 fused_add_rmsnorm (post_attention_layernorm) -> per-token-group-128 fp8 quant -> gate_up (DeepGEMM) -> SiluAndMul ->
@@ -105,7 +105,7 @@ class MiMoDenseTP:
         # residual + attention + MLP (written in place by the second arnq); a consumer that does not take the norm-next
         # handoff adds zeros to it and still gets the right layer output.
         self.zeros = torch.zeros(MAX_M, H, dtype=torch.bfloat16, device=dev)
-        # goal11-post: skinny preload / depth of the gate_up and down GEMMs (env "gu_preload,gu_depth,dn_preload,dn_depth";
+        # skinny preload / depth of the gate_up and down GEMMs (env "gu_preload,gu_depth,dn_preload,dn_depth";
         # default 6,6,6,6). The preload TMAs land on the SMs of the NVLink-bound arnq that precedes them.
         import os
 
@@ -119,7 +119,7 @@ class MiMoDenseTP:
         self.next_pf_w = layer.mlp.down_proj.weight if os.environ.get("SGLANG_MIMO_DENSE_TP_NEXT_PF", "0") == "1" else None
 
     def _stamp_bufs(self):
-        """goal11-post diagnostics (SGLANG_MIMO_DENSE_TP_STAMPS=1): globaltimer stamps of the two arnq calls (separate
+        """Diagnostics (SGLANG_MIMO_DENSE_TP_STAMPS=1): globaltimer stamps of the two arnq calls (separate
         buffers, captured into the graph); dump_stamps() prints them."""
         import os
 
@@ -372,7 +372,7 @@ def embed_norm_next(model, input_ids: torch.Tensor, forward_batch) -> Optional[t
     ln = layer0.input_layernorm
     full = getattr(emb, "_local_full_weight", None)
     if full is not None:
-        # goal12-glue: replicated table -> local gather + norm + quant (no owner push / receive polling)
+        # replicated table (SGLANG_DFLASH_EMBED_LOCAL_REPLICA): local gather + norm + quant, no owner push / receive polling
         st.embed_nq(input_ids, full, out, emb._local_vocab_ranges, ln.weight, ln.variance_epsilon, xq, xs, local=True)
     else:
         st.embed_nq(input_ids, emb.weight, out, emb._fused_embed_ranges, ln.weight, ln.variance_epsilon, xq, xs)

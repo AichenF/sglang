@@ -1,4 +1,4 @@
-"""goal11-post: the DFlash draft-KV materialization's k-RMSNorm + RoPE (+ v scale) AND the KV-cache write of every draft
+"""The DFlash draft-KV materialization's k-RMSNorm + RoPE (+ v scale) AND the KV-cache write of every draft
 layer in ONE launch (SGLANG_DFLASH_MAT_FUSED_KV_WRITE).
 
 Replaces _fused_norm_rope_kernel_stacked (-> stacked k_out / v_out) + set_kv_buffer_prefix_valid_multi_layer (byte copy of

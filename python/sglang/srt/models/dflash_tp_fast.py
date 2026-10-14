@@ -1,4 +1,4 @@
-"""goal11-dense: fused TP8 decode path for the DFlash draft (hidden 6144, fp8 per-channel draft weights, M <= 32).
+"""Fused TP8 decode path for the DFlash draft (hidden 6144, fp8 per-channel draft weights, M <= 32).
 
 Per draft layer the unfused path launches ~20 kernels: RMSNorm, per-token quant, qkv GEMM, q/k norm, RoPE, value
 scale, KV store, attention, per-token quant, o_proj GEMM, custom all-reduce (2-shot), fused add+RMSNorm, per-token
@@ -61,7 +61,7 @@ class DFlashTPFast:
             from sglang.kernels.ops.gemm.skinny_gemm import skinny_fp8_pt_gemm
 
             self.skinny = skinny_fp8_pt_gemm
-        # goal11-draft: the 5 layers at M = 32 as one persistent kernel (built at the first eager M = 32 forward)
+        # the 5 layers at M = 32 as one persistent kernel (built at the first eager M = 32 forward)
         self.mega = None
         self.mega_state = "off" if not envs.SGLANG_DFLASH_MEGA.get() else "pending"
 
@@ -128,7 +128,7 @@ class DFlashTPFast:
 
     def _attend(self, attn, qkv, positions, forward_batch):
         """DFlashAttention.attend with the q/k RMSNorm + RoPE + value scale + KV-cache store as ONE kernel
-        (kernels/ops/speculative/dflash_qknr_kv.py, from goal10-p2) also when the draft KV lives in an SWA pool;
+        (kernels/ops/speculative/dflash_qknr_kv.py) also when the draft KV lives in an SWA pool;
         falls back to attend() when the layout is not the plain bf16 one."""
         args, why = self._qknr_args(attn, qkv, positions, forward_batch)
         if not getattr(self, "_qknr_logged", False) and self.state.rank == 0:
@@ -227,7 +227,7 @@ class DFlashTPFast:
             )
         return self.mm(xq, linear.weight, xs.view(-1, 1), linear.weight_scale, torch.bfloat16, None)
 
-    # ---------------------------------------------------------------- goal11-draft: draft megakernel
+    # ---------------------------------------------------------------- draft megakernel
     def _mega_layer_args(self, forward_batch, layer_idx: int):
         from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
         from sglang.srt.model_executor.forward_context import get_attn_backend

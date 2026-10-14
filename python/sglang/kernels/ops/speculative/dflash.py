@@ -156,7 +156,7 @@ def _dflash_accept_bonus_publish_kernel(
     block_size,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """goal11-glue: _dflash_accept_bonus_contig_kernel (contiguous rows) + the overlap scheduler's FutureMap relay in
+    """_dflash_accept_bonus_contig_kernel (contiguous rows) + the overlap scheduler's FutureMap relay in
     the same launch: new_seq_lens_buf[future_idx[row]] = new_seq_len (FutureMap.publish) and
     output_tokens_buf[future_idx[row]] = bonus (FutureMap.stash's bonus_tokens write)."""
     row = tl.program_id(0)
@@ -302,7 +302,7 @@ def _prepare_dflash_draft_block_unchecked(
         return
     from sglang.kernels.ops.speculative import step_prep
 
-    if step_prep.is_recording():  # goal11-post: deferred into the draft runner's fused replay prep
+    if step_prep.is_recording():  # deferred into the draft runner's fused replay prep
         step_prep.record(
             "prepare", bonus_tokens=bonus_tokens, prefix_lens=prefix_lens, req_pool_indices=req_pool_indices,
             req_to_token=req_to_token, block_ids_out=block_ids_out, positions_out=positions_out,

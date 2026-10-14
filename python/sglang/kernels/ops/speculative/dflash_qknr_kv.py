@@ -1,4 +1,4 @@
-"""DFlash draft attention prologue in one kernel (goal10-p2).
+"""DFlash draft attention prologue in one kernel.
 
 Replaces, per draft layer, the chain  fused_qknorm (q, k per-head RMSNorm)  ->  rotary (NeoX, full or
 partial rotary_dim)  ->  ``v * v_scale``  ->  store_kvcache(k, v)  with a single launch on the fused

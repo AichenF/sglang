@@ -800,7 +800,7 @@ class DFlashDraftModel(nn.Module):
         return self.hidden_norm(projected)
 
     def _fc_ag_norm(self, target_hidden: torch.Tensor) -> Optional[torch.Tensor]:
-        """goal11-dense: TP8, <= 32 context tokens: the column-parallel fc's local slice, then its all-gather +
+        """TP8, <= 32 context tokens: the column-parallel fc's local slice, then its all-gather +
         hidden_norm in one kernel (dflash_tp_fused.ag_norm) instead of the multimem all-gather + RMSNorm."""
         st = getattr(self, "_fc_ag_state", None)
         if st is False:
@@ -864,7 +864,7 @@ class DFlashDraftModel(nn.Module):
         hidden_states = input_embeds
         residual: Optional[torch.Tensor] = None
 
-        # goal11-dense: fused TP8 decode path (projection -> all-reduce -> add+RMSNorm -> fp8 quant in one kernel)
+        # fused TP8 decode path (projection -> all-reduce -> add+RMSNorm -> fp8 quant in one kernel)
         if not getattr(self, "_tp_fast_checked", False):
             self._tp_fast_checked = True
             from sglang.srt.models.dflash_tp_fast import DFlashTPFast

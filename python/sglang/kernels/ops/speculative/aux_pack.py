@@ -1,4 +1,4 @@
-"""goal11-glue: pack up to 5 deferred DFlash aux captures ([M, H] bf16 row-major sources) into the packed
+"""Pack up to 5 deferred DFlash aux captures ([M, H] bf16 row-major sources) into the packed
 [M, K * H] aux buffer slots in one launch (replaces one copy kernel per capture)."""
 
 from typing import List, Tuple

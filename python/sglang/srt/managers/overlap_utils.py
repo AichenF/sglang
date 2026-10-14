@@ -144,7 +144,7 @@ class RelayPayload:
     # ngram delays the draft extend (ngram update)
     accept_tokens: Optional[torch.Tensor] = None
     accept_lens: Optional[torch.Tensor] = None
-    # goal11-glue: bonus_tokens were already written to output_tokens_buf[indices] by the producing kernel
+    # bonus_tokens were already written to output_tokens_buf[indices] by the producing kernel
     bonus_prestashed: bool = False
 
     @classmethod
@@ -449,7 +449,7 @@ class FutureMap:
             if self.draft_probs_buf is not None and draft_input.draft_probs is not None:
                 draft_input.draft_probs = self.draft_probs_buf[indices]
         elif getattr(draft_input, "defer_bonus_gather", False) and not _DEBUG_ASSERT:
-            # goal11-post: the DFlash worker folds this gather into its fused draft prep (step_prep); it reads
+            # the DFlash worker folds this gather into its fused draft prep (step_prep); it reads
             # draft_input.bonus_gather instead (and gathers itself on any other path)
             draft_input.bonus_tokens = None
             draft_input.bonus_gather = (self.output_tokens_buf, indices)
@@ -587,7 +587,7 @@ class FutureMap:
         if indices.shape[0] == 0:
             return  # DP idle
         if not prewritten:
-            # goal11-glue: prewritten = the worker's accept kernel already scattered new_seq_lens into
+            # prewritten = the worker's accept kernel already scattered new_seq_lens into
             # new_seq_lens_buf[indices] on this stream (dflash compute_dflash_accept_bonus_publish)
             self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
         publish_confidence = self.needs_confidence_relay and confidence is not None

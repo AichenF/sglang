@@ -1912,7 +1912,7 @@ class ModelRunner:
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
             if not can_run_graph:
-                # goal11-post: recorded (deferred) replay-prep ops must run before an eager forward reads them
+                # recorded (deferred) replay-prep ops must run before an eager forward reads them
                 from sglang.kernels.ops.speculative import step_prep
 
                 if step_prep.pending() or step_prep.is_recording():

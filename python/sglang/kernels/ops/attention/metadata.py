@@ -590,7 +590,7 @@ def normal_decode_set_metadata(
     """
     from sglang.kernels.ops.speculative import step_prep
 
-    if step_prep.is_recording():  # goal11-post: fused replay prep (step_prep.py)
+    if step_prep.is_recording():  # fused replay prep (step_prep.py)
         step_prep.record(
             "metadata", cache_seqlens_int32=cache_seqlens_int32, cu_seqlens_k=cu_seqlens_k, page_table=page_table,
             req_to_token=req_to_token, req_pool_indices=req_pool_indices, max_seq_pages=max_seq_pages,

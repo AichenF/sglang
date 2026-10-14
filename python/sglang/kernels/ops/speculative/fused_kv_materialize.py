@@ -484,7 +484,7 @@ class FusedKVMaterializeHelper:
             v_out=tmp_v,
             v_scale=self.v_scale_values,
         )
-        # goal11-dense: one launch for every layer when the caller can (stacked [layers, ctx, ...] K/V)
+        # one launch for every layer when the caller can (stacked [layers, ctx, ...] K/V)
         if write_all_layers_kv is not None and write_all_layers_kv(cache_k, cache_v):
             return
         for layer_idx in range(self.n_layers):

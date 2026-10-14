@@ -203,7 +203,7 @@ def set_kv_buffer_prefix_valid_multi_layer(
     BYTES_PER_TILE: tl.constexpr,
     N_TILES: tl.constexpr,
 ):
-    """goal11-dense: set_kv_buffer_prefix_valid_tiled for ALL draft layers in one launch (grid axis 2 = layer x
+    """set_kv_buffer_prefix_valid_tiled for ALL draft layers in one launch (grid axis 2 = layer x
     tile). src_* = stacked [layers, rows, row] buffers; dst_*_table = per-layer cache base addresses (int64)."""
     bid = tl.program_id(0)
     row = tl.program_id(1)

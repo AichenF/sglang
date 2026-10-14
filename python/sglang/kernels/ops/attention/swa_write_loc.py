@@ -1,4 +1,4 @@
-"""goal11-glue: the FA backend's per-replay SWA write-location refill in one launch:
+"""The FA backend's per-replay SWA write-location refill in one launch:
 dst[i] = mapping[loc[i]] for i < n, dst[i] = 0 for n <= i < len(dst)
 (replaces dst[n:].zero_() + mapping[loc] gather + dst[:n].copy_())."""
 
@@ -21,7 +21,7 @@ def _swa_write_loc_kernel(dst_ptr, loc_ptr, map_ptr, map_len, n, total, BLOCK: t
 def fill_swa_write_loc(dst: torch.Tensor, loc: torch.Tensor, mapping: torch.Tensor) -> None:
     from sglang.kernels.ops.speculative import step_prep
 
-    if step_prep.is_recording():  # goal11-post: fused replay prep (step_prep.py)
+    if step_prep.is_recording():  # fused replay prep (step_prep.py)
         step_prep.record("wloc", dst=dst, loc=loc, mapping=mapping)
         return
     loc = loc.contiguous()
