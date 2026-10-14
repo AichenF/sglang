@@ -3300,7 +3300,11 @@ __device__ __forceinline__ void fc1_producer(const Params& P, uint8_t* smem, uin
                 const int s = EXACT_M ? 0 : it % NSTAGE1;
                 const int ph = EXACT_M ? 0 : (it / NSTAGE1) & 1;
                 mbar_wait(&empty[s], ph ^ 1);
-                if constexpr (PREFILL) named_bar_sync(3, PREFILL_B3);   // see the entry: joint plan (warp 19) visible to the FC2 producer warps
+                if constexpr (PREFILL) {
+                    // the per-lane try_wait spin above can leave the warp diverged, and bar.sync requires a converged warp
+                    __syncwarp();
+                    named_bar_sync(3, PREFILL_B3);   // see the entry: joint plan (warp 19) visible to the FC2 producer warps
+                }
                 if (weight_role && lane == 0) { s_item_q[n & 7] = -1; mbar_arrive(&full[s]); }
                 if (gather_role) cp_async_mbar_arrive_noinc(&full[s]);
                 break;
