@@ -26,7 +26,6 @@ device counter and resets its own work queues, so it is CUDA-graph replay safe.
 
 from __future__ import annotations
 
-import ctypes
 import logging
 import os
 import threading
@@ -179,39 +178,6 @@ class _SharedRankState:
                     peer = lib.cudaIpcOpenMemHandle(type(handle).from_buffer_copy(h))
                     ptrs.append(peer.value)
             self.state.link_pro_ptrs(ptrs, ptr.value)
-        # SGLANG_MIMO_FUSED_MOE_L2_SETASIDE_MB = N raises the L2 persisting set-aside (cudaLimitPersistingL2CacheSize, default
-        # 11.25 MB on H200, max 37.5) so the kernel's L2::evict_last prefetch of the next layer's o_proj weight (25.2 MB) is fully protected
-        # until the o_proj GEMM reads it ~30 us later. Device-wide, set once per process (= per rank).
-        mb = os.environ.get("SGLANG_MIMO_FUSED_MOE_L2_SETASIDE_MB", "")
-        if mb:
-            try:
-                cudart = None
-                for so in ("libcudart.so.12", "libcudart.so"):
-                    try:
-                        cudart = ctypes.CDLL(so)
-                        break
-                    except OSError:
-                        continue
-                if cudart is None:
-                    raise OSError("libcudart not found")
-                cudart.cudaDeviceSetLimit.argtypes = [ctypes.c_int, ctypes.c_size_t]
-                cudart.cudaDeviceGetLimit.argtypes = [
-                    ctypes.POINTER(ctypes.c_size_t),
-                    ctypes.c_int,
-                ]
-                rc = cudart.cudaDeviceSetLimit(
-                    6, ctypes.c_size_t(int(float(mb) * 2**20))
-                )  # cudaLimitPersistingL2CacheSize = 6
-                cur = ctypes.c_size_t(0)
-                cudart.cudaDeviceGetLimit(ctypes.byref(cur), 6)
-                log_info_on_rank0(
-                    logger,
-                    f"MiMo fused MoE: L2 persisting set-aside request {mb} MB -> rc {rc}, now {cur.value / 2**20:.2f} MB",
-                )
-            except Exception as e:  # a cache-policy knob must never kill the server
-                logger.warning(
-                    f"MiMo fused MoE: cudaDeviceSetLimit(PersistingL2CacheSize) failed: {e}"
-                )
         torch.cuda.synchronize(device)
 
 

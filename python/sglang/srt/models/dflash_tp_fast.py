@@ -52,11 +52,10 @@ class DFlashTPFast:
 
         self.mm = fp8_scaled_mm
         self.skinny = None
+        # preload the whole smem ring (6 units) before griddepcontrol.wait: the preceding fused TP kernel is
+        # NVLink-bound and triggers its dependents right after its own wait
         self.preload = int(envs.SGLANG_DFLASH_TP_SKINNY_PRELOAD.get())
-        # the whole smem ring (6 units) before griddepcontrol.wait + the rest of the CTA's K-slice into L2: the
-        # preceding fused TP kernel is NVLink-bound and triggers its dependents right after its own wait
         self.depth = int(envs.SGLANG_DFLASH_TP_SKINNY_DEPTH.get())
-        self.l2pre = int(envs.SGLANG_DFLASH_TP_SKINNY_L2PRE.get())
         if envs.SGLANG_DFLASH_TP_SKINNY.get():
             from sglang.kernels.ops.gemm.skinny_gemm import skinny_fp8_pt_gemm
 
@@ -223,7 +222,7 @@ class DFlashTPFast:
             # skinny GEMM launched with PDL: its first weight tiles stream while the previous (NVLink-bound) kernel
             # runs -- the fused TP kernels trigger their dependents right after their own griddepcontrol.wait
             return self.skinny(
-                xq, xs, linear.weight.t(), linear.weight_scale, preload=self.preload, depth=self.depth, l2pre=self.l2pre
+                xq, xs, linear.weight.t(), linear.weight_scale, preload=self.preload, depth=self.depth
             )
         return self.mm(xq, linear.weight, xs.view(-1, 1), linear.weight_scale, torch.bfloat16, None)
 

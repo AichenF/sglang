@@ -110,13 +110,7 @@ class MiMoDenseTP:
         import os
 
         pd = [int(v) for v in os.environ.get("SGLANG_MIMO_DENSE_TP_PRELOAD", "6,6,6,6").split(",")]
-        # + L2 prefetch of the rest of each CTA's weight slice before the PDL wait ("gu,dn" units, -1 = all; 0 = off)
-        l2 = [int(v) for v in os.environ.get("SGLANG_MIMO_DENSE_TP_L2PRE", "0,0").split(",")]
-        # + extra dynamic smem (bytes) so a GEMM CTA cannot share an SM with an arnq CTA ("gu,dn"; 0 = off)
-        sp = [int(v) for v in os.environ.get("SGLANG_MIMO_DENSE_TP_SMEM_PAD", "0,0").split(",")]
-        self.gu_pd, self.dn_pd = (pd[0], pd[1], l2[0], sp[0]), (pd[2], pd[3], l2[1], sp[1])
-        # the gate_up GEMM L2-prefetches the down_proj weights from its tail (SGLANG_MIMO_DENSE_TP_NEXT_PF, default 0)
-        self.next_pf_w = layer.mlp.down_proj.weight if os.environ.get("SGLANG_MIMO_DENSE_TP_NEXT_PF", "0") == "1" else None
+        self.gu_pd, self.dn_pd = (pd[0], pd[1]), (pd[2], pd[3])
 
     def _stamp_bufs(self):
         """Diagnostics (SGLANG_MIMO_DENSE_TP_STAMPS=1): globaltimer stamps of the two arnq calls (separate
@@ -244,13 +238,10 @@ class MiMoDenseTP:
             return False
         return True
 
-    def _gemm(self, linear, xq: torch.Tensor, xs_t: torch.Tensor, pd=(6, 6, 0, 0), next_w=None) -> torch.Tensor:
+    def _gemm(self, linear, xq: torch.Tensor, xs_t: torch.Tensor, pd=(6, 6)) -> torch.Tensor:
         """Block-scale fp8 GEMM of a pre-quantized [M, K] input with column-major group scales xs_t [K/128, M]."""
         if self.skinny is not None:
-            return self.skinny(
-                xq, xs_t.t(), linear.weight, linear.weight_scale_inv, preload=pd[0], depth=pd[1], l2pre=pd[2],
-                smem_pad=pd[3], next_w=next_w,
-            )
+            return self.skinny(xq, xs_t.t(), linear.weight, linear.weight_scale_inv, preload=pd[0], depth=pd[1])
         return linear.quant_method.apply(linear, (xq, xs_t.t()))
 
     def forward(self, partial: torch.Tensor, residual: torch.Tensor, forward_batch) -> torch.Tensor:
@@ -273,7 +264,7 @@ class MiMoDenseTP:
         st.arnq_g128(partial, residual, ln.weight, ln.variance_epsilon, xq, xs)
         if sb is not None:
             st.stamps = old_st
-        gu = self._gemm(mlp.gate_up_proj, xq, xs, self.gu_pd, next_w=self.next_pf_w)
+        gu = self._gemm(mlp.gate_up_proj, xq, xs, self.gu_pd)
         # (2) SiluAndMul + group quant
         I = self.inter
         aq = torch.empty(M, I, dtype=torch.float8_e4m3fn, device=dev)

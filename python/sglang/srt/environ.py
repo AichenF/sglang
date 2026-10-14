@@ -1256,7 +1256,6 @@ class Envs:
     SGLANG_DFLASH_TP_SKINNY = EnvBool(True)
     SGLANG_DFLASH_TP_SKINNY_PRELOAD = EnvInt(6)
     SGLANG_DFLASH_TP_SKINNY_DEPTH = EnvInt(6)
-    SGLANG_DFLASH_TP_SKINNY_L2PRE = EnvInt(0)
     # the fused context-KV materialization commits every draft layer's K/V in one launch
     SGLANG_DFLASH_KV_WRITE_ALL = EnvBool(True)
     # the DFlash draft-KV materialization of a verify step (fc + all-gather/hidden_norm + K/V projection +
