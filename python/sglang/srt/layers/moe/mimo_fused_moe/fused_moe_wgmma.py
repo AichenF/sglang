@@ -16,8 +16,6 @@ Kernel format (= layer.w13_weight / w13_weight_scale / w13_weight_scale_2 and w2
 
 import ctypes
 import os
-import subprocess
-import sys
 
 import torch
 from torch.utils.cpp_extension import load
@@ -43,20 +41,10 @@ _ext = None
 
 
 def ext():
+    """JIT-build (once per flag set) and return the extension. wgmma_rs_fp8.cuh is committed source; after editing
+    gen_wgmma_header.py, regenerate it with `python gen_wgmma_header.py wgmma_rs_fp8.cuh`."""
     global _ext
     if _ext is None:
-        header = os.path.join(HERE, "wgmma_rs_fp8.cuh")
-        gen = os.path.join(HERE, "gen_wgmma_header.py")
-        if not os.path.exists(header) or os.path.getmtime(gen) > os.path.getmtime(
-            header
-        ):
-            try:  # regenerate the wgmma wrappers (skipped when the package directory is read-only and the header is shipped)
-                subprocess.check_call(
-                    [sys.executable, gen, header], stdout=subprocess.DEVNULL
-                )
-            except (OSError, subprocess.CalledProcessError):
-                if not os.path.exists(header):
-                    raise
         extra = (
             os.environ.get("FMOE_NVCC_FLAGS", "").split()
         )  # e.g. "-DFMOE_PHASE_STAMPS" (separate build cache per flag set)
