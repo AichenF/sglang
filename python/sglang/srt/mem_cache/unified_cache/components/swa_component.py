@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
@@ -25,6 +26,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKV,
     RebuildFullToSWAMapping,
     RecoverSWAWithLockedFull,
+    SWAEvictExcessPathStates,
     SWARebuild,
 )
 from sglang.srt.mem_cache.unified_cache.components.tree_component import (
@@ -76,6 +78,9 @@ class SWAComponent(TreeComponent):
         ) // params.page_size
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
+        from sglang.srt.environ import envs
+
+        self.swa_max_states_per_path = envs.SGLANG_SWA_MAX_STATES_PER_PATH.get()
 
     component_type = ComponentType.SWA
 
@@ -395,6 +400,24 @@ class SWAComponent(TreeComponent):
                 node.id,
                 node.component_data[BASE_COMPONENT_TYPE].value,
             )
+        )
+        if self.swa_max_states_per_path > 0:
+            # Queued after the SWARebuild actions that stamp this insert's windows.
+            cache_actions.append(SWAEvictExcessPathStates(tail_node_id=node.id))
+
+    def _evict_excess_path_states(
+        self,
+        tail: UnifiedTreeNode,
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> None:
+        self._evict_path_states_beyond_cap(
+            tail,
+            self.swa_max_states_per_path,
+            device_frees,
+            host_frees,
+            # A repeat of the tail matches up to one page short of its end.
+            protected_tail_tokens=self.sliding_window_size + self.tree_core.page_size,
         )
 
     def _maybe_split_leaf_for_swa_lock(
@@ -1126,6 +1149,19 @@ class SWAComponent(TreeComponent):
 
     def apply_component_action(self, action: ComponentAction) -> None:
         alloc = self.cache.token_to_kv_pool_allocator
+        if isinstance(action, SWAEvictExcessPathStates):
+            device_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
+            host_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
+            try:
+                self.tree_core.evict_excess_path_states(
+                    action.tail_node_id,
+                    device_frees,
+                    host_frees,
+                    component_type=self.component_type,
+                )
+            finally:
+                self.cache._free_values(device_frees, host_frees)
+            return
         if isinstance(action, FreeComponentDeviceSlot):
             for indices in action.indices:
                 alloc.free_swa(indices)

@@ -374,9 +374,11 @@ class UnifiedTreeCoreInterface(ABC):
         tail_node_id: NodeId,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        component_type: ComponentType | None = None,
     ) -> None:
-        """Evict shallow Mamba device checkpoints beyond the per-path cap on the
-        tail's root path, collecting freed values into the caller's dicts."""
+        """Evict shallow device states of ``component_type`` (Mamba when None)
+        beyond the per-path cap on the tail's root path, collecting freed values
+        into the caller's dicts."""
         ...
 
     # ==== HiCache ====

@@ -608,6 +608,9 @@ class Envs:
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
+    # Keep at most this many live SWA windows per radix path; -1 keeps every
+    # chunk-boundary window.
+    SGLANG_SWA_MAX_STATES_PER_PATH = EnvInt(-1)
     # Also free the final chunk's out-of-window SWA slots when a request is cached
     # as finished; otherwise a finished prefill keeps that whole chunk of SWA live.
     SGLANG_OPT_UNIFIED_CACHE_FREE_FINISHED_OUT_OF_WINDOW_SLOTS = EnvBool(True)
