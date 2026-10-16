@@ -791,7 +791,20 @@ class UnifiedRadixCache(BasePrefixCache):
                 req.extra_key,
                 is_bigram=self.tree_core.is_eagle,
                 cache_salt=req.cache_salt,
-            ).page_aligned(self.page_size)
+            )
+
+            if (
+                envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get()
+                and envs.SGLANG_OPT_UNIFIED_CACHE_FREE_FINISHED_OUT_OF_WINDOW_SLOTS.get()
+            ):
+                # Same frontier as cache_unfinished_req; measured before page
+                # alignment so the insert boundary keeps a live window.
+                for comp in self._components_tuple:
+                    comp.free_out_of_window_slots(
+                        req, len(radix_key) - 1, insert_params
+                    )
+
+            radix_key = radix_key.page_aligned(self.page_size)
             page_aligned_len = len(radix_key)
             values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 
