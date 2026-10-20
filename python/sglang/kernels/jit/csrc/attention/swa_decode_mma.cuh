@@ -61,6 +61,12 @@ __device__ __forceinline__ unsigned pack_bf16(float lo, float hi) {
   return u;
 }
 
+__device__ __forceinline__ float load_sink(const void* sinks, int head, int sink_bf16) {
+  if (sink_bf16)
+    return __bfloat162float(static_cast<const __nv_bfloat16*>(sinks)[head]);
+  return static_cast<const float*>(sinks)[head];
+}
+
 // W  : query rows (verify tokens) per request
 // HP : query heads per program; W*HP must be <= 16 (one m16 tile)
 // NW : warps per CTA
@@ -68,9 +74,9 @@ template <int W, int HP, int WINDOW, int NW>
 __global__ __launch_bounds__(NW * 32) void swa_mma_kernel(
     const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ K,
     const __nv_bfloat16* __restrict__ V, const int* __restrict__ PT,
-    const int* __restrict__ SEQLENS, const float* __restrict__ SINKS,
+    const int* __restrict__ SEQLENS, const void* __restrict__ SINKS,
     __nv_bfloat16* __restrict__ OUT, int q_stride_m, int q_stride_h, int pt_stride,
-    int hq, float sm_scale, int has_sink) {
+    int hq, float sm_scale, int has_sink, int sink_bf16) {
   constexpr int NKEY = WINDOW - 1 + W;           // keys any row of this request can see
   constexpr int NPAD = (NKEY + 15) / 16 * 16;    // 135 -> 144, the PV k-dim must be x16
   constexpr int M = W * HP;
@@ -218,8 +224,8 @@ __global__ __launch_bounds__(NW * 32) void swa_mma_kernel(
   }
   float sk0 = 0.f, sk1 = 0.f;
   if (has_sink) {
-    sk0 = SINKS[hg * HP + (rA % HP)] * LOG2E;
-    sk1 = SINKS[hg * HP + (rB % HP)] * LOG2E;
+    sk0 = load_sink(SINKS, hg * HP + (rA % HP), sink_bf16) * LOG2E;
+    sk1 = load_sink(SINKS, hg * HP + (rB % HP), sink_bf16) * LOG2E;
     m0 = fmaxf(m0, sk0);
     m1 = fmaxf(m1, sk1);
   }
@@ -289,8 +295,8 @@ __global__ __launch_bounds__(NW * 32) void swa_mma_kernel(
 
 template <int W, int HP, int WINDOW, int NW>
 void launch_swa_mma(const void* q, const void* k, const void* v, const int* pt, const int* sl,
-                    const float* sinks, void* out, int bs, int hq, int q_stride_m, int q_stride_h,
-                    int pt_stride, float sm_scale, int has_sink, DLDevice device) {
+                    const void* sinks, void* out, int bs, int hq, int q_stride_m, int q_stride_h,
+                    int pt_stride, float sm_scale, int has_sink, int sink_bf16, DLDevice device) {
   constexpr int NKEY = WINDOW - 1 + W;
   constexpr int NPAD = (NKEY + 15) / 16 * 16;
   constexpr int MPAD = 16;
@@ -306,7 +312,7 @@ void launch_swa_mma(const void* q, const void* k, const void* v, const int* pt, 
   });
   host::LaunchKernel(dim3(bs, hq / HP), dim3(NW * 32), device, kSmem)(
       kern, (const __nv_bfloat16*)q, (const __nv_bfloat16*)k, (const __nv_bfloat16*)v, pt, sl,
-      sinks, (__nv_bfloat16*)out, q_stride_m, q_stride_h, pt_stride, hq, sm_scale, has_sink);
+      sinks, (__nv_bfloat16*)out, q_stride_m, q_stride_h, pt_stride, hq, sm_scale, has_sink, sink_bf16);
 }
 
 }  // namespace swa_mma_detail
@@ -328,7 +334,8 @@ inline void swa_decode_mma(
     int64_t window_tokens,
     int64_t window_size,
     int64_t heads_per_program,
-    int64_t has_sink) {
+    int64_t has_sink,
+    int64_t sink_bf16) {
   using namespace swa_mma_detail;
   const int bs = (int)page_table.shape()[0];
   const int hq = (int)q.shape()[1];
@@ -340,13 +347,13 @@ inline void swa_decode_mma(
   const void* vp = v.data_ptr();
   const int* ptp = (const int*)page_table.data_ptr();
   const int* slp = (const int*)cache_seqlens.data_ptr();
-  const float* skp = has_sink ? (const float*)sinks.data_ptr() : nullptr;
+  const void* skp = has_sink ? sinks.data_ptr() : nullptr;
   void* op = out.data_ptr();
 
 #define SWA_MMA_CASE(w, hp, win)                                                          \
   if (window_tokens == w && heads_per_program == hp && window_size == win) {              \
     launch_swa_mma<w, hp, win, 8>(qp, kp, vp, ptp, slp, skp, op, bs, hq, (int)q_stride_m, \
-                                  (int)q_stride_h, pt_stride, s, (int)has_sink, device);  \
+                                  (int)q_stride_h, pt_stride, s, (int)has_sink, (int)sink_bf16, device); \
     return;                                                                               \
   }
   SWA_MMA_CASE(8, 2, 129) SWA_MMA_CASE(8, 2, 128)

@@ -187,12 +187,14 @@ def swa_decode_attention(
         and q.stride(0) % 8 == 0
         and q.stride(1) % 8 == 0
         and q.data_ptr() % 16 == 0
+        and (sinks is None or sinks.dtype in (torch.bfloat16, torch.float32))
     ):
         _mma_module().swa_decode_mma(
             q, k2, v2, page_table, cache_seqlens,
             sinks if sinks is not None else q, out_view,
             q.stride(0), q.stride(1),
             sm_scale, window_tokens, window_size, hp, 1 if sinks is not None else 0,
+            int(sinks is not None and sinks.dtype == torch.bfloat16),
         )
         return out
 
