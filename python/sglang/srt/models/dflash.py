@@ -86,6 +86,15 @@ def _logical_linear_weight_shape(
     return (logical_numel,)
 
 
+def _is_dflash2_weight(name: str) -> bool:
+    parts = name.removeprefix("model.").split(".")
+    return parts[0] == "candidate_selector" or (
+        len(parts) > 3
+        and parts[0] == "layers"
+        and parts[2] in {"attention_conv", "mlp_conv"}
+    )
+
+
 def _project_candidate_logits(
     hidden: torch.Tensor, lm_head: nn.Module, *, num_org: int, use_quant_head: bool
 ) -> torch.Tensor:
@@ -636,6 +645,7 @@ class DFlashDraftModel(nn.Module):
     supports_fused_context_kv = True
     # Layer prefixes and a quant_config-aware `fc`, for quantized checkpoints.
     supports_quantization = False
+    supports_candidate_selector = False
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
@@ -648,6 +658,15 @@ class DFlashDraftModel(nn.Module):
         draft_config = self.draft_config = parse_dflash_draft_config(
             draft_hf_config=config
         )
+        if draft_config.selector_rank and not self.supports_candidate_selector:
+            raise ValueError(
+                "DFLASH selector config requires DFlash2DraftModel; "
+                f"got {type(self).__name__}. Check the checkpoint architectures."
+            )
+        if self.supports_candidate_selector and not draft_config.selector_rank:
+            raise ValueError(
+                "DFlash selector draft requires dflash_config.selector_rank."
+            )
         self.block_size = draft_config.resolve_block_size(default=16)
         self.candidate_selector: Optional[nn.Module] = None
         self.lilicorr: Optional[nn.Module] = None
@@ -951,6 +970,12 @@ class DFlashDraftModel(nn.Module):
             else:
                 resolved_name = resolve_param_name(name)
                 if resolved_name is None:
+                    if _is_dflash2_weight(name):
+                        raise ValueError(
+                            f"DFlash2 checkpoint parameter {name!r} has no matching "
+                            "draft parameter. Check the checkpoint architectures, "
+                            "selector/convolution config, and tensor format."
+                        )
                     # Ignore unexpected weights (e.g., HF rotary caches).
                     continue
                 param = params_dict[resolved_name]
@@ -1272,13 +1297,11 @@ class CandidateSelector(nn.Module):
 class DFlash2DraftModel(DFlashDraftModel):
     """DFlash backbone + candidate selector. Reuses the DFLASH speculative worker."""
 
+    supports_candidate_selector = True
+
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         draft_config = self.draft_config
-        if not draft_config.selector_rank:
-            raise ValueError(
-                "DFlash selector draft requires dflash_config.selector_rank."
-            )
         self.candidate_selector = CandidateSelector(
             hidden_size=int(config.hidden_size),
             vocab_size=int(config.vocab_size),
