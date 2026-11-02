@@ -180,13 +180,15 @@ def run_mega(
     )
 
 
-def run_qkv(x, x_scale, qwmap, qsw, out, scratch: Scratch, pdl=True, qpre=0, dbg=None, xflags=None, xwork=None):
-    """FA layers: the megakernel's qkv GEMM alone -> out bf16 [32][3392] (x / x_scale = the norm-next (fp8, column-major scales) pair)."""
+def run_qkv(x, x_scale, qwmap, qsw, out, scratch: Scratch, pdl=True, qpre=0, dbg=None, xflags=None, xwork=None, qonly_instance=True):
+    """FA layers: the megakernel's qkv GEMM alone -> out bf16 [32][3392] (x / x_scale = the norm-next (fp8, column-major scales) pair).
+    qonly_instance: the compile-time qkv-only kernel instance (no attention / o_proj code, no qkv-flag release); same rows."""
     ext().attn_block_qkv(
         x, x_scale.t(), qwmap, qsw, out, scratch.qflags, scratch.dummy_work, int(qpre), int(bool(pdl)),
         dbg if dbg is not None else _EMPTY_I64.setdefault(str(x.device), torch.empty(0, dtype=torch.int64, device=x.device)),
         xflags if xflags is not None else _empty_i32(x.device),
         xwork if xwork is not None else _empty_i32(x.device),
+        int(bool(qonly_instance)),
     )
 
 
@@ -626,6 +628,8 @@ class MegaQkv:
         self.qwmap = ext().make_qwmap(w.data)
         self.scratch = _scratch(w.device)
         self.qpre = int(os.environ.get("SGLANG_MIMO_MEGA_QPRE", "16"))
+        # the compile-time qkv-only kernel instance (default on; SGLANG_MIMO_MEGA_QONLY_INSTANCE=0 = the shared instance in qkv-only mode)
+        self.qonly_instance = os.environ.get("SGLANG_MIMO_MEGA_QONLY_INSTANCE", "1") == "1"
         self.ok = True
 
     @staticmethod
@@ -663,5 +667,6 @@ class MegaQkv:
     def run(self, x):
         out = torch.empty(32, 3392, dtype=torch.bfloat16, device=x[0].device)
         xf, xw = x_ready_flags(x[0])
-        run_qkv(x[0], x[1], self.qwmap, self.qsw, out, self.scratch, pdl=True, qpre=self.qpre, xflags=xf, xwork=xw)
+        run_qkv(x[0], x[1], self.qwmap, self.qsw, out, self.scratch, pdl=True, qpre=self.qpre, xflags=xf, xwork=xw,
+                qonly_instance=self.qonly_instance)
         return out

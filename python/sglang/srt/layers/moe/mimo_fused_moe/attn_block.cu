@@ -1678,7 +1678,9 @@ constexpr int LAYER_TOKC = 32, LAYER_PUSH_BAR = 9;
 __device__ __forceinline__ void named_bar_arrive(int id, int n) { asm volatile("bar.arrive %0, %1;" :: "r"(id), "r"(n) : "memory"); }
 // ROLE: 0 = every role (standalone kernel); FUSED layer kernel: 1 = the 8 math warps, 2 = the 3 producer warps (separate inlined copies:
 // the layer kernel's setmaxnreg phases give them different register budgets, which ptxas assigns per disjoint branch)
-template <int WINDOW, bool FUSED, int ROLE = 0>
+// QONLY: the full-attention layers' qkv-only launch as its own instance -- the attention / o_proj code is compiled out and the qkv-ready
+// flags are not released (nothing polls them: the next kernel reads the rows after griddepcontrol.wait), so the CTAs retire earlier
+template <int WINDOW, bool FUSED, int ROLE = 0, bool QONLY = false>
 __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
     constexpr bool R_MATH = ROLE != 2, R_PROD = ROLE != 1;
     uint64_t* wfull = reinterpret_cast<uint64_t*>(smem + MG_OFF_BAR);
@@ -1707,7 +1709,7 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
     const int c = blockIdx.x;
     const int h = (int)cluster_rank(), p = c / CL;
     const int kbase = h * (KO / CL), rbase = p * PCOLS;
-    const bool qonly = P.mode & MODE_QKV_ONLY;   // FA layers: the qkv GEMM alone (rows into qout), no attention / o_proj
+    const bool qonly = QONLY || (P.mode & MODE_QKV_ONLY);   // FA layers: the qkv GEMM alone (rows into qout), no attention / o_proj
     const bool att = c < NATT && !qonly;
     const int gns = att ? MEGA_GNS_ATT : MEGA_GNS_OTH;   // ring stage / lap parity tracked incrementally (no runtime division)
     const int qrow0 = q_row0(p), qg = q_rows(p), qmid = (qg + 1) / 2;
@@ -1846,7 +1848,7 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
             if (!(MEGA_REL_EARLY && att)) {   // MEGA_REL_EARLY: attention CTAs release from math tid 0
                 mbar_wait(ep_bar, 0);
                 mbar_wait(qready, 0);
-                st_release_gpu(&P.qflags[c * FLAG_STRIDE], s_epoch[0]);
+                if (!QONLY) st_release_gpu(&P.qflags[c * FLAG_STRIDE], s_epoch[0]);
                 if (P.dbg) P.dbg[blockIdx.x * NDBG + 9] = gtimer();
             }
             if (MEGA_OPW_LATE || MEGA_OPW_PACE) mbar_arrive(qrel);
@@ -2418,11 +2420,11 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
     }
 }
 
-template <int WINDOW>
+template <int WINDOW, bool QONLY = false>
 __global__ void __launch_bounds__(MG_NTHREADS, 1) attn_block_mega_kernel(const __grid_constant__ MegaParams P) {
     extern __shared__ uint8_t smem_raw[];
     uint8_t* smem = smem_raw + ((1024u - (sa(smem_raw) & 1023u)) & 1023u);
-    mega_body<WINDOW, false>(P, smem);
+    mega_body<WINDOW, false, 0, QONLY>(P, smem);
 }
 
 // ------------------------------------------------------------------------------------------------------------------ host
@@ -2612,7 +2614,7 @@ static void set_xflags(MegaParams& P, const torch::Tensor& xflags, const torch::
 struct MegaCapture { MegaParams P; int window; bool pdl; bool valid; };
 static MegaCapture* g_mega_capture = nullptr;
 #endif
-template <int WINDOW>
+template <int WINDOW, bool QONLY = false>
 static void launch_mega_t(const MegaParams& P, cudaStream_t stream, bool pdl) {
 #ifdef BLK_LAYER_CAPTURE
     if (g_mega_capture) { g_mega_capture->P = P; g_mega_capture->window = WINDOW; g_mega_capture->pdl = pdl; g_mega_capture->valid = true; return; }
@@ -2620,7 +2622,7 @@ static void launch_mega_t(const MegaParams& P, cudaStream_t stream, bool pdl) {
     static bool configured[16] = {false};
     int dev = 0; cudaGetDevice(&dev);
     if (!configured[dev]) {
-        TORCH_CHECK(cudaFuncSetAttribute(attn_block_mega_kernel<WINDOW>, cudaFuncAttributeMaxDynamicSharedMemorySize, MG_SMEM_ALLOC) == cudaSuccess, "smem attribute");
+        TORCH_CHECK(cudaFuncSetAttribute(attn_block_mega_kernel<WINDOW, QONLY>, cudaFuncAttributeMaxDynamicSharedMemorySize, MG_SMEM_ALLOC) == cudaSuccess, "smem attribute");
         configured[dev] = true;
     }
     cudaLaunchConfig_t cfg = {};
@@ -2629,7 +2631,7 @@ static void launch_mega_t(const MegaParams& P, cudaStream_t stream, bool pdl) {
     at[0].id = cudaLaunchAttributeClusterDimension; at[0].val.clusterDim.x = CL; at[0].val.clusterDim.y = 1; at[0].val.clusterDim.z = 1;
     at[1].id = cudaLaunchAttributeProgrammaticStreamSerialization; at[1].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = at; cfg.numAttrs = pdl ? 2 : 1;
-    TORCH_CHECK(cudaLaunchKernelEx(&cfg, attn_block_mega_kernel<WINDOW>, P) == cudaSuccess, "attn_block_mega launch failed");
+    TORCH_CHECK(cudaLaunchKernelEx(&cfg, attn_block_mega_kernel<WINDOW, QONLY>, P) == cudaSuccess, "attn_block_mega launch failed");
 }
 
 // x [32][6144] fp8 (row stride % 16 B == 0) | x_scale_t [48][>= 32] fp32 rows (= the deep_gemm column-major [32, 48] scale's transpose
@@ -2713,8 +2715,10 @@ void attn_block_mega(torch::Tensor x, torch::Tensor x_scale_t, torch::Tensor qwm
 }
 
 // FA layers: the megakernel's qkv GEMM alone (MODE_QKV_ONLY): x [32][6144] fp8 + x_scale_t [48][32] -> qout bf16 [32][3392]
+// qonly_instance: 1 = the compile-time qkv-only kernel instance (no qkv-flag release; same rows), 0 = the shared instance
 void attn_block_qkv(torch::Tensor x, torch::Tensor x_scale_t, torch::Tensor qwmap, torch::Tensor qsw, torch::Tensor qout, torch::Tensor qflags,
-                    torch::Tensor work, int64_t qpre, int64_t pdl, torch::Tensor dbg, torch::Tensor xflags, torch::Tensor xwork) {
+                    torch::Tensor work, int64_t qpre, int64_t pdl, torch::Tensor dbg, torch::Tensor xflags, torch::Tensor xwork,
+                    int64_t qonly_instance) {
     TORCH_CHECK(x.is_cuda() && x.element_size() == 1 && x.dim() == 2 && x.size(0) == M && x.size(1) == QK && x.stride(1) == 1 && x.stride(0) % 16 == 0 &&
                 reinterpret_cast<uint64_t>(x.data_ptr()) % 16 == 0, "x must be fp8 [32][6144]");
     TORCH_CHECK(x_scale_t.scalar_type() == torch::kFloat32 && x_scale_t.dim() == 2 && x_scale_t.size(0) == QKB && x_scale_t.size(1) >= M &&
@@ -2742,7 +2746,8 @@ void attn_block_qkv(torch::Tensor x, torch::Tensor x_scale_t, torch::Tensor qwma
     P.work = work.data_ptr<int>();
     P.dbg = dbg.numel() >= (int64_t)NCTA * NDBG ? reinterpret_cast<unsigned long long*>(dbg.data_ptr()) : nullptr;
     P.mode = MODE_QKV_ONLY;
-    launch_mega_t<129>(P, at::cuda::getCurrentCUDAStream(), pdl != 0);
+    if (qonly_instance) launch_mega_t<129, true>(P, at::cuda::getCurrentCUDAStream(), pdl != 0);
+    else launch_mega_t<129>(P, at::cuda::getCurrentCUDAStream(), pdl != 0);
 }
 
 }  // namespace blk
