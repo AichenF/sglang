@@ -220,8 +220,25 @@ constexpr int PREFILL_B3 = FC1_PUB_OFFLOAD ? 96 : 128;   // FMOE_FC2_PREFILL's p
 #define FMOE_GP_SHIFT 0                  // goal11 sched r2: FC1 tasks moved from round 1 to round 2 (GP regime, capped so round 2 <= round 1): s more 1-task CTAs
 #endif                                   //    (the last s of the deal order = helpers) start FC2 after round 0 while s more 3-task CTAs stream FC1 in the
                                          //    FC2 phase, which is consumer-bound at ~3.6 TB/s -> FC1 / FC2 overlap instead of an FC1 phase then an FC2 phase
+#ifndef FMOE_G13_EARLY_HOIST
+#define FMOE_G13_EARLY_HOIST 1           // goal13: the first task's early tiles (FMOE_EARLY_FIRST_TILE) go out in the kernel body right after the register
+#endif                                   //    split (0: in fc1_producer after its role / plan bookkeeping)
+#ifndef FMOE_G13_ILV2
+#define FMOE_G13_ILV2 1                  // goal13 GP2 plan: the two owners of a tile with the SAME FC1 task count (>= 2) walk the owner slots
+#endif                                   //    interleaved (stride 2: A even, B odd positions from the helper segment end; counts ceil / floor) instead
+                                         //    of contiguous ranges, so neither starts on the latest-ready (round-1) h. Uses the walk's existing
+                                         //    stride (only the plan and fc2_helper_range change). GP2 knob bit 29 inverts the default.
+#ifndef FMOE_G13_QMID
+#define FMOE_G13_QMID 0                  // goal13 GP2 plan option (off): tile 36+g slot order [first owner | helper quarters | late owner] (see
+#endif                                   //    m32_gp2_plan); GP2 knob bit 30 inverts the default
+#ifndef FMOE_G13_RH
+#define FMOE_G13_RH 256                  // goal13 GP2 plan option (off): helper FC2 stage cost in 1/256 of an owner stage (the helpers stream ~7 %
+#endif                                   //    slower per stage: 0.647 vs 0.605-0.610 us); 256 = the original plan (identical output)
+#ifndef FMOE_G13_RQ
+#define FMOE_G13_RQ 256                  // goal13 GP2 plan option (off): the same for owner B of tile 36+g (three quarter merges; 0.647 us per stage)
+#endif
 #ifndef FMOE_GP2_HELPER_LEAD
-#define FMOE_GP2_HELPER_LEAD 4   // GP2 plan: the helper ends this many stage units before owner B (B merges its partial)
+#define FMOE_GP2_HELPER_LEAD 7   // GP2 plan: the helper ends this many stage units before owner B (B merges its partial)
 #endif
 #ifndef FMOE_GP2_BW
 #define FMOE_GP2_BW 4                    // FMOE_GP2 helper h-copy walk: ready words polled per round trip (8 spilled in the 64-register producer warp)
@@ -1493,7 +1510,7 @@ __device__ __forceinline__ void fc2_helper_range(const Params& P, int U, const i
         if constexpr (EXACT_M == 32 && PARTS == 2) {
             if (m32_gp_active(misc)) {
                 if constexpr (FMOE_GP2) {   // uniform 2.75-stream layout (m32_gp2_plan): owners get their slot range, helpers [0, stages)
-                    stride = 1;
+                    stride = ((int)blockIdx.x < 96 && misc[GP2_MISC + 2] == 2) ? 2 : 1;   // FMOE_G13_ILV2 interleaved owner walk
                     if ((int)blockIdx.x >= 96) { part = 1; parts = 2; }
                     begin = misc[GP2_MISC]; end = misc[GP2_MISC + 1];
                     return;
@@ -1803,7 +1820,9 @@ __device__ __forceinline__ void build_m32_joint_plan(int* misc) {
 // The group's FC1 end offsets take three values (1, 2 or 3 tasks): e[k] = m32_gp_offset of a k-task CTA; the 11 members' task counts
 // are packed 2 bits each (member m = 0..10: A of tiles g/12+g/24+g/36+g, B of the same, H of g/12+g/24+g). Few live registers: the
 // plan runs in the 64-register producer warp 19.
-struct M32Gp2Group { int e1, e2, e3, bm, hm; unsigned kbits; };
+struct M32Gp2Group { int e1, e2, e3, bm, hm; unsigned kbits; int rh, rq; };
+// stages a stream of relative cost r (x256) completes in t owner-stage units (FMOE_G13_RH / RQ; r == 256: t)
+__device__ __forceinline__ int m32_gp2_cap(int t, int r) { return t <= 0 ? 0 : (r == 256 ? t : (t << 8) / r); }
 __device__ __forceinline__ int m32_gp2_e(const M32Gp2Group& G, int m) {
     const int k = (G.kbits >> (2 * m)) & 3;
     // owners B (members 4..7) merge the helper partial(s) after their own stages: tile 36+g's B (member 7) three, the others one
@@ -1811,7 +1830,7 @@ __device__ __forceinline__ int m32_gp2_e(const M32Gp2Group& G, int m) {
 }
 // Helper i's stages per pair, the stages it can give to tile 36+g, and its own tile's deficit at makespan T.
 __device__ __forceinline__ void m32_gp2_helper_at(const M32Gp2Group& G, int U, int T, int i, int& n0, int& avail, int& need) {
-    n0 = max(T - m32_gp2_e(G, 8 + i) - G.hm, 0) >> 1;
+    n0 = m32_gp2_cap(T - m32_gp2_e(G, 8 + i) - G.hm, G.rh) >> 1;
     need = max(U - max(T - m32_gp2_e(G, i), 0) - max(T - m32_gp2_e(G, 4 + i), 0), 0);
     avail = min(n0, 2 * n0 - need);
 }
@@ -1824,21 +1843,24 @@ __device__ __forceinline__ bool m32_gp2_feasible(const M32Gp2Group& G, int U, in
         if (avail < 0) return false;   // need > 2 n0
         give += avail;
     }
-    return give >= U - max(T - m32_gp2_e(G, 3), 0) - max(T - m32_gp2_e(G, 7), 0);   // tile 36+g's deficit
+    return give >= U - max(T - m32_gp2_e(G, 3), 0) - m32_gp2_cap(T - m32_gp2_e(G, 7), G.rq);   // tile 36+g's deficit
 }
 // Builds this CTA's FC2 plan into misc[GP2_MISC..+3] (one thread; warp 19 during FC1). Pure function of (U, n_tasks, blockIdx).
 // knob (lab tuning through P.reserve = -1 - knob; production reserve -1 -> 0 = all defaults): bits 0-7 B merge units per partial
-// (FMOE_GP2_B_MERGE_UNITS), 8-15 the third task's length in units (FMOE_GP2_TU3), 16-23 FMOE_GP_EARLY_PCT, 24-30 helper lead + 1
-// (FMOE_GP_MERGE_UNITS).
+// (FMOE_GP2_B_MERGE_UNITS), 8-15 / 16-23 FMOE_G13_RQ / FMOE_G13_RH - 256, 24-28 helper lead + 1 (FMOE_GP2_HELPER_LEAD), 29 / 30 invert
+// FMOE_G13_ILV2 / FMOE_G13_QMID.
 __device__ __forceinline__ void m32_gp2_plan(int U, int n_tasks, int b, int* misc, int knob, int sh) {
     const int g = b >= 96 ? (b - 96) % 12 : (b % 48) % 12;
     M32Gp2Group G;
     {
         constexpr int TU = FMOE_GP_TASK_UNITS;
-        const int ep = (knob >> 16) & 0xff ? (knob >> 16) & 0xff : FMOE_GP_EARLY_PCT;
-        const int tu3 = (knob >> 8) & 0xff ? (knob >> 8) & 0xff : FMOE_GP2_TU3;
+        // (knob bits 8-15 / 16-23 carry the rate overrides of FMOE_G13_RQ / FMOE_G13_RH; TU3 / EARLY_PCT are compile-time)
+        const int ep = FMOE_GP_EARLY_PCT;
+        const int tu3 = FMOE_GP2_TU3;
+        G.rq = (knob >> 8) & 0xff ? 256 + ((knob >> 8) & 0xff) : FMOE_G13_RQ;
+        G.rh = (knob >> 16) & 0xff ? 256 + ((knob >> 16) & 0xff) : FMOE_G13_RH;
         G.bm = knob & 0xff ? (knob & 0xff) - 1 : FMOE_GP2_B_MERGE_UNITS;   // (value + 1 so that 0 units can be requested)
-        G.hm = (knob >> 24) & 0x7f ? ((knob >> 24) & 0x7f) - 1 : FMOE_GP2_HELPER_LEAD;   // helper ends this many units before B
+        G.hm = (knob >> 24) & 0x1f ? ((knob >> 24) & 0x1f) - 1 : FMOE_GP2_HELPER_LEAD;   // helper ends this many units before B (bits 24-28; 29: ILV2 toggle)
         int r1, r2; m32_gp_rounds(n_tasks, sh, r1, r2);   // tasks of rounds 1 / 2 (FMOE_GP_SHIFT)
         G.e1 = (ep * TU * (r1 + r2)) / (100 * 132);   // = m32_gp_offset of a 1 / 2 / 3-task CTA (default knobs)
         G.e2 = TU + (ep * TU * r2) / (100 * 132);
@@ -1855,7 +1877,7 @@ __device__ __forceinline__ void m32_gp2_plan(int U, int n_tasks, int b, int* mis
     }
     const int T = lo;
     // tile 36+g's deficit D, water-filled over the helpers' avail (nq_i = min(avail_i, x), smallest x), excess taken back from capped ones
-    const int D = max(U - max(T - m32_gp2_e(G, 3), 0) - max(T - m32_gp2_e(G, 7), 0), 0);
+    const int D = max(U - max(T - m32_gp2_e(G, 3), 0) - m32_gp2_cap(T - m32_gp2_e(G, 7), G.rq), 0);
     int x = 0;
     {
         int xl = 0, xh = 4096;
@@ -1884,6 +1906,23 @@ __device__ __forceinline__ void m32_gp2_plan(int U, int n_tasks, int b, int* mis
         if (i == me_t) my_base = 2 * n0 - nq;     // tile i's slots taken by its helper
         if (i < me_h) q0 += nq;                   // quarter segments of tile 36+g in helper order
     }
+    // FMOE_G13_QMID: on tile 36+g with owners of DIFFERENT FC1 task counts, the owner that leaves FC1 first takes the earliest slots,
+    // the helpers' quarter segments the middle, the late owner the tail ([first | quarters | late] instead of [quarters | first | late]):
+    // the first owner (in situ the critical B of tiles 36..47) then starts on round-0 h instead of waiting for the round-1 publishes; the
+    // wait moves to the helpers' pair-1 quarter segment (helpers have the plan's lead).
+    int qshift = 0;
+    {
+        const int kA3 = (G.kbits >> 6) & 3, kB3 = (G.kbits >> 14) & 3;
+        const bool ilv3 = (FMOE_G13_ILV2 != 0) != (((knob >> 29) & 1) != 0) && kA3 == kB3 && kA3 >= 2;
+        if ((FMOE_G13_QMID != 0) != (((knob >> 30) & 1) != 0) && kA3 != kB3 && !ilv3) {
+            const int ea3 = m32_gp2_e(G, 3), eb3 = m32_gp2_e(G, 7), s3 = max(U - sumq, 0);
+            const int cA3 = max(T - ea3, 0), cB3 = m32_gp2_cap(T - eb3, G.rq);
+            int na3 = min(max(G.rq == 256 ? (s3 + eb3 - ea3) >> 1 : (s3 * G.rq + ((eb3 - ea3) << 8)) / (256 + G.rq), max(s3 - cB3, 0)), min(cA3, s3));
+            na3 = min(max(na3, 0), s3);
+            qshift = ea3 < eb3 ? na3 : s3 - na3;   // slots of the first-leaving owner of tile 36+g
+        }
+    }
+    if (me_h >= 0) q0 += qshift;
     int begin = 0, end = 0;
     if (b >= 96) {
         end = 2 * my_n0;
@@ -1892,15 +1931,26 @@ __device__ __forceinline__ void m32_gp2_plan(int U, int n_tasks, int b, int* mis
         const int base = me_t < 3 ? my_base : sumq;
         const int ea = m32_gp2_e(G, me_t), eb = m32_gp2_e(G, 4 + me_t);
         const int s = max(U - base, 0);
-        const int cA = max(T - ea, 0), cB = max(T - eb, 0);
-        // the two owners share s and end together: na - nb = eB - eA (clamped to their capacities)
-        int na = min(max((s + eb - ea) >> 1, max(s - cB, 0)), min(cA, s));
+        const int rb = me_t == 3 ? G.rq : 256;   // FMOE_G13_RQ: tile 36+g's B streams slower
+        const int cA = max(T - ea, 0), cB = m32_gp2_cap(T - eb, rb);
+        // the two owners share s and end together: na - nb = eB - eA (clamped to their capacities); rate-aware: ea + na = eb + nb * rb / 256
+        int na = min(max(rb == 256 ? (s + eb - ea) >> 1 : (s * rb + ((eb - ea) << 8)) / (256 + rb), max(s - cB, 0)), min(cA, s));
         na = min(max(na, 0), s);
         const int nb = s - na;
         const bool a_first = ea < eb;                      // the owner that leaves FC1 first takes the earlier-ready slots
         const bool me_first = is_b != a_first;
+        const int kA = (G.kbits >> (2 * me_t)) & 3, kB = (G.kbits >> (2 * (4 + me_t))) & 3;
+        if ((FMOE_G13_ILV2 != 0) != (((knob >> 29) & 1) != 0) && kA == kB && kA >= 2) {   // FMOE_G13_ILV2: stride-2 walk over [base, U)
+            begin = base + (is_b ? 1 : 0);
+            end = U;
+            my_nq = 2;   // stride marker read by fc2_helper_range (owners never use misc[GP2_MISC + 2] otherwise)
+        } else if (me_t == 3 && qshift > 0) {   // FMOE_G13_QMID layout [first | quarters | late]
+            begin = me_first ? 0 : qshift + sumq;
+            end = me_first ? qshift : U;
+        } else {
         begin = base + (me_first ? 0 : (a_first ? na : nb));
         end = begin + (is_b ? nb : na);
+        }
     }
     misc[GP2_MISC + 0] = begin;
     misc[GP2_MISC + 1] = end;
@@ -4261,6 +4311,9 @@ __device__ __forceinline__ void fc1_producer(const Params& P, uint8_t* smem, uin
     static_assert(!EXACT_M || (KSPLIT == 1 && NKT_ITEM % (2 * NSTAGE1) == 0),
                   "exact FC1 chunks span whole stage/parity periods");
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    // goal13: with FMOE_G13_EARLY_HOIST the first task's early tiles were already issued in the kernel body right after the register split
+    constexpr bool ONE_WAVE_ = EXACT_M == 32 && PARTS == 2 && WIDTH_OVERRIDE == 16;
+    constexpr bool EARLY_HOIST = FMOE_G13_EARLY_HOIST != 0 && (ONE_WAVE_ || TOKEN_ONLY) && FMOE_EARLY_FIRST_TILE > 0 && !PRE_SPLIT && EXACT_M != 0;
     const int grid = EXACT_M ? 132 : (int)gridDim.x;
     const int* s_union = reinterpret_cast<const int*>(smem + OFF_TAB + TAB_UNION);
     const unsigned long long* s_mask = reinterpret_cast<const unsigned long long*>(smem + OFF_TAB + TAB_MASK);
@@ -4298,10 +4351,10 @@ __device__ __forceinline__ void fc1_producer(const Params& P, uint8_t* smem, uin
         // The per-thread tensormap acquire fence (~1 us) ran in the prologue's message-wait window when FMOE_FC1_ACQUIRE_EARLY
         // ; here only the cheap descriptor prefetch is repeated so the first TMA finds it cached. (Moving
         // the fence to the kernel start instead delayed stage 1's barrier by the fence: two-wave regressions.)
-        if (weight_role && lane < 2) {
+        if (!EARLY_HOIST && weight_role && lane < 2) {
             if (FMOE_FC1_ACQUIRE_EARLY && !P.pre_routed) tma_prefetch_map(P.tmaps + lane); else tma_acquire_map(P.tmaps + lane);
         }
-        if constexpr (TASK_ONLY && FMOE_EARLY_FIRST_TILE > 0 && !PRE_SPLIT) {
+        if constexpr (TASK_ONLY && FMOE_EARLY_FIRST_TILE > 0 && !PRE_SPLIT && !EARLY_HOIST) {
             // Tiles 0..N-1 of this CTA's first task (resolved in the task-table loop: s_misc[60]) go out right here, before the
             // item / token-list handoff chain below; period 0 of the first item is skipped. Issued after the role split on
             // purpose: every memory instruction issue crawls (0.2-0.8 us each) while the 132-CTA first-tile burst is in flight,
@@ -7193,6 +7246,24 @@ __global__ void __launch_bounds__(NTHREADS, 1) fused_moe_kernel(const __grid_con
         // FC2 retains the original112/32 budget after the full-CTA join.
         setmaxnreg_dec<EXACT_M == 64 ? 64 : RegSplit<NT>::producer>();
         if (tid == PROD_WARP * 32) LSTAMP(P, 18);   // phase build: producer warps past the register split
+        if constexpr (FMOE_G13_EARLY_HOIST != 0 && EXACT_M == 32 && PARTS == 2 && FMOE_EARLY_FIRST_TILE > 0 && !PRE_SPLIT) {
+            // goal13: the first task's early tiles go out right after the register split, before the warp-18/19 plan / publish code that
+            // the weight and gather warps otherwise jump over (lab stamps: split -> fc1_producer entry 1.2-1.3 us of cold far jumps, entry
+            // -> first weight TMA another 0.85 us). misc[60] >= 0 only on the token-task schedules (N8 two-wave / N16 one-wave).
+            if (warp == PROD_WARP || warp == PROD_WARP + 1) {
+                const int lane_ = tid & 31;
+                if (warp == PROD_WARP && lane_ < 2) {
+                    if (FMOE_FC1_ACQUIRE_EARLY && !P.pre_routed) tma_prefetch_map(P.tmaps + lane_); else tma_acquire_map(P.tmaps + lane_);
+                }
+                const int ft = s_misc[60];
+                if (ft >= 0) {
+                    const int u = ft >> 8, c = (ft >> 1) & 0x7f, hf = ft & 1;
+                    if (warp == PROD_WARP) fc1_early_weights(P, smem, full, s_union[u], hf);
+                    else if (wide_m32_fc1) fc1_early_gather<16>(P, smem, full, p_tok, s_mask[u], c * 16);
+                    else fc1_early_gather<8>(P, smem, full, p_tok, s_mask[u], c * 8);
+                }
+            }
+        }
         if constexpr (PREFILL_FC2) {   // idle warp 19 builds the joint FC2 plan during FC1; fc1_producer's barrier 3 publishes it
             if (warp == PROD_WARP + 3 && (tid & 31) == 0) build_m32_joint_plan<EXACT_M, PARTS, true>(s_misc);
         }
