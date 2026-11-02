@@ -6,9 +6,11 @@ all-gather of the logits, no host sync, no rank-0 broadcast), and writes `predic
 layout (accepted rows -> their candidate, first rejected row -> the bonus, later rows -> -1) so the greedy accept
 kernel turns it into accept_len / bonus / commit lengths unchanged. Greedy requests get the vocab-parallel argmax.
 
-``SampleVerifyState`` owns this rank's receive buffer and the peers' mapped addresses (one collective at creation over
-the TP group's CPU group; every rank must create it at the same point), the per-row call counters and the static
-per-request parameter buffers that a captured graph reads (``stage``).
+``SampleVerifyState`` owns this rank's receive buffer and the peers' mapped addresses, the per-row call counters and the
+static per-request parameter buffers that a captured graph reads (``stage``). The kernel reads the receive-buffer
+addresses from a device table, so the buffer can be allocated after graph capture: ``defer_buffer=True`` leaves it to
+``materialize()`` (one collective over the TP group's CPU group; every rank calls it at the same point). Until then
+only all-greedy batches with ``skip_greedy`` may run the kernel (it returns before any exchange).
 """
 
 import functools
@@ -70,9 +72,8 @@ class SampleVerifyState:
         vocab_start: int,
         vocab: int,
         seed: int,
+        defer_buffer: bool = False,
     ):
-        from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
-
         assert len(ranks) == R, f"sample_verify needs TP{R}, got {len(ranks)}"
         self.rank = int(rank)
         self.device = device
@@ -80,20 +81,11 @@ class SampleVerifyState:
         self.vocab_start = int(vocab_start)
         self.vocab = int(vocab)
         self.seed = int(seed) & ((1 << 63) - 1)
-        lib = CudaRTLibrary()
-        self._lib = lib
-        ptr = lib.cudaMalloc(BUF_BYTES)
-        lib.cudaMemset(ptr, 0, BUF_BYTES)
-        self._ptr = ptr
-        handle = lib.cudaIpcGetMemHandle(ptr)
-        handles = _gather_objects(cpu_group, ranks, self.rank, bytes(handle))
-        addrs = []
-        for r, h in enumerate(handles):
-            if r == self.rank:
-                addrs.append(ptr.value)
-            else:
-                addrs.append(lib.cudaIpcOpenMemHandle(type(handle).from_buffer_copy(h)).value)
-        self.peers = torch.tensor(addrs, dtype=torch.int64)  # host tensor
+        self._cpu_group = cpu_group
+        self._ranks = list(ranks)
+        self.ready = False
+        # every rank's receive-buffer address (device table read by the kernel; filled by materialize())
+        self.peer_table = torch.zeros(R, dtype=torch.int64, device=device)
         self.calls = torch.zeros(MAXN, dtype=torch.int32, device=device)
         self.flags = torch.zeros(MAXN, dtype=torch.int64, device=device)
         # static per-request parameters read by the kernel (a captured graph reads these addresses)
@@ -103,6 +95,32 @@ class SampleVerifyState:
         self.out = torch.zeros(MAXN, dtype=torch.int64, device=device)
         self._staged_key = None
         torch.cuda.synchronize(device)
+        if not defer_buffer:
+            self.materialize()
+
+    def materialize(self) -> None:
+        """Allocate this rank's receive buffer, exchange the IPC handles and fill the device address table.
+        Collective over the TP group's CPU group (every rank, same point, outside graph capture)."""
+        if self.ready:
+            return
+        from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
+
+        lib = CudaRTLibrary()
+        self._lib = lib
+        ptr = lib.cudaMalloc(BUF_BYTES)
+        lib.cudaMemset(ptr, 0, BUF_BYTES)
+        self._ptr = ptr
+        handle = lib.cudaIpcGetMemHandle(ptr)
+        handles = _gather_objects(self._cpu_group, self._ranks, self.rank, bytes(handle))
+        addrs = []
+        for r, h in enumerate(handles):
+            if r == self.rank:
+                addrs.append(ptr.value)
+            else:
+                addrs.append(lib.cudaIpcOpenMemHandle(type(handle).from_buffer_copy(h)).value)
+        self.peer_table.copy_(torch.tensor(addrs, dtype=torch.int64))
+        torch.cuda.synchronize(self.device)
+        self.ready = True
 
     # ---- per-request parameters ----
     def stage(self, params: Sequence[Tuple[int, float, float]]) -> None:
@@ -150,6 +168,7 @@ class SampleVerifyState:
         assert cand.dtype == torch.int64 and cand.is_contiguous() and cand.numel() >= n
         if out is None:
             out = self.out
+        assert self.ready or (skip_greedy and all(p[0] == 0 for p in (self._staged_key or ()))), "receive buffer not allocated"
         _module(_pdl()).run(
             logits,
             cand,
@@ -159,7 +178,7 @@ class SampleVerifyState:
             out,
             self.calls,
             self.flags,
-            self.peers,
+            self.peer_table,
             self.vocab_start,
             self.vocab,
             self.rank,
@@ -191,8 +210,11 @@ def unsupported_reason(local_vocab: int, device: Optional[torch.device] = None) 
     return None
 
 
-def create_state(group, *, local_vocab: int, vocab_start: int, vocab: int, seed: int) -> Optional[SampleVerifyState]:
-    """Collective over the TP group (every rank, same point, outside graph capture). None if not TP8."""
+def create_state(
+    group, *, local_vocab: int, vocab_start: int, vocab: int, seed: int, defer_buffer: bool = False
+) -> Optional[SampleVerifyState]:
+    """Collective over the TP group unless defer_buffer (every rank, same point, outside graph capture). None if not
+    TP8."""
     if group.world_size != R or torch.cuda.is_current_stream_capturing():
         return None
     dev = torch.device("cuda", torch.cuda.current_device())
@@ -205,4 +227,5 @@ def create_state(group, *, local_vocab: int, vocab_start: int, vocab: int, seed:
         vocab_start=vocab_start,
         vocab=vocab,
         seed=seed,
+        defer_buffer=defer_buffer,
     )

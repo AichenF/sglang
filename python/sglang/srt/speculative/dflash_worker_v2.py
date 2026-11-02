@@ -1198,6 +1198,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
+            if self._sample_verify is not None:
+                # SGLANG_DFLASH_SAMPLE_FUSED: receive buffers after the KV cache and every captured graph (collective)
+                self._sample_verify.materialize()
             if get_parallel().tp_rank == 0:
                 # goal12-glue: the process-wide input-buffer pool aliases same-sized static inputs of the draft and the
                 # target runners -> any prep of one runner concurrent with the other's graph races on them
@@ -3048,6 +3051,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                     vocab_start=vocab_start,
                     vocab=vocab,
                     seed=int(seed) if seed is not None else 0,
+                    # the 4 MB receive buffer is allocated after the KV cache and graph capture (init_cuda_graphs):
+                    # allocated here, ahead of the KV pools, it moved them and cost greedy steps ~0.02 ms at B4 x 64k
+                    defer_buffer=True,
                 )
                 if self._sample_verify is None:
                     reason = "state unavailable"
@@ -3108,6 +3114,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         is staged all-greedy, so a captured one returns at once and the in-graph argmax serves the batch."""
         sv = self._sample_verify
         if sv is None:
+            return False
+        if not sv.ready:  # receive buffers not allocated yet (before init_cuda_graphs): the kernel may only skip
+            sv.stage_all_greedy(min(bs, 64))
             return False
         if bs * int(self.block_size) > 64:
             return False  # no captured graph of this size runs the kernel

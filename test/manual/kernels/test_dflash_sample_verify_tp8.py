@@ -526,6 +526,29 @@ if "fast" in MODES:
     tps = DFlashTPState(dev, cpu, list(range(ws)), rank)
     gen = torch.Generator(device=dev)
     gen.manual_seed(5150)
+    # deferred receive buffer (the worker's start-up order): skip-only before materialize(), then normal calls
+    st_d = SampleVerifyState(dev, cpu, list(range(ws)), rank, local_vocab=Vs, vocab_start=vs0, vocab=V, seed=1234,
+                             defer_buffer=True)
+    _, _, full, params, cand, coins = make_case(0, gen)
+    shard = full[:, vs0 : vs0 + Vs].contiguous()
+    st_d.stage_all_greedy(4)
+    o_d = torch.full((32,), -7, dtype=torch.int64, device=dev)
+    st_d.run(shard, cand, G, out=o_d, coins=coins, skip_greedy=True)
+    torch.cuda.synchronize()
+    dbad = 0 if bool((o_d == -7).all()) and int(st_d.peer_table.abs().sum()) == 0 else 1
+    st_d.materialize()
+    params = [(1, 1.0, 0.95)] * 4
+    st_d.stage(params)
+    st.stage(params)
+    o_d = st_d.run(shard, cand, G, out=o_d, coins=coins, skip_greedy=True).clone()
+    o_e = st.run(shard, cand, G, out=torch.zeros_like(o_d), coins=coins).clone()
+    torch.cuda.synchronize()
+    dbad += 0 if torch.equal(o_d, o_e) and same_on_all_ranks(o_d) else 1
+    t = torch.tensor([dbad], device=dev)
+    dist.all_reduce(t)
+    log(f"[fast] deferred receive buffer: skip before materialize(), then == an eagerly created state: "
+        f"{'OK' if int(t) == 0 else 'FAIL'}")
+    bad_total += int(t)
     bs, n = 4, 32
     s_logits = torch.zeros(n, Vs, dtype=torch.bfloat16, device=dev)
     s_cand = torch.zeros(n, dtype=torch.int64, device=dev)

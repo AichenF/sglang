@@ -29,6 +29,8 @@
 // Uniforms: Philox4x32-10(seed, (call, request, k)) with the per-row call counter (identical on every rank), or an
 // explicit coin tensor (tests). Transport as in dflash_tp_fused: pushes into the peers' CUDA-IPC receive buffers,
 // every 8-byte half {payload, tag} with tag = (call + 1) | 2^30, two phases alternated by the per-row call counter.
+// The buffer addresses come from a device table, so a captured graph does not fix them (the worker allocates the
+// receive buffers after the KV cache and graph capture; until then it stages every batch greedy).
 #pragma once
 
 #include <sgl_kernel/tensor.h>
@@ -82,7 +84,7 @@ struct SVParams {
   int64_t* out;                 // [n] predict
   int* calls;                   // [MAXN] per-row call counters
   unsigned long long* flags;    // [MAXN] per-row accept flags {tag << 32 | accept} (this GPU)
-  uint8_t* peer[R];
+  const unsigned long long* peers;  // [R] device table: every rank's receive buffer (this rank's own at [rank])
   int rank;
   int n;
   int G;
@@ -284,7 +286,8 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
   float* rh = reinterpret_cast<float*>(cnt + NKEY / 2);          // [R][NB] round-1 histograms by source rank
   float* rh2 = rh + R * NB;                                       // [R][NB] round-2 histograms
   float* H = rh2 + R * NB;                                        // [NB]
-  uint8_t* mybuf = p.peer[p.rank];
+  __shared__ uint8_t* s_peer[R];
+  if (tid < R) s_peer[tid] = reinterpret_cast<uint8_t*>(p.peers[tid]);  // read after the argmax reduce barrier
 
   // ---- 1) row -> smem (sampling), local first argmax over the shard ----
   const uint4* row4 = reinterpret_cast<const uint4*>(p.logits + static_cast<int64_t>(t) * p.ld);
@@ -352,6 +355,7 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
   }
   if (lane == 0) { s_wk[warp] = bk; s_wi[warp] = bi; }
   __syncthreads();
+  uint8_t* const mybuf = s_peer[p.rank];
   {
     int k = s_wk[0], i = s_wi[0];
 #pragma unroll
@@ -429,7 +433,7 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
       else if (v == 1) val = make_uint4(__float_as_uint(m_loc), tag, __float_as_uint(z_loc), tag);
       else if (v == 2) val = make_uint4(xc_info, tag, 0u, tag);
       else val = make_uint4(__float_as_uint(H[2 * (v - HDR_V)]), tag, __float_as_uint(H[2 * (v - HDR_V) + 1]), tag);
-      st_v4(p.peer[d] + R1_OFF + ((static_cast<int64_t>(phase) * MAXN + t) * R + p.rank) * R1_SLOT + v * 16, val);
+      st_v4(s_peer[d] + R1_OFF + ((static_cast<int64_t>(phase) * MAXN + t) * R + p.rank) * R1_SLOT + v * 16, val);
     }
     SV_STAMP(3);
     for (int idx = tid; idx < R * nvec; idx += THREADS) {
@@ -494,7 +498,7 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
     __syncthreads();
     for (int idx = tid; idx < R * HIST_V; idx += THREADS) {
       const int d = idx / HIST_V, v = idx - d * HIST_V;
-      st_v4(p.peer[d] + R2_OFF + ((static_cast<int64_t>(phase) * MAXN + t) * R + p.rank) * R2_SLOT + v * 16,
+      st_v4(s_peer[d] + R2_OFF + ((static_cast<int64_t>(phase) * MAXN + t) * R + p.rank) * R2_SLOT + v * 16,
             make_uint4(__float_as_uint(H[2 * v]), tag, __float_as_uint(H[2 * v + 1]), tag));
     }
     for (int idx = tid; idx < R * HIST_V; idx += THREADS) {
@@ -701,7 +705,7 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
     if (tid < R) {
       const int pick = s_i[5] < 0 ? (Vs - 1) : s_i[5];
       const uint32_t tok = static_cast<uint32_t>(pick + p.vocab_start);
-      st_v4(p.peer[tid] + R3_OFF + (static_cast<int64_t>(phase) * MAXN + t) * R3_SLOT, make_uint4(tok, tag, 0u, tag));
+      st_v4(s_peer[tid] + R3_OFF + (static_cast<int64_t>(phase) * MAXN + t) * R3_SLOT, make_uint4(tok, tag, 0u, tag));
     }
   }
   if (tid == 0) {
@@ -723,7 +727,7 @@ inline int smem_bytes(int Vs) {
 template <bool kUsePDL>
 struct SampleVerify {
   // logits [n, Vs] bf16 shard (row stride free, 16-B aligned rows), cand [n] int64, temp/top_p [>= n/G] fp32,
-  // mode [>= n/G] int32, out [>= n] int64, calls [MAXN] int32, flags [MAXN] int64, peers [8] int64 (host).
+  // mode [>= n/G] int32, out [>= n] int64, calls [MAXN] int32, flags [MAXN] int64, peers [8] int64 (device table).
   static void run(
       tvm::ffi::TensorView logits,
       tvm::ffi::TensorView cand,
@@ -766,8 +770,7 @@ struct SampleVerify {
     prm.out = static_cast<int64_t*>(out.data_ptr());
     prm.calls = static_cast<int*>(calls.data_ptr());
     prm.flags = static_cast<unsigned long long*>(flags.data_ptr());
-    const int64_t* pp = static_cast<const int64_t*>(peers.data_ptr());
-    for (int i = 0; i < R; ++i) prm.peer[i] = reinterpret_cast<uint8_t*>(pp[i]);
+    prm.peers = static_cast<const unsigned long long*>(peers.data_ptr());
     prm.rank = static_cast<int>(rank);
     prm.n = n;
     prm.G = static_cast<int>(group);
