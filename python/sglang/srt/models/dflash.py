@@ -190,8 +190,14 @@ def _get_dflash_layer_attention_params(
     if layer_type == "sliding_attention":
         sliding_window_size = get_dflash_attention_sliding_window_size(config)
         assert sliding_window_size is not None
+        architectures = getattr(config.get_text_config(), "architectures", None) or []
+        default = (
+            AttentionType.ENCODER_ONLY
+            if "DFlash2DraftModel" in architectures
+            else AttentionType.DECODER
+        )
         return sliding_window_size, _get_dflash_attention_type(
-            config, default=AttentionType.DECODER
+            config, default=default
         )
     raise ValueError(
         f"Unsupported DFLASH draft layer type. layer_types[{layer_id}]={layer_type!r}."

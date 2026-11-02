@@ -1,0 +1,983 @@
+{
+  "schema": 1,
+  "generated_utc": "2026-11-02T05:48:55.024068+00:00",
+  "status": "MEASURED_COMPONENT_GAINS_AND_CONDITIONAL_ESTIMATE_ORIGINAL_MODEL_FAIL",
+  "model_gate": "FAIL",
+  "model_relative_l2": 0.0744137168,
+  "model_gate_relative_l2_limit": 0.02,
+  "production_acceptance_claimed": false,
+  "e2e_speedup_claimed": false,
+  "coefficient": {
+    "job_id": 5530895,
+    "scope": "PRIVATE_SHARED_SPLIT4_COEFFICIENT_MICROBENCHMARK_NOT_MODEL_OR_E2E",
+    "gpu_uuid": "18ca9afe-d657-5f25-60e1-848b8bd74666",
+    "protocol": "graph7 alternating rotating four-arm repeats x50;50 distinct output slots/arm; allthree private helpers same49152B workspace; all50 input controls before timing",
+    "resource_geometry": {
+      "all_private_grid": 120,
+      "all_private_threads": 256,
+      "shared_bytes": 49152
+    },
+    "strict_new_native_controls": 50,
+    "raw_graph_samples": 280,
+    "stage_results": [
+      {
+        "stage": 0,
+        "arms": {
+          "native_linear": {
+            "median_us": 8.231679797172546,
+            "min_us": 8.171520233154297,
+            "max_us": 8.321279883384705,
+            "raw_us": [
+              8.23743999004364,
+              8.171520233154297,
+              8.231679797172546,
+              8.22655975818634,
+              8.179200291633606,
+              8.250240087509155,
+              8.321279883384705
+            ]
+          },
+          "old_shared_wmma_split8": {
+            "median_us": 21.50399923324585,
+            "min_us": 21.47200107574463,
+            "max_us": 21.55519962310791,
+            "raw_us": [
+              21.53791904449463,
+              21.47200107574463,
+              21.50399923324585,
+              21.49631977081299,
+              21.524479389190674,
+              21.490559577941895,
+              21.55519962310791
+            ]
+          },
+          "integrated_normal_split4": {
+            "median_us": 47.39071846008301,
+            "min_us": 47.37088203430176,
+            "max_us": 47.4732780456543,
+            "raw_us": [
+              47.37472057342529,
+              47.39071846008301,
+              47.421441078186035,
+              47.4732780456543,
+              47.40352153778076,
+              47.37088203430176,
+              47.37215995788574
+            ]
+          },
+          "shared_staged_normal_split4": {
+            "median_us": 23.276801109313965,
+            "min_us": 23.208959102630615,
+            "max_us": 23.376638889312744,
+            "raw_us": [
+              23.276801109313965,
+              23.315839767456055,
+              23.376638889312744,
+              23.237760066986084,
+              23.278720378875732,
+              23.208959102630615,
+              23.24415922164917
+            ]
+          }
+        },
+        "delta_us": 24.113917350769043,
+        "remaining_fraction": 0.4911679304655385,
+        "time_reduction_fraction": 0.5088320695344615,
+        "speedup": 2.0359635431657366
+      },
+      {
+        "stage": 1,
+        "arms": {
+          "native_linear": {
+            "median_us": 8.250880241394043,
+            "min_us": 8.232319951057434,
+            "max_us": 8.279680013656616,
+            "raw_us": [
+              8.25215995311737,
+              8.250880241394043,
+              8.254079818725586,
+              8.232319951057434,
+              8.279680013656616,
+              8.245760202407837,
+              8.24895977973938
+            ]
+          },
+          "old_shared_wmma_split8": {
+            "median_us": 21.328001022338867,
+            "min_us": 21.315839290618896,
+            "max_us": 21.380479335784912,
+            "raw_us": [
+              21.37471914291382,
+              21.328001022338867,
+              21.380479335784912,
+              21.317119598388672,
+              21.315839290618896,
+              21.327359676361084,
+              21.343998908996582
+            ]
+          },
+          "integrated_normal_split4": {
+            "median_us": 47.41375923156738,
+            "min_us": 47.3689603805542,
+            "max_us": 47.4451208114624,
+            "raw_us": [
+              47.421441078186035,
+              47.418880462646484,
+              47.3689603805542,
+              47.4451208114624,
+              47.38815784454346,
+              47.387518882751465,
+              47.41375923156738
+            ]
+          },
+          "shared_staged_normal_split4": {
+            "median_us": 22.525439262390137,
+            "min_us": 22.452480792999268,
+            "max_us": 22.55039930343628,
+            "raw_us": [
+              22.55039930343628,
+              22.46527910232544,
+              22.549760341644287,
+              22.49664068222046,
+              22.452480792999268,
+              22.5382399559021,
+              22.525439262390137
+            ]
+          }
+        },
+        "delta_us": 24.888319969177246,
+        "remaining_fraction": 0.47508233110934245,
+        "time_reduction_fraction": 0.5249176688906576,
+        "speedup": 2.1048983187081425
+      },
+      {
+        "stage": 2,
+        "arms": {
+          "native_linear": {
+            "median_us": 8.209279775619507,
+            "min_us": 8.190079927444458,
+            "max_us": 8.260480165481567,
+            "raw_us": [
+              8.224639892578125,
+              8.200960159301758,
+              8.243839740753174,
+              8.209279775619507,
+              8.200960159301758,
+              8.260480165481567,
+              8.190079927444458
+            ]
+          },
+          "old_shared_wmma_split8": {
+            "median_us": 21.78175926208496,
+            "min_us": 21.738240718841553,
+            "max_us": 21.833600997924805,
+            "raw_us": [
+              21.809918880462646,
+              21.78175926208496,
+              21.75679922103882,
+              21.833600997924805,
+              21.78623914718628,
+              21.777279376983643,
+              21.738240718841553
+            ]
+          },
+          "integrated_normal_split4": {
+            "median_us": 47.32863903045654,
+            "min_us": 47.306880950927734,
+            "max_us": 47.363200187683105,
+            "raw_us": [
+              47.35616207122803,
+              47.32863903045654,
+              47.31328010559082,
+              47.306880950927734,
+              47.31647968292236,
+              47.34079837799072,
+              47.363200187683105
+            ]
+          },
+          "shared_staged_normal_split4": {
+            "median_us": 24.031999111175537,
+            "min_us": 23.982079029083252,
+            "max_us": 24.062719345092773,
+            "raw_us": [
+              24.031999111175537,
+              23.996798992156982,
+              24.034559726715088,
+              24.021759033203125,
+              24.062719345092773,
+              24.031999111175537,
+              23.982079029083252
+            ]
+          }
+        },
+        "delta_us": 23.296639919281006,
+        "remaining_fraction": 0.5077686492466149,
+        "time_reduction_fraction": 0.4922313507533851,
+        "speedup": 1.9694008314292684
+      },
+      {
+        "stage": 3,
+        "arms": {
+          "native_linear": {
+            "median_us": 8.18943977355957,
+            "min_us": 8.183680176734924,
+            "max_us": 8.33728015422821,
+            "raw_us": [
+              8.240000009536743,
+              8.188160061836243,
+              8.289920091629028,
+              8.18880021572113,
+              8.33728015422821,
+              8.18943977355957,
+              8.183680176734924
+            ]
+          },
+          "old_shared_wmma_split8": {
+            "median_us": 21.25312089920044,
+            "min_us": 21.242239475250244,
+            "max_us": 21.30431890487671,
+            "raw_us": [
+              21.2774395942688,
+              21.27232074737549,
+              21.25312089920044,
+              21.242239475250244,
+              21.25056028366089,
+              21.30431890487671,
+              21.25312089920044
+            ]
+          },
+          "integrated_normal_split4": {
+            "median_us": 47.43552207946777,
+            "min_us": 47.39520072937012,
+            "max_us": 47.47456073760986,
+            "raw_us": [
+              47.399678230285645,
+              47.4560022354126,
+              47.43552207946777,
+              47.40352153778076,
+              47.436161041259766,
+              47.47456073760986,
+              47.39520072937012
+            ]
+          },
+          "shared_staged_normal_split4": {
+            "median_us": 23.262081146240234,
+            "min_us": 23.24863910675049,
+            "max_us": 23.276801109313965,
+            "raw_us": [
+              23.274879455566406,
+              23.276801109313965,
+              23.24928045272827,
+              23.25119972229004,
+              23.24863910675049,
+              23.262081146240234,
+              23.264000415802002
+            ]
+          }
+        },
+        "delta_us": 24.17344093322754,
+        "remaining_fraction": 0.4903936992043587,
+        "time_reduction_fraction": 0.5096063007956413,
+        "speedup": 2.039177912812612
+      },
+      {
+        "stage": 4,
+        "arms": {
+          "native_linear": {
+            "median_us": 8.220160007476807,
+            "min_us": 8.2150399684906,
+            "max_us": 8.309119939804077,
+            "raw_us": [
+              8.217599987983704,
+              8.220160007476807,
+              8.218240141868591,
+              8.29695999622345,
+              8.2150399684906,
+              8.236799836158752,
+              8.309119939804077
+            ]
+          },
+          "old_shared_wmma_split8": {
+            "median_us": 21.91807985305786,
+            "min_us": 21.880319118499756,
+            "max_us": 21.950080394744873,
+            "raw_us": [
+              21.880319118499756,
+              21.950080394744873,
+              21.89824104309082,
+              21.908481121063232,
+              21.935360431671143,
+              21.91807985305786,
+              21.923840045928955
+            ]
+          },
+          "integrated_normal_split4": {
+            "median_us": 47.44128227233887,
+            "min_us": 47.40608215332031,
+            "max_us": 47.48032093048096,
+            "raw_us": [
+              47.443199157714844,
+              47.48032093048096,
+              47.40608215332031,
+              47.406721115112305,
+              47.44128227233887,
+              47.43231773376465,
+              47.44703769683838
+            ]
+          },
+          "shared_staged_normal_split4": {
+            "median_us": 23.7555193901062,
+            "min_us": 23.722240924835205,
+            "max_us": 23.85215997695923,
+            "raw_us": [
+              23.85215997695923,
+              23.766400814056396,
+              23.77664089202881,
+              23.7555193901062,
+              23.722240924835205,
+              23.75488042831421,
+              23.74272108078003
+            ]
+          }
+        },
+        "delta_us": 23.685762882232666,
+        "remaining_fraction": 0.5007351878420264,
+        "time_reduction_fraction": 0.4992648121579736,
+        "speedup": 1.9970635662926155
+      },
+      {
+        "stage": 5,
+        "arms": {
+          "native_linear": {
+            "median_us": 8.09984028339386,
+            "min_us": 8.094080090522766,
+            "max_us": 8.234879970550537,
+            "raw_us": [
+              8.146560192108154,
+              8.095359802246094,
+              8.11456024646759,
+              8.234879970550537,
+              8.09984028339386,
+              8.095999956130981,
+              8.094080090522766
+            ]
+          },
+          "old_shared_wmma_split8": {
+            "median_us": 21.30431890487671,
+            "min_us": 21.283199787139893,
+            "max_us": 21.345279216766357,
+            "raw_us": [
+              21.298561096191406,
+              21.283199787139893,
+              21.30431890487671,
+              21.315839290618896,
+              21.290879249572754,
+              21.317119598388672,
+              21.345279216766357
+            ]
+          },
+          "integrated_normal_split4": {
+            "median_us": 47.35487937927246,
+            "min_us": 47.32480049133301,
+            "max_us": 47.38815784454346,
+            "raw_us": [
+              47.38815784454346,
+              47.350401878356934,
+              47.33952045440674,
+              47.35487937927246,
+              47.32480049133301,
+              47.37215995788574,
+              47.360639572143555
+            ]
+          },
+          "shared_staged_normal_split4": {
+            "median_us": 23.09823989868164,
+            "min_us": 23.050239086151123,
+            "max_us": 23.153278827667236,
+            "raw_us": [
+              23.067519664764404,
+              23.121919631958008,
+              23.138558864593506,
+              23.050239086151123,
+              23.079040050506592,
+              23.09823989868164,
+              23.153278827667236
+            ]
+          }
+        },
+        "delta_us": 24.25663948059082,
+        "remaining_fraction": 0.4877689522484961,
+        "time_reduction_fraction": 0.512231047751504,
+        "speedup": 2.0501509892957386
+      },
+      {
+        "stage": 6,
+        "arms": {
+          "native_linear": {
+            "median_us": 8.181120157241821,
+            "min_us": 8.147199749946594,
+            "max_us": 8.199679851531982,
+            "raw_us": [
+              8.199679851531982,
+              8.181120157241821,
+              8.158720135688782,
+              8.184959888458252,
+              8.147199749946594,
+              8.158079981803894,
+              8.199040293693542
+            ]
+          },
+          "old_shared_wmma_split8": {
+            "median_us": 22.069120407104492,
+            "min_us": 22.04416036605835,
+            "max_us": 22.083840370178223,
+            "raw_us": [
+              22.083840370178223,
+              22.072958946228027,
+              22.081279754638672,
+              22.06144094467163,
+              22.069120407104492,
+              22.04416036605835,
+              22.05888032913208
+            ]
+          },
+          "integrated_normal_split4": {
+            "median_us": 47.4073600769043,
+            "min_us": 47.38624095916748,
+            "max_us": 47.43807792663574,
+            "raw_us": [
+              47.42591857910156,
+              47.38624095916748,
+              47.39327907562256,
+              47.38687992095947,
+              47.42080211639404,
+              47.4073600769043,
+              47.43807792663574
+            ]
+          },
+          "shared_staged_normal_split4": {
+            "median_us": 24.133760929107666,
+            "min_us": 24.119040966033936,
+            "max_us": 24.19071912765503,
+            "raw_us": [
+              24.126079082489014,
+              24.169600009918213,
+              24.19071912765503,
+              24.133760929107666,
+              24.130558967590332,
+              24.172799587249756,
+              24.119040966033936
+            ]
+          }
+        },
+        "delta_us": 23.27359914779663,
+        "remaining_fraction": 0.5090720278445761,
+        "time_reduction_fraction": 0.49092797215542394,
+        "speedup": 1.964358568735402
+      },
+      {
+        "stage": 7,
+        "arms": {
+          "native_linear": {
+            "median_us": 8.156800270080566,
+            "min_us": 8.139520287513733,
+            "max_us": 8.232960104942322,
+            "raw_us": [
+              8.232960104942322,
+              8.139520287513733,
+              8.157439827919006,
+              8.152959942817688,
+              8.156800270080566,
+              8.183680176734924,
+              8.151040077209473
+            ]
+          },
+          "old_shared_wmma_split8": {
+            "median_us": 21.047039031982422,
+            "min_us": 21.008639335632324,
+            "max_us": 21.074559688568115,
+            "raw_us": [
+              21.040000915527344,
+              21.06879949569702,
+              21.03679895401001,
+              21.074559688568115,
+              21.008639335632324,
+              21.047039031982422,
+              21.062400341033936
+            ]
+          },
+          "integrated_normal_split4": {
+            "median_us": 47.42015838623047,
+            "min_us": 47.37919807434082,
+            "max_us": 47.443199157714844,
+            "raw_us": [
+              47.42015838623047,
+              47.37919807434082,
+              47.443199157714844,
+              47.42015838623047,
+              47.39391803741455,
+              47.43680000305176,
+              47.39776134490967
+            ]
+          },
+          "shared_staged_normal_split4": {
+            "median_us": 22.61120080947876,
+            "min_us": 22.581119537353516,
+            "max_us": 22.652161121368408,
+            "raw_us": [
+              22.610559463500977,
+              22.652161121368408,
+              22.581119537353516,
+              22.61120080947876,
+              22.626559734344482,
+              22.6092791557312,
+              22.61631965637207
+            ]
+          }
+        },
+        "delta_us": 24.80895757675171,
+        "remaining_fraction": 0.4768267669060431,
+        "time_reduction_fraction": 0.5231732330939569,
+        "speedup": 2.0971977024038297
+      },
+      {
+        "stage": 8,
+        "arms": {
+          "native_linear": {
+            "median_us": 8.205440044403076,
+            "min_us": 8.183680176734924,
+            "max_us": 8.246399760246277,
+            "raw_us": [
+              8.23360025882721,
+              8.24512004852295,
+              8.205440044403076,
+              8.202880024909973,
+              8.246399760246277,
+              8.183680176734924,
+              8.202880024909973
+            ]
+          },
+          "old_shared_wmma_split8": {
+            "median_us": 21.575040817260742,
+            "min_us": 21.54815912246704,
+            "max_us": 21.591041088104248,
+            "raw_us": [
+              21.591041088104248,
+              21.576321125030518,
+              21.578240394592285,
+              21.56224012374878,
+              21.575040817260742,
+              21.55263900756836,
+              21.54815912246704
+            ]
+          },
+          "integrated_normal_split4": {
+            "median_us": 47.429118156433105,
+            "min_us": 47.41055965423584,
+            "max_us": 47.438721656799316,
+            "raw_us": [
+              47.42847919464111,
+              47.431678771972656,
+              47.436161041259766,
+              47.429118156433105,
+              47.438721656799316,
+              47.41055965423584,
+              47.42847919464111
+            ]
+          },
+          "shared_staged_normal_split4": {
+            "median_us": 23.683838844299316,
+            "min_us": 23.596160411834717,
+            "max_us": 23.768320083618164,
+            "raw_us": [
+              23.700480461120605,
+              23.637120723724365,
+              23.768320083618164,
+              23.727359771728516,
+              23.596160411834717,
+              23.66015911102295,
+              23.683838844299316
+            ]
+          }
+        },
+        "delta_us": 23.74527931213379,
+        "remaining_fraction": 0.4993522916910259,
+        "time_reduction_fraction": 0.5006477083089741,
+        "speedup": 2.002594193797652
+      },
+      {
+        "stage": 9,
+        "arms": {
+          "native_linear": {
+            "median_us": 8.25215995311737,
+            "min_us": 8.218240141868591,
+            "max_us": 8.390399813652039,
+            "raw_us": [
+              8.273919820785522,
+              8.390399813652039,
+              8.22272002696991,
+              8.251519799232483,
+              8.25215995311737,
+              8.218240141868591,
+              8.259199857711792
+            ]
+          },
+          "old_shared_wmma_split8": {
+            "median_us": 21.850240230560303,
+            "min_us": 21.83232069015503,
+            "max_us": 21.897599697113037,
+            "raw_us": [
+              21.87648057937622,
+              21.850240230560303,
+              21.836159229278564,
+              21.897599697113037,
+              21.83232069015503,
+              21.857280731201172,
+              21.847679615020752
+            ]
+          },
+          "integrated_normal_split4": {
+            "median_us": 47.45344161987305,
+            "min_us": 47.42976188659668,
+            "max_us": 47.596797943115234,
+            "raw_us": [
+              47.45344161987305,
+              47.42976188659668,
+              47.44192123413086,
+              47.43423938751221,
+              47.475199699401855,
+              47.596797943115234,
+              47.472639083862305
+            ]
+          },
+          "shared_staged_normal_split4": {
+            "median_us": 23.390719890594482,
+            "min_us": 23.36575984954834,
+            "max_us": 23.447039127349854,
+            "raw_us": [
+              23.447039127349854,
+              23.40480089187622,
+              23.379840850830078,
+              23.378560543060303,
+              23.36575984954834,
+              23.39967966079712,
+              23.390719890594482
+            ]
+          }
+        },
+        "delta_us": 24.062721729278564,
+        "remaining_fraction": 0.49291935615474247,
+        "time_reduction_fraction": 0.5070806438452575,
+        "speedup": 2.0287294209766626
+      }
+    ],
+    "isolated_sum_of_stage_medians_us": {
+      "native_linear": 81.99680030345917,
+      "old_shared_wmma_split8": 215.63071966171265,
+      "integrated_normal_split4": 474.07487869262695,
+      "shared_staged_normal_split4": 233.76960039138794
+    },
+    "sum_comparison": {
+      "delta_us": 240.305278301239,
+      "remaining_ratio": 0.493106913903691,
+      "time_reduction_fraction": 0.506893086096309,
+      "speedup": 2.027957775086704
+    },
+    "notes": [
+      "Sum of independently timed stage medians is not a measured decoder duration.",
+      "Old shared8 is faster than new shared4 but is not an exact-native replacement: differing output bytes retained in original report."
+    ]
+  },
+  "decoder_scenario": {
+    "baseline_job": 5524014,
+    "baseline_model_valid": false,
+    "measured_graph_us": {
+      "generic": 587.7967834472656,
+      "mega": 1973.1071472167969
+    },
+    "formula": "T_scenario=T_measured_failed_Mega - sum(old_direct4_isolated_stage_medians) + sum(new_shared4_isolated_stage_medians)",
+    "estimated_graph_us": 1732.8018689155579,
+    "conditional_delta_us": 240.305278301239,
+    "conditional_time_reduction_fraction": 0.12179028322927425,
+    "conditional_speedup": 1.1386801818557766,
+    "estimated_still_slower_than_generic_factor": 2.947960788000836,
+    "assumptions": [
+      "Same actual weights/input shapes and selected implementation; no new numerical or dispatch failure.",
+      "All10 isolated projection median costs are additive, serial, and lie on the full decoder critical path.",
+      "No overlap with input producers, TP/NVLink, attention or other layers; no communication or scheduling change.",
+      "Isolated120CTA/256thread/49152Bshared resource behavior transfers to the full persistent512thread kernel without occupancy, contention, synchronization or cache changes.",
+      "Other decoder costs stay unchanged. These are unverified scenario assumptions, not a fitted model or a confidence interval.",
+      "The additive result is an optimistic conditional scenario, not a rigorous upper bound on all possible performance effects."
+    ],
+    "confidence_interval": false,
+    "measured_integrated_speedup": false
+  },
+  "amdahl": [
+    {
+      "assumed_current_fraction": 0.05,
+      "component_remaining_ratio": 0.493106913903691,
+      "total_remaining_fraction": 0.9746553456951845,
+      "time_reduction_fraction": 0.025344654304815452,
+      "speedup": 1.0260037093283862
+    },
+    {
+      "assumed_current_fraction": 0.1,
+      "component_remaining_ratio": 0.493106913903691,
+      "total_remaining_fraction": 0.9493106913903692,
+      "time_reduction_fraction": 0.050689308609630904,
+      "speedup": 1.0533959103898753
+    },
+    {
+      "assumed_current_fraction": 0.2,
+      "component_remaining_ratio": 0.493106913903691,
+      "total_remaining_fraction": 0.8986213827807382,
+      "time_reduction_fraction": 0.10137861721926181,
+      "speedup": 1.112815718790878
+    },
+    {
+      "assumed_current_fraction": 0.3,
+      "component_remaining_ratio": 0.493106913903691,
+      "total_remaining_fraction": 0.8479320741711073,
+      "time_reduction_fraction": 0.1520679258288927,
+      "speedup": 1.1793397495637208
+    },
+    {
+      "assumed_current_fraction": 0.5,
+      "component_remaining_ratio": 0.493106913903691,
+      "total_remaining_fraction": 0.7465534569518455,
+      "time_reduction_fraction": 0.2534465430481545,
+      "speedup": 1.339488807784735
+    }
+  ],
+  "sampling": {
+    "job_id": 5520349,
+    "scope": "SOURCE5_PRODUCTION_SAMPLING_12_CASE_COMPONENT_TIMING_NOT_WORKER_OR_E2E",
+    "protocol": "Graph median of7 repeats x50 invocations; B1/2/4,block8,V152576,T1,p.95; original native defaults restored for timing;42 raw eager/graph rows percase.",
+    "cases": [
+      {
+        "batch": 1,
+        "mode": "k50",
+        "graph_us": {
+          "original_native": 108.02111625671387,
+          "source4_dispatch": 97.52575874328613,
+          "source5_dispatch": 97.75551795959473
+        },
+        "native_to_source5_delta_us": 10.26559829711914,
+        "native_to_source5_speedup": 1.1050129804576578,
+        "source4_to_source5_delta_us": -0.22975921630859375,
+        "serial_component_calls_to_accumulate_300us": 30
+      },
+      {
+        "batch": 1,
+        "mode": "k128",
+        "graph_us": {
+          "original_native": 119.50976371765137,
+          "source4_dispatch": 106.34559631347656,
+          "source5_dispatch": 105.7817554473877
+        },
+        "native_to_source5_delta_us": 13.728008270263672,
+        "native_to_source5_speedup": 1.1297767106643595,
+        "source4_to_source5_delta_us": 0.5638408660888672,
+        "serial_component_calls_to_accumulate_300us": 22
+      },
+      {
+        "batch": 1,
+        "mode": "full_vocab",
+        "graph_us": {
+          "original_native": 172.34560012817383,
+          "source4_dispatch": 163.97760391235352,
+          "source5_dispatch": 163.8003158569336
+        },
+        "native_to_source5_delta_us": 8.545284271240234,
+        "native_to_source5_speedup": 1.0521689120471773,
+        "source4_to_source5_delta_us": 0.17728805541992188,
+        "serial_component_calls_to_accumulate_300us": 36
+      },
+      {
+        "batch": 1,
+        "mode": "no_topk",
+        "graph_us": {
+          "original_native": 153.09887886047363,
+          "source4_dispatch": 151.9711971282959,
+          "source5_dispatch": 146.07680320739746
+        },
+        "native_to_source5_delta_us": 7.022075653076172,
+        "native_to_source5_speedup": 1.0480711208001063,
+        "source4_to_source5_delta_us": 5.8943939208984375,
+        "serial_component_calls_to_accumulate_300us": 43
+      },
+      {
+        "batch": 2,
+        "mode": "k50",
+        "graph_us": {
+          "original_native": 128.87104034423828,
+          "source4_dispatch": 114.53568458557129,
+          "source5_dispatch": 114.98368263244629
+        },
+        "native_to_source5_delta_us": 13.887357711791992,
+        "native_to_source5_speedup": 1.1207767693106852,
+        "source4_to_source5_delta_us": -0.447998046875,
+        "serial_component_calls_to_accumulate_300us": 22
+      },
+      {
+        "batch": 2,
+        "mode": "k128",
+        "graph_us": {
+          "original_native": 137.18655586242676,
+          "source4_dispatch": 121.34271621704102,
+          "source5_dispatch": 121.06240272521973
+        },
+        "native_to_source5_delta_us": 16.12415313720703,
+        "native_to_source5_speedup": 1.1331887751625471,
+        "source4_to_source5_delta_us": 0.28031349182128906,
+        "serial_component_calls_to_accumulate_300us": 19
+      },
+      {
+        "batch": 2,
+        "mode": "full_vocab",
+        "graph_us": {
+          "original_native": 198.18239212036133,
+          "source4_dispatch": 189.30559158325195,
+          "source5_dispatch": 190.39936065673828
+        },
+        "native_to_source5_delta_us": 7.783031463623047,
+        "native_to_source5_speedup": 1.040877403352497,
+        "source4_to_source5_delta_us": -1.0937690734863281,
+        "serial_component_calls_to_accumulate_300us": 39
+      },
+      {
+        "batch": 2,
+        "mode": "no_topk",
+        "graph_us": {
+          "original_native": 178.4819221496582,
+          "source4_dispatch": 175.18207550048828,
+          "source5_dispatch": 170.9702491760254
+        },
+        "native_to_source5_delta_us": 7.5116729736328125,
+        "native_to_source5_speedup": 1.0439355560972425,
+        "source4_to_source5_delta_us": 4.211826324462891,
+        "serial_component_calls_to_accumulate_300us": 40
+      },
+      {
+        "batch": 4,
+        "mode": "k50",
+        "graph_us": {
+          "original_native": 168.00064086914062,
+          "source4_dispatch": 154.70208168029785,
+          "source5_dispatch": 154.63359832763672
+        },
+        "native_to_source5_delta_us": 13.367042541503906,
+        "native_to_source5_speedup": 1.0864433259399544,
+        "source4_to_source5_delta_us": 0.06848335266113281,
+        "serial_component_calls_to_accumulate_300us": 23
+      },
+      {
+        "batch": 4,
+        "mode": "k128",
+        "graph_us": {
+          "original_native": 174.6726417541504,
+          "source4_dispatch": 160.1875114440918,
+          "source5_dispatch": 160.33920288085938
+        },
+        "native_to_source5_delta_us": 14.333438873291016,
+        "native_to_source5_speedup": 1.089394475061358,
+        "source4_to_source5_delta_us": -0.15169143676757812,
+        "serial_component_calls_to_accumulate_300us": 21
+      },
+      {
+        "batch": 4,
+        "mode": "full_vocab",
+        "graph_us": {
+          "original_native": 248.98496627807617,
+          "source4_dispatch": 231.94175720214844,
+          "source5_dispatch": 233.26271057128906
+        },
+        "native_to_source5_delta_us": 15.72225570678711,
+        "native_to_source5_speedup": 1.0674014962283571,
+        "source4_to_source5_delta_us": -1.320953369140625,
+        "serial_component_calls_to_accumulate_300us": 20
+      },
+      {
+        "batch": 4,
+        "mode": "no_topk",
+        "graph_us": {
+          "original_native": 224.32767868041992,
+          "source4_dispatch": 216.52671813964844,
+          "source5_dispatch": 213.81311416625977
+        },
+        "native_to_source5_delta_us": 10.514564514160156,
+        "native_to_source5_speedup": 1.0491764247256794,
+        "source4_to_source5_delta_us": 2.713603973388672,
+        "serial_component_calls_to_accumulate_300us": 29
+      }
+    ],
+    "delta_range_us": [
+      7.022075653076172,
+      16.12415313720703
+    ],
+    "rounded_7_to_16us_scenario": {
+      "component_calls": [
+        19,
+        43
+      ],
+      "assumption": "Exactly one matching component invocation per serial step, same gain each time, no overlap/extra overhead. Counts are component calls/steps, not generated tokens.",
+      "warning": "Accumulated0.3ms across19\u201343steps does not reproduce a0.3ms single-step or full-E2E claim."
+    }
+  },
+  "evidence_sha256": [
+    {
+      "sha256": "a4062c2d38ce259ca8c3863917ee6a6537f380d9a5a7e22f5ff5e11dcad505c4"
+    },
+    {
+      "sha256": "98fd8b7c52228cbcad6d2feb92c182d8b64e642ca607569216796d3a84a87313"
+    },
+    {
+      "sha256": "ee3407fa44fd9540cee847a081304f9bfa5661be59370f49a71a6a51485ffdb8"
+    },
+    {
+      "sha256": "10fbde5c8b36c3fe56d60dff87ea56e6fcf7e1c50abc7f26d90fb0136cfc7d5b"
+    },
+    {
+      "sha256": "30b4b8edb482f250eb1f49e7c4a84f35fab96321333dbc36bc0cab48bbc19e3e"
+    },
+    {
+      "sha256": "0fcdfc5bd8ce6b7613a84d8e11c7724cae099095b3fde7b87211c4bb2a0b20fa"
+    },
+    {
+      "sha256": "bbf56816d7c2dd9786d452b6ace27395960c93f93fe70db6603120b634a091d4"
+    },
+    {
+      "sha256": "f29e530aaf6fad6dad55b548cb241392ea018b08f53968b6b36e02406e784f9a"
+    },
+    {
+      "sha256": "558793b5a12bc986e1911a464db63b192757dc2a51d2412e3841659802bb7aa0"
+    },
+    {
+      "sha256": "673109eb3ee366a2691676c0b4bc2ca3bde1f65eda8790d347979988b2df68a2"
+    },
+    {
+      "sha256": "5bf9bff064fb167644411d2dffce0c4bd6c2871928a0b5898ef082c249238433"
+    },
+    {
+      "sha256": "0353158bd4de414ceb2c14e387e1a7b3333b607d61b92d8175590252823476c8"
+    },
+    {
+      "sha256": "32f09390160326c0fe87e7c1d097130da4b533a8f75f07779d8f50763924c111"
+    },
+    {
+      "sha256": "14c49584d2d3cef339680d8b1e628dc70561ff2fabe31199a14d3e0e7d6d9251"
+    },
+    {
+      "sha256": "642bca6b7928785fc593b50c8bc79f61e8333511168f36cc24f129379280dce3"
+    },
+    {
+      "sha256": "5abbe0c9f8080bec521a14e613e4cd0d61868dfc615e7a8f19ceb693e628a9e3"
+    },
+    {
+      "sha256": "e1b43f2b7dedb5b7294618ee6c057281a86027d43163d829cf8fd18c0af57d9d"
+    },
+    {
+      "sha256": "f2e2072fee4d17a692d04bbfcec9f259a283b8270de6650da826a09c499c7903"
+    }
+  ]
+}

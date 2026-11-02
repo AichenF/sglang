@@ -19,6 +19,7 @@ from sglang.kernels.ops.speculative.dflash import (
 )
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     accept_sampling,
+    accept_sampling_triton,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
@@ -2180,9 +2181,24 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             self._draft_probs_buf = buffer
         draft_probs = buffer[:bs]
+        accept_impl = accept_sampling
+        if (
+            os.environ.get("SGLANG_DFLASH_SELECTOR_FUSED_BONUS", "0") == "1"
+            and candidates.is_cuda and candidates.dtype == torch.int64
+            and bs in (1, 2, 4) and block == 8 and vocab == 152576
+            and next_token_logits.device == candidates.device
+            and next_token_logits.dtype == torch.float32
+            and next_token_logits.shape == (bs * block, vocab)
+            and candidate_ids.device == candidates.device
+            and candidate_ids.dtype == torch.int64
+            and candidate_ids.shape == (bs, gamma, 16)
+            and q_rows.device == candidates.device and q_rows.dtype == torch.float32
+            and q_rows.shape == candidate_ids.shape
+        ):
+            accept_impl = accept_sampling_triton
         try:
             draft_probs.scatter_(-1, candidate_ids, q_rows.float())
-            accept_len, bonus, _ = accept_sampling(
+            accept_len, bonus, _ = accept_impl(
                 candidates=candidates,
                 target_logits=next_token_logits,
                 draft_probs=draft_probs,
