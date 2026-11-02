@@ -3,9 +3,10 @@
     torchrun --nproc-per-node 8 test/manual/kernels/test_dflash_sample_verify_tp8.py
 
 Environment:
-    SV_MODE    comma-separated sections (default "eager,stat,graph"; also "time", "stamps", "san")
+    SV_MODE    comma-separated sections (default "eager,stat,graph,fast"; also "time", "stamps", "san")
     SV_TRIALS  trials of the eager section (default 150)
     SV_STAT_N  kernel calls of the statistics section (default 20000)
+    SV_FAST_N  graph replays of the fast-path section (default 150)
 
 Sections:
     eager   identical uniforms: the kernel against the reference DFlash path (full fp32 logits ->
@@ -18,7 +19,12 @@ Sections:
             (chi-square), the reference sampling kernel with torch.rand uniforms for comparison.
     graph   CUDA graph replays with changing logits / candidates / uniforms / parameters: bitwise equal to eager
             calls, accept decisions equal to the reference, ranks agree; Philox graph replay == eager call.
-    time    graph-replayed kernel time against the in-graph greedy argmax and the eager reference path.
+    fast    the worker's capture layout: the in-graph greedy argmax on the main stream and the kernel with
+            skip_greedy on a forked stream. All-greedy batches: argmax == torch.argmax bitwise, the kernel leaves
+            its output and call counters untouched; mixed / sampled batches: kernel output bitwise == eager call,
+            accept decisions == reference, greedy rows == torch.argmax; ranks agree.
+    time    graph-replayed kernel time against the in-graph greedy argmax and the eager reference path; the
+            fast-path layout (argmax + forked kernel) against the argmax alone (greedy) and the kernel alone (sampled).
     stamps  per-phase %globaltimer stamps of the kernel.
     san     a few Philox calls only (for compute-sanitizer runs).
 """
@@ -50,7 +56,7 @@ from sglang.srt.speculative.dflash_utils import (  # noqa: E402
     compute_dflash_sampling_correct_drafts_and_bonus,
 )
 
-MODES = set(os.environ.get("SV_MODE", "eager,stat,graph").split(","))
+MODES = set(os.environ.get("SV_MODE", "eager,stat,graph,fast").split(","))
 Vs = 19072  # a 152576-entry vocabulary over 8 ranks
 V = Vs * ws
 G = 8
@@ -414,7 +420,16 @@ if "san" in MODES:
         o = st.run(full[:, vs0 : vs0 + Vs].contiguous(), cand, G).clone()
         torch.cuda.synchronize()
         sbad += 0 if same_on_all_ranks(o) else 1
-    log(f"[san] RESULT {'OK' if sbad == 0 else 'FAIL'} (Philox calls, ranks agree)")
+        # skip_greedy: the same batch (runs unless all-greedy) and its all-greedy version (returns at once)
+        o2 = torch.full_like(o, -7)
+        st.run(full[:, vs0 : vs0 + Vs].contiguous(), cand, G, out=o2, skip_greedy=True)
+        st.stage_all_greedy(len(params))
+        calls0 = st.calls.clone()
+        o3 = torch.full_like(o, -7)
+        st.run(full[:, vs0 : vs0 + Vs].contiguous(), cand, G, out=o3, skip_greedy=True)
+        torch.cuda.synchronize()
+        sbad += 0 if same_on_all_ranks(o2) and bool((o3 == -7).all()) and torch.equal(calls0, st.calls) else 1
+    log(f"[san] RESULT {'OK' if sbad == 0 else 'FAIL'} (Philox calls, ranks agree; skip_greedy early return)")
     bad_total += sbad
 
 # ---------------- CUDA graph replays ----------------
@@ -490,6 +505,89 @@ if "graph" in MODES:
         f"ranks agree) {int(t[0])} bad; Philox graph replay vs eager {int(t[1])} bad of 40 (sums over ranks)")
     bad_total += int(t.sum())
 
+# ---------------- fast path: the worker's capture layout (argmax on the main stream, kernel on a fork) ----------------
+def fork_layout(tps, shard, cand, head_out, out, coins=None):
+    """argmax on the current stream; the sampling verify with skip_greedy on a forked stream; join"""
+    main = torch.cuda.current_stream()
+    ev = torch.cuda.Event()
+    ev.record(main)
+    tps.argmax(shard, head_out, vs0)
+    fork_stream.wait_event(ev)
+    with torch.cuda.stream(fork_stream):
+        st.run(shard, cand, G, out=out, coins=coins, skip_greedy=True)
+    main.wait_stream(fork_stream)
+
+
+fork_stream = torch.cuda.Stream()
+
+if "fast" in MODES:
+    from sglang.kernels.ops.communication.dflash_tp_fused import DFlashTPState
+
+    tps = DFlashTPState(dev, cpu, list(range(ws)), rank)
+    gen = torch.Generator(device=dev)
+    gen.manual_seed(5150)
+    bs, n = 4, 32
+    s_logits = torch.zeros(n, Vs, dtype=torch.bfloat16, device=dev)
+    s_cand = torch.zeros(n, dtype=torch.int64, device=dev)
+    s_coins = torch.zeros(n + bs, dtype=torch.float32, device=dev)
+    s_out = torch.zeros(n, dtype=torch.int64, device=dev)
+    s_head = torch.zeros(32, dtype=torch.int64, device=dev)
+    st.stage_all_greedy(bs)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        fork_layout(tps, s_logits, s_cand, s_head, s_out, s_coins)
+        torch.cuda.synchronize()
+        gr = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(gr, stream=s):
+            fork_layout(tps, s_logits, s_cand, s_head, s_out, s_coins)
+    torch.cuda.synchronize()
+    cnt = dict(greedy=0, mixed=0, sampled=0)
+    fbad = 0
+    n_fast = int(os.environ.get("SV_FAST_N", "150"))
+    for it in range(n_fast):
+        _, _, full, params, cand, coins = make_case(8 * it, gen)  # batch-4 cases
+        kind = it % 3  # 0 all greedy, 1 mixed, 2 as drawn (mostly all sampled)
+        if kind == 0:
+            params = [(0, 1.0, 1.0)] * bs
+        elif kind == 1:
+            params = [(0, 1.0, 1.0) if b % 2 == 0 else (p if p[0] else (1, 1.0, 0.95)) for b, p in enumerate(params)]
+        s_logits.copy_(full[:, vs0 : vs0 + Vs])
+        s_cand.copy_(cand)
+        s_coins.copy_(coins)
+        s_out.fill_(-7)
+        s_head.fill_(-7)
+        st.stage(params)
+        saved = st.calls.clone()
+        gr.replay()
+        torch.cuda.synchronize()
+        g_out, g_head = s_out.clone(), s_head[:n].clone()
+        am = torch.argmax(full.float(), dim=-1)
+        ok = torch.equal(g_head, am) and same_on_all_ranks(g_out)
+        if all(p[0] == 0 for p in params):
+            cnt["greedy"] += 1
+            ok &= bool((g_out == -7).all()) and torch.equal(saved, st.calls)
+        else:
+            cnt["mixed" if any(p[0] == 0 for p in params) else "sampled"] += 1
+            st.calls.copy_(saved)
+            e_out = st.run(s_logits, s_cand, G, out=torch.zeros_like(s_out), coins=s_coins).clone()
+            torch.cuda.synchronize()
+            ok &= torch.equal(g_out, e_out)
+            _, racc, _ = reference(full, cand, params, coins, bs)
+            kacc, _ = decode_predict(g_out, cand, bs)
+            for b in range(bs):
+                if params[b][0] == 0:
+                    ok &= torch.equal(g_out[b * G : (b + 1) * G], am[b * G : (b + 1) * G])
+                else:
+                    ok &= int(kacc[b]) == int(racc[b])
+        fbad += 0 if ok else 1
+    t = torch.tensor([fbad], device=dev)
+    dist.all_reduce(t)
+    log(f"[fast] RESULT {'OK' if int(t) == 0 else 'FAIL'}: {n_fast} replays of the fork layout ({cnt['greedy']} all-greedy, "
+        f"{cnt['mixed']} mixed, {cnt['sampled']} sampled batches): argmax == torch.argmax, all-greedy -> kernel output / "
+        f"counters untouched, otherwise kernel == eager and accept == reference; {int(t)} bad (sum over ranks)")
+    bad_total += int(t)
+
 
 def graph_time(fn, calls=20, replays=10):
     s = torch.cuda.Stream()
@@ -533,6 +631,11 @@ if "time" in MODES:
         if n <= 32:
             o = torch.zeros(32, dtype=torch.int64, device=dev)
             res["in-graph argmax"] = graph_time(lambda: tps.argmax(shard, o, vs0))
+            so = torch.zeros(n, dtype=torch.int64, device=dev)
+            st.stage([(0, 1.0, 1.0)] * bs)
+            res["fork layout greedy"] = graph_time(lambda: fork_layout(tps, shard, cand, o, so))
+            st.stage([(1, 1.0, 0.95)] * bs)
+            res["fork layout sampled p0.95"] = graph_time(lambda: fork_layout(tps, shard, cand, o, so))
         si = sampling_info_for([(1, 1.0, 0.95)] * bs)
 
         def ref_once():  # the eager path: all-gather + fp32 + probabilities + sampling kernel + two broadcasts

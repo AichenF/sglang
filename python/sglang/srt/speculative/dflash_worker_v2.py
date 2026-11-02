@@ -682,9 +682,10 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # Fast paths (see _init_vocab_parallel_fast_paths).
         self._target_greedy_head: Optional[VocabParallelGreedyHead] = None
-        # SGLANG_DFLASH_SAMPLE_FUSED: vocab-parallel sampling verify state, the verify-graph token counts captured
-        # with it, and whether the current step's batch was staged for it
+        # SGLANG_DFLASH_SAMPLE_FUSED: vocab-parallel sampling verify state, its forked capture stream, the
+        # verify-graph token counts captured with it, and whether the current step's batch was staged for it
         self._sample_verify = None
+        self._sv_stream = None
         self._sv_graph_tokens = set()
         self._sv_step = False
         self._sv_logged = 0
@@ -2984,7 +2985,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             logger.info("DFLASH draft block embedding folded into the draft graph.")
 
     def _target_greedy_head_capture_hook(self, runner, out, forward_batch, num_tokens):
-        """Capture tail hook on the target runner: in-graph shard argmax (or the vocab-parallel sampling verify)."""
+        """Capture tail hook on the target runner: in-graph shard argmax, plus the vocab-parallel sampling verify on a
+        forked stream next to it (it returns at once for all-greedy batches, which take the argmax)."""
         del runner, num_tokens
         head = self._target_greedy_head
         if (
@@ -3001,11 +3003,20 @@ class DFlashWorkerV2(BaseSpecWorker):
             or int(logits.shape[0]) > head.max_tokens
         ):
             return
-        if self._sv_run(logits, getattr(forward_batch, "input_ids", None)) is not None:
-            if torch.cuda.is_current_stream_capturing():
-                self._sv_graph_tokens.add(int(logits.shape[0]))
+        ids = getattr(forward_batch, "input_ids", None)
+        if not self._sv_supported(logits, ids):
+            head(logits)
             return
+        main = torch.cuda.current_stream()
+        fork = torch.cuda.Event()
+        fork.record(main)
         head(logits)
+        self._sv_stream.wait_event(fork)
+        with torch.cuda.stream(self._sv_stream):
+            self._sv_run(logits, ids, skip_greedy=True)
+        main.wait_stream(self._sv_stream)
+        if torch.cuda.is_current_stream_capturing():
+            self._sv_graph_tokens.add(int(logits.shape[0]))
 
     # ------------------------------------------------------------------
     # SGLANG_DFLASH_SAMPLE_FUSED: vocab-parallel sampling verify
@@ -3040,6 +3051,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
                 if self._sample_verify is None:
                     reason = "state unavailable"
+                else:
+                    self._sv_stream = torch.cuda.Stream(device=self.device)
             except Exception as e:  # pragma: no cover - defensive
                 reason = f"init failed ({e})"
                 self._sample_verify = None
@@ -3091,17 +3104,17 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def _sv_stage(self, batch, bs: int) -> bool:
         """Stage this step's per-request parameters before the verify forward (the captured kernel reads them).
-        True when the step's verify result comes from the fused kernel."""
+        True when the step's verify result comes from the fused kernel, i.e. a request samples. Otherwise the kernel
+        is staged all-greedy, so a captured one returns at once and the in-graph argmax serves the batch."""
         sv = self._sample_verify
         if sv is None:
             return False
         if bs * int(self.block_size) > 64:
             return False  # no captured graph of this size runs the kernel
-        if len(batch.reqs) != bs:
-            sv.stage_all_greedy(bs)  # a captured graph of this size runs the kernel: make it the argmax
-            return False
-        params = self._sv_params(batch)
-        if params is None:
+        params = None
+        if len(batch.reqs) == bs and not _is_all_greedy(batch.sampling_info):
+            params = self._sv_params(batch)
+        if params is None or not any(p[0] for p in params):
             sv.stage_all_greedy(bs)
             return False
         sv.stage(params)
@@ -3110,16 +3123,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             logger.info("DFLASH vocab-parallel sampling verify: first sampled step (bs=%d, params=%s).", bs, params)
         return True
 
-    def _sv_run(self, logits: torch.Tensor, ids) -> Optional[torch.Tensor]:
-        sv = self._sample_verify
-        if sv is None or ids is None:
-            return None
+    def _sv_supported(self, logits: torch.Tensor, ids) -> bool:
+        if self._sample_verify is None or ids is None:
+            return False
         n = int(logits.shape[0])
-        block = int(self.block_size)
-        if (
+        return not (
             n == 0
             or n > 64
-            or n % block != 0
+            or n % int(self.block_size) != 0
             or logits.dtype != torch.bfloat16
             or logits.stride(1) != 1
             or logits.stride(0) % 8 != 0
@@ -3127,9 +3138,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             or ids.dtype != torch.int64
             or not ids.is_contiguous()
             or ids.numel() < n
-        ):
+        )
+
+    def _sv_run(self, logits: torch.Tensor, ids, skip_greedy: bool = False) -> Optional[torch.Tensor]:
+        if not self._sv_supported(logits, ids):
             return None
-        return sv.run(logits, ids.reshape(-1)[:n], block)
+        n = int(logits.shape[0])
+        return self._sample_verify.run(logits, ids.reshape(-1)[:n], int(self.block_size), skip_greedy=skip_greedy)
 
     @staticmethod
     def _sampling_allows_greedy_fast_path(sampling_info) -> bool:
@@ -3180,9 +3195,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         ``in_graph_head``: the decode graph (with the tail hook) produced head.out
         for this batch; otherwise the shard argmax runs eagerly here.
 
-        SGLANG_DFLASH_SAMPLE_FUSED: when the step was staged for the vocab-parallel sampling verify, target_predict
-        is that kernel's output (greedy-verify layout: accepted candidates, then the sampled bonus), for sampled and
-        greedy requests alike; graphs captured with it (<= 64 rows) also serve the plain greedy fast path."""
+        SGLANG_DFLASH_SAMPLE_FUSED: when the step was staged for the vocab-parallel sampling verify (a request
+        samples), target_predict is that kernel's output (greedy-verify layout: accepted candidates, then the sampled
+        bonus), for the batch's sampled and greedy requests alike."""
         head = self._target_greedy_head
         if head is None or logits_output is None:
             return None
@@ -3199,9 +3214,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         if not is_shard:
             return None
-        sv_graph = bool(in_graph_head) and n in self._sv_graph_tokens
         if self._sv_step:
-            if sv_graph:
+            if in_graph_head and n in self._sv_graph_tokens:
                 predict = self._sample_verify.out[:n]  # produced in-graph by the tail hook
             else:
                 ids = candidates.reshape(-1) if candidates is not None else None
@@ -3226,11 +3240,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             logits_output.next_token_logits = full
             if not fast:
                 return None
-        if sv_graph:
-            # this graph runs the sampling verify instead of the argmax; a batch it was not staged for ran it with
-            # every request greedy (_sv_stage), i.e. it produced the argmax
-            predict = self._sample_verify.out[:n]
-        elif in_graph_head:
+        if in_graph_head:
             predict = head.out[:n]  # produced in-graph by the tail hook
         else:
             predict = head(logits)

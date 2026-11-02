@@ -138,9 +138,12 @@ class SampleVerifyState:
         coins: Optional[torch.Tensor] = None,
         dbg: Optional[torch.Tensor] = None,
         stamps: Optional[torch.Tensor] = None,
+        skip_greedy: bool = False,
     ) -> torch.Tensor:
         """logits: this rank's [n, Vs] bf16 shard; cand: [n] int64 verify input ids (block-major). Returns predict
-        [n] int64 (written into ``out`` or the state's static buffer). coins (tests): fp32 [n/G * G + n/G]."""
+        [n] int64 (written into ``out`` or the state's static buffer). coins (tests): fp32 [n/G * G + n/G].
+        skip_greedy: when every staged request is greedy the kernel returns at once and leaves ``out`` and the call
+        counters untouched (the caller takes the greedy argmax from elsewhere)."""
         n = int(logits.shape[0])
         assert logits.ndim == 2 and int(logits.shape[1]) == self.local_vocab and logits.dtype == torch.bfloat16
         assert 1 <= n <= MAXN and n % group == 0 and 2 <= group <= MAXG
@@ -165,6 +168,7 @@ class SampleVerifyState:
             0 if coins is None else coins.data_ptr(),
             0 if dbg is None else dbg.data_ptr(),
             0 if stamps is None else stamps.data_ptr(),
+            int(bool(skip_greedy)),
         )
         return out[:n]
 

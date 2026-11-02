@@ -23,6 +23,8 @@
 // Output: predict [n] int64 in the greedy-verify layout (predict[b, j] = candidate j+1 for accepted rows, the bonus
 // at the first rejected row, -1 after it), consumed by the unchanged greedy accept kernel. Greedy requests (mode 0)
 // get the vocab-parallel argmax (torch.argmax order: NaN max, -0 == +0, lowest index on ties) after round 1 only.
+// skip_greedy: when no request of the batch samples, every CTA returns at once (no output, no counter update); the
+// worker captures the kernel next to the in-graph greedy argmax, which then serves the batch.
 //
 // Uniforms: Philox4x32-10(seed, (call, request, k)) with the per-row call counter (identical on every rank), or an
 // explicit coin tensor (tests). Transport as in dflash_tp_fused: pushes into the peers' CUDA-IPC receive buffers,
@@ -88,6 +90,7 @@ struct SVParams {
   const float* coins;           // optional [n/G, G] + [n/G] final (tests); nullptr -> Philox
   float* dbg;                   // optional [n, DBG]
   unsigned long long* stamps;   // optional [MAXN, 16] %globaltimer per phase (diagnostics)
+  int skip_greedy;              // 1: return at once when every request is greedy (mode 0)
 };
 
 __device__ __forceinline__ unsigned long long gtime() {
@@ -255,6 +258,14 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
   if (t >= p.n) {
     device::PDLTriggerSecondary<kUsePDL>();
     return;
+  }
+  if (p.skip_greedy) {  // all-greedy batch: the in-graph argmax serves it (same staged modes on every rank)
+    int any = 0;
+    for (int i = 0; i < p.n / p.G; ++i) any |= p.mode[i];
+    if (any == 0) {
+      device::PDLTriggerSecondary<kUsePDL>();
+      return;
+    }
   }
   SV_STAMP(0);
   const int G = p.G;
@@ -730,7 +741,8 @@ struct SampleVerify {
       int64_t seed,
       int64_t coins,
       int64_t dbg,
-      int64_t stamps) {
+      int64_t stamps,
+      int64_t skip_greedy) {
     using namespace host;
     using namespace dflash_sv;
     const int n = static_cast<int>(logits.size(0));
@@ -763,6 +775,7 @@ struct SampleVerify {
     prm.coins = reinterpret_cast<const float*>(coins);
     prm.dbg = reinterpret_cast<float*>(dbg);
     prm.stamps = reinterpret_cast<unsigned long long*>(stamps);
+    prm.skip_greedy = skip_greedy != 0 ? 1 : 0;
     const int smem = smem_bytes(Vs);
     RuntimeCheck(smem <= 220 * 1024 && Vs <= NKEY / 2);  // the final scan reuses the count table for Vs floats
     auto kern = sample_verify_kernel<kUsePDL>;
