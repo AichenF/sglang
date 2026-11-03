@@ -1510,6 +1510,14 @@ class Envs:
     SGLANG_DFLASH_VP_ARGMAX = EnvBool(True)
     # Debug: also run the full-logits reference path and compare tokens.
     SGLANG_DFLASH_VP_ARGMAX_CHECK = EnvBool(False)
+    # Vocab-parallel sampling verify for DFLASH (TP8, <= 64 verify rows): temperature + softmax + top-p + the chain
+    # rejection sampling + the bonus draw on the logits shard in one in-graph kernel (per-row statistics exchanged
+    # over CUDA IPC; no logits all-gather, no host sync, no rank-0 broadcast). It is captured on a forked stream next
+    # to the in-graph greedy argmax and returns at once when no request of the batch samples (all-greedy batches keep
+    # the argmax path). Requests with top_k not in {1, all}, min_p, penalties, logit bias, grammar, logprobs or custom
+    # processors keep the full-logits path. Needs SGLANG_DFLASH_VP_ARGMAX; 0 restores the full-logits path for every
+    # sampled batch.
+    SGLANG_DFLASH_SAMPLE_FUSED = EnvBool(True)
     # gather the draft fc (target-hidden projection) output with the
     # multimem symm-mem all-gather instead of the NCCL ring.
     SGLANG_DFLASH_FC_MULTIMEM = EnvBool(True)

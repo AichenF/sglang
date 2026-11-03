@@ -57,6 +57,7 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -681,6 +682,13 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # Fast paths (see _init_vocab_parallel_fast_paths).
         self._target_greedy_head: Optional[VocabParallelGreedyHead] = None
+        # SGLANG_DFLASH_SAMPLE_FUSED: vocab-parallel sampling verify state, its forked capture stream, the
+        # verify-graph token counts captured with it, and whether the current step's batch was staged for it
+        self._sample_verify = None
+        self._sv_stream = None
+        self._sv_graph_tokens = set()
+        self._sv_step = False
+        self._sv_logged = 0
         self._fc_gatherer = None
         self._vp_check_logged = 0
         self._embed_in_graph = False
@@ -1190,6 +1198,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
+            if self._sample_verify is not None:
+                # SGLANG_DFLASH_SAMPLE_FUSED: receive buffers after the KV cache and every captured graph (collective)
+                self._sample_verify.materialize()
             if get_parallel().tp_rank == 0:
                 # goal12-glue: the process-wide input-buffer pool aliases same-sized static inputs of the draft and the
                 # target runners -> any prep of one runner concurrent with the other's graph races on them
@@ -2898,6 +2909,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 target_mr.capture_tail_hooks.append(
                     self._target_greedy_head_capture_hook
                 )
+                if envs.SGLANG_DFLASH_SAMPLE_FUSED.get():
+                    self._init_sample_verify(
+                        tp_group, num_org, int(shard.org_vocab_start_index), vocab
+                    )
             if get_parallel().tp_rank == 0:
                 logger.info(
                     "DFLASH target greedy verify: vocab-parallel argmax %s (mode=%s, max_tokens=%d).",
@@ -2973,8 +2988,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             logger.info("DFLASH draft block embedding folded into the draft graph.")
 
     def _target_greedy_head_capture_hook(self, runner, out, forward_batch, num_tokens):
-        """Capture tail hook on the target runner: in-graph shard argmax."""
-        del runner, forward_batch, num_tokens
+        """Capture tail hook on the target runner: in-graph shard argmax, plus the vocab-parallel sampling verify on a
+        forked stream next to it (it returns at once for all-greedy batches, which take the argmax)."""
+        del runner, num_tokens
         head = self._target_greedy_head
         if (
             head is None
@@ -2990,7 +3006,154 @@ class DFlashWorkerV2(BaseSpecWorker):
             or int(logits.shape[0]) > head.max_tokens
         ):
             return
+        ids = getattr(forward_batch, "input_ids", None)
+        if not self._sv_supported(logits, ids):
+            head(logits)
+            return
+        main = torch.cuda.current_stream()
+        fork = torch.cuda.Event()
+        fork.record(main)
         head(logits)
+        self._sv_stream.wait_event(fork)
+        with torch.cuda.stream(self._sv_stream):
+            self._sv_run(logits, ids, skip_greedy=True)
+        main.wait_stream(self._sv_stream)
+        if torch.cuda.is_current_stream_capturing():
+            self._sv_graph_tokens.add(int(logits.shape[0]))
+
+    # ------------------------------------------------------------------
+    # SGLANG_DFLASH_SAMPLE_FUSED: vocab-parallel sampling verify
+    # ------------------------------------------------------------------
+    def _init_sample_verify(self, tp_group, local_vocab: int, vocab_start: int, vocab: int) -> None:
+        reason = None
+        if int(tp_group.world_size) != 8:
+            reason = f"tp {tp_group.world_size} != 8"
+        elif self.selector is not None or self.lilicorr is not None or self._is_domino:
+            reason = "selector/lilicorr/domino draft"
+        elif not 2 <= int(self.block_size) <= 16:
+            reason = f"block size {self.block_size}"
+        if reason is None:
+            try:
+                from sglang.kernels.ops.speculative.sample_verify import (
+                    create_state,
+                    unsupported_reason,
+                )
+
+                reason = unsupported_reason(local_vocab, self.device)
+            except Exception as e:  # pragma: no cover - defensive
+                reason = f"unavailable ({e})"
+        if reason is None:
+            try:
+                seed = getattr(self.server_args, "random_seed", None)
+                self._sample_verify = create_state(
+                    tp_group,
+                    local_vocab=local_vocab,
+                    vocab_start=vocab_start,
+                    vocab=vocab,
+                    seed=int(seed) if seed is not None else 0,
+                    # the 4 MB receive buffer is allocated after the KV cache and graph capture (init_cuda_graphs):
+                    # allocated here, ahead of the KV pools, it moved them and cost greedy steps ~0.02 ms at B4 x 64k
+                    defer_buffer=True,
+                )
+                if self._sample_verify is None:
+                    reason = "state unavailable"
+                else:
+                    self._sv_stream = torch.cuda.Stream(device=self.device)
+            except Exception as e:  # pragma: no cover - defensive
+                reason = f"init failed ({e})"
+                self._sample_verify = None
+        if get_parallel().tp_rank == 0:
+            logger.info(
+                "DFLASH vocab-parallel sampling verify %s.",
+                "enabled (<= 64 verify rows)" if reason is None else f"disabled ({reason})",
+            )
+
+    def _sv_params(self, batch):
+        """Per-request (mode, temperature, top_p) for the fused sampling verify, or None when the batch needs the
+        full-logits path (logprobs, grammar, penalties, logit bias, min_p, top_k other than 1 / all, ...)."""
+        if batch.return_logprob or batch.has_grammar or SIMULATE_ACC_LEN > 0:
+            return None
+        si = batch.sampling_info
+        if si is not None:
+            if getattr(si, "has_custom_logit_processor", False):
+                return None
+            if getattr(si, "acc_linear_penalties", None) is not None:
+                return None
+            penalizer = getattr(si, "penalizer_orchestrator", None)
+            if penalizer is not None and getattr(penalizer, "is_required", False):
+                return None
+            if getattr(si, "grammar_mask", None) is not None or getattr(si, "logit_bias", None) is not None:
+                return None
+            if getattr(si, "need_min_p_sampling", False):
+                return None
+            if getattr(si, "sampling_mask_batch_indices", None) is not None:
+                return None
+        params = []
+        any_sampled = False
+        for req in batch.reqs:
+            sp = req.sampling_params
+            if sp.top_k <= 1:
+                params.append((0, 1.0, 1.0))
+            elif sp.top_k == TOP_K_ALL and not sp.min_p > 0:
+                params.append((1, float(sp.temperature), float(sp.top_p)))
+                any_sampled = True
+            else:
+                return None
+        if any_sampled:
+            spec = get_spec()
+            if (
+                float(spec.speculative_accept_threshold_single) != 1.0
+                or float(spec.speculative_accept_threshold_acc) != 1.0
+            ):
+                return None
+        return params
+
+    def _sv_stage(self, batch, bs: int) -> bool:
+        """Stage this step's per-request parameters before the verify forward (the captured kernel reads them).
+        True when the step's verify result comes from the fused kernel, i.e. a request samples. Otherwise the kernel
+        is staged all-greedy, so a captured one returns at once and the in-graph argmax serves the batch."""
+        sv = self._sample_verify
+        if sv is None:
+            return False
+        if not sv.ready:  # receive buffers not allocated yet (before init_cuda_graphs): the kernel may only skip
+            sv.stage_all_greedy(min(bs, 64))
+            return False
+        if bs * int(self.block_size) > 64:
+            return False  # no captured graph of this size runs the kernel
+        params = None
+        if len(batch.reqs) == bs and not _is_all_greedy(batch.sampling_info):
+            params = self._sv_params(batch)
+        if params is None or not any(p[0] for p in params):
+            sv.stage_all_greedy(bs)
+            return False
+        sv.stage(params)
+        if self._sv_logged == 0 and get_parallel().tp_rank == 0 and any(p[0] for p in params):
+            self._sv_logged = 1
+            logger.info("DFLASH vocab-parallel sampling verify: first sampled step (bs=%d, params=%s).", bs, params)
+        return True
+
+    def _sv_supported(self, logits: torch.Tensor, ids) -> bool:
+        if self._sample_verify is None or ids is None:
+            return False
+        n = int(logits.shape[0])
+        return not (
+            n == 0
+            or n > 64
+            or n % int(self.block_size) != 0
+            or logits.dtype != torch.bfloat16
+            or logits.stride(1) != 1
+            or logits.stride(0) % 8 != 0
+            or logits.data_ptr() % 16 != 0
+            or ids.dtype != torch.int64
+            or not ids.is_contiguous()
+            or ids.numel() < n
+        )
+
+    def _sv_run(self, logits: torch.Tensor, ids, skip_greedy: bool = False) -> Optional[torch.Tensor]:
+        if not self._sv_supported(logits, ids):
+            return None
+        n = int(logits.shape[0])
+        return self._sample_verify.run(logits, ids.reshape(-1)[:n], int(self.block_size), skip_greedy=skip_greedy)
 
     @staticmethod
     def _sampling_allows_greedy_fast_path(sampling_info) -> bool:
@@ -3033,12 +3196,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         sampling_info,
         bs: int,
         in_graph_head: bool,
+        candidates: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         """Returns target_predict [bs, block] from the vocab-parallel argmax, or
         None (after restoring full fp32 logits in logits_output) for the old path.
 
         ``in_graph_head``: the decode graph (with the tail hook) produced head.out
-        for this batch; otherwise the shard argmax runs eagerly here."""
+        for this batch; otherwise the shard argmax runs eagerly here.
+
+        SGLANG_DFLASH_SAMPLE_FUSED: when the step was staged for the vocab-parallel sampling verify (a request
+        samples), target_predict is that kernel's output (greedy-verify layout: accepted candidates, then the sampled
+        bonus), for the batch's sampled and greedy requests alike."""
         head = self._target_greedy_head
         if head is None or logits_output is None:
             return None
@@ -3055,6 +3223,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         if not is_shard:
             return None
+        if self._sv_step:
+            if in_graph_head and n in self._sv_graph_tokens:
+                predict = self._sample_verify.out[:n]  # produced in-graph by the tail hook
+            else:
+                ids = candidates.reshape(-1) if candidates is not None else None
+                if ids is not None and (ids.dtype != torch.int64 or not ids.is_contiguous()):
+                    ids = ids.to(torch.int64).contiguous()
+                predict = self._sv_run(logits, ids)
+            if predict is not None:
+                return predict.view(bs, block_size)
         fast = (
             self.selector is None
             and self._selector_sample is None
@@ -3136,7 +3314,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         elif (
-            not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
+            target_predict is None
+            and not _is_all_greedy(sampling_info)
+            and is_dflash_sampling_verify_available()
         ):
             accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
                 candidates=candidates,
@@ -3157,6 +3337,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             # else: vocab-parallel result -- every rank selected from the same
             # gathered pairs with the same deterministic kernel, so the ranks
             # agree by construction and the rank-0 broadcast is not needed.
+            # (The fused sampling verify likewise: every rank reduces the same
+            # messages with the same uniforms; the bonus comes from one rank.)
             if self._use_triton_accept_bonus:
                 try:
                     (
@@ -3835,6 +4017,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
             verify_forward_batch.can_run_decode_cuda_graph = False
 
+        # SGLANG_DFLASH_SAMPLE_FUSED: the verify graph's sampling kernel reads this step's per-request parameters
+        self._sv_step = self._sv_stage(batch, bs)
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -3860,6 +4044,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # prefill graph / eager runner also report can_run_cuda_graph but the
             # shard argmax must then run eagerly.
             in_graph_head=bool(verify_decode_graph and can_run_cuda_graph),
+            candidates=draft_tokens,
         )
 
         grammar_mask = None
