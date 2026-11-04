@@ -718,8 +718,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             reason = "dp attention"
         elif self.use_compact_draft_cache:
             reason = "compact draft cache"
-        elif self.lilicorr is not None or self.selector is not None or self._is_domino:
-            reason = "selector/lilicorr/domino draft"
+        elif self.lilicorr is not None or self._is_domino:
+            # The candidate selector only reads the draft output; the draft KV is written from the target hidden as usual.
+            reason = "lilicorr/domino draft"
         elif self._fused_kv_helper is None or not self._use_fused_kv_materialize:
             reason = "no fused KV helper"
         elif getattr(self._fused_kv_helper, "max_position_hint", None) is None:
