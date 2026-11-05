@@ -42,6 +42,7 @@ from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
     get_dflash_layer_types,
+    get_dflash_legacy_attention_sliding_window_size,
     is_dense_head_weight,
     is_nemotron_35_draft_config,
     parse_dflash_draft_config,
@@ -165,13 +166,19 @@ def _get_dflash_layer_attention_params(
     config, layer_id: int
 ) -> Tuple[int, AttentionType]:
     layer_types = get_dflash_layer_types(config)
-    if layer_types is None:
-        return -1, AttentionType.ENCODER_ONLY
-    if layer_id >= len(layer_types):
+    if layer_types is not None and layer_id >= len(layer_types):
         raise ValueError(
             "DFLASH config.layer_types must contain one entry per draft layer. "
             f"Got {len(layer_types)} entries, layer_id={layer_id}."
         )
+
+    legacy_window = get_dflash_legacy_attention_sliding_window_size(config)
+    if legacy_window is not None:
+        return legacy_window, _get_dflash_attention_type(
+            config, default=AttentionType.ENCODER_ONLY
+        )
+    if layer_types is None:
+        return -1, AttentionType.ENCODER_ONLY
 
     layer_type = layer_types[layer_id]
     if layer_type == "full_attention":

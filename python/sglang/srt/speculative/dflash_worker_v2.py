@@ -610,12 +610,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._g12_init_slope_diag()
         if get_parallel().tp_rank == 0:
             logger.info(
-                "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
+                "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s, attention_window_left=%s",
                 bundle.resolved_attention_backend,
                 self.draft_model.__class__.__name__,
                 self.block_size,
                 self.draft_window_size,
                 self.use_compact_draft_cache,
+                self.draft_model_runner.sliding_window_size,
             )
             if self._is_domino:
                 logger.info(

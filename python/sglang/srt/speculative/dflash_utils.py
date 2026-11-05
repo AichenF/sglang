@@ -415,7 +415,61 @@ def get_dflash_layer_types(config: Any) -> Optional[Sequence[str]]:
     return layer_types
 
 
+def get_dflash_legacy_attention_sliding_window_size(config: Any) -> Optional[int]:
+    """Resolve the legacy DFlash SWA radius without changing the HF config.
+
+    Legacy checkpoints declare a per-layer attention radius with
+    ``dflash_config.use_swa/swa_window_size``. Unlike HF's ``sliding_window``,
+    this value is already window_left: do not subtract one. Qwen3Config may
+    synthesize all-full ``layer_types`` and clear the top-level window, so the
+    explicit legacy flag takes precedence over an all-full/default layer list.
+    To disable that declaration, set ``dflash_config.use_swa=False``.
+
+    Native sliding/mixed layer layouts and Nemotron keep their existing
+    semantics. This does not enable the independent compact-cache CLI option.
+    """
+    layer_types = get_dflash_layer_types(config)
+    if (
+        layer_types is not None
+        and any(layer_type != "full_attention" for layer_type in layer_types)
+    ) or is_nemotron_35_draft_config(config):
+        return None
+
+    dflash_config = _get_dflash_config(config)
+    use_swa = dflash_config.get("use_swa", False)
+    if not isinstance(use_swa, bool):
+        raise ValueError("DFLASH dflash_config.use_swa must be a bool.")
+    if not use_swa:
+        return None
+
+    window = dflash_config.get("swa_window_size")
+    if window is None:
+        text_config = _get_text_config(config)
+        window = _cfg_get(
+            text_config, "sliding_window", _cfg_get(config, "sliding_window")
+        )
+    if window is not None and (
+        isinstance(window, bool) or not isinstance(window, Integral)
+    ):
+        raise ValueError("DFLASH legacy swa_window_size must be an integer.")
+    window = _parse_optional_int(
+        window, field_name="DFLASH legacy swa_window_size", min_value=1
+    )
+    if window is None:
+        raise ValueError(
+            "DFLASH dflash_config.use_swa=True requires a positive "
+            "dflash_config.swa_window_size (or config.sliding_window). "
+            "Set the nested swa_window_size when the HF config normalizes "
+            "the top-level sliding_window to None."
+        )
+    return window
+
+
 def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
+    legacy_window = get_dflash_legacy_attention_sliding_window_size(config)
+    if legacy_window is not None:
+        return legacy_window
+
     layer_types = get_dflash_layer_types(config)
     if layer_types is None or "sliding_attention" not in layer_types:
         return None
