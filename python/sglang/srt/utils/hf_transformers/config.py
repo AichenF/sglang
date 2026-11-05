@@ -226,6 +226,12 @@ class HfModelConfigParser(ModelConfigParserBase):
                 **kwargs,
             )
 
+        if "DFlash2DraftModel" in (config.architectures or []):
+            raw_config, _ = PretrainedConfig.get_config_dict(
+                model, revision=revision, **kwargs
+            )
+            _normalize_dflash2_attention_config(config, raw_config)
+
         if (
             config.architectures is not None
             and config.architectures[0] == "Phi4MMForCausalLM"
@@ -309,6 +315,36 @@ class HfModelConfigParser(ModelConfigParserBase):
             _set_architectures(config, "LongcatFlashForCausalLM")
 
         return config
+
+
+def _normalize_dflash2_attention_config(config, raw_config):
+    """Resolve native DFlash2 fields before HF-generated defaults become policy.
+
+    Qwen3 fills absent layer_types with full_attention and can discard a supplied
+    sliding_window when use_sliding_window is absent. Consult the raw export to
+    distinguish these defaults from explicitly requested attention semantics.
+    """
+    if "DFlash2DraftModel" not in (raw_config.get("architectures") or []):
+        return
+    draft = raw_config.get("dflash_config") or {}
+    layer_types = raw_config.get("layer_types")
+    if layer_types is None and "use_swa" in draft:
+        if type(draft["use_swa"]) is not bool:
+            raise ValueError("DFlash2 dflash_config.use_swa must be a boolean")
+        kind = "sliding_attention" if draft["use_swa"] else "full_attention"
+        layer_types = [kind] * int(config.num_hidden_layers)
+    if layer_types is not None:
+        config.layer_types = layer_types
+    if "sliding_attention" in (getattr(config, "layer_types", None) or []):
+        window = raw_config.get("sliding_window")
+        if window is None:
+            window = draft.get("swa_window_size")
+        if type(window) is not int or window < 1:
+            raise ValueError("DFlash2 sliding attention requires a positive integer window")
+        config.sliding_window = window
+        config.use_sliding_window = True
+    # DFlash block attention has always been bidirectional unless declared otherwise.
+    config.is_causal = raw_config.get("is_causal", False)
 
 
 @register_model_config_parser("mistral")

@@ -406,6 +406,14 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> Lis
 def get_dflash_layer_types(config: Any) -> Optional[Sequence[str]]:
     text_config = _get_text_config(config)
     layer_types = _cfg_get(text_config, "layer_types", _cfg_get(config, "layer_types"))
+    architectures = _cfg_get(text_config, "architectures", _cfg_get(config, "architectures")) or []
+    if layer_types is None and "DFlash2DraftModel" in architectures:
+        draft_config = _get_dflash_config(text_config)
+        if "use_swa" in draft_config:
+            if type(draft_config["use_swa"]) is not bool:
+                raise ValueError("DFlash2 dflash_config.use_swa must be a boolean")
+            kind = "sliding_attention" if draft_config["use_swa"] else "full_attention"
+            layer_types = [kind] * int(_cfg_get(text_config, "num_hidden_layers"))
     if layer_types is None:
         return None
     if isinstance(layer_types, str) or not isinstance(layer_types, Sequence):
@@ -424,12 +432,17 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     sliding_window = _cfg_get(
         text_config, "sliding_window", _cfg_get(config, "sliding_window")
     )
-    if sliding_window is None and is_nemotron_35_draft_config(config):
-        sliding_window = _get_dflash_config(config).get("swa_window_size")
+    architectures = _cfg_get(text_config, "architectures", _cfg_get(config, "architectures")) or []
+    is_dflash2 = "DFlash2DraftModel" in architectures
+    if sliding_window is None and (is_nemotron_35_draft_config(config) or is_dflash2):
+        draft_source = text_config if is_dflash2 else config
+        sliding_window = _get_dflash_config(draft_source).get("swa_window_size")
     if sliding_window is None:
         raise ValueError(
             "DFLASH sliding_attention layers require config.sliding_window."
         )
+    if is_dflash2 and (type(sliding_window) is not int or sliding_window < 1):
+        raise ValueError("DFlash2 sliding attention requires a positive integer window")
 
     # HF sliding windows include the current token; SGLang stores window_left.
     return int(sliding_window) - 1
