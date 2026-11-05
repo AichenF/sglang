@@ -17,7 +17,12 @@ H = 6144
 R = 8
 SL = H // R
 MAXT = 32
-BUF_BYTES = 2 * MAXT * R * SL * 2 + 2 * MAXT * R * 8 + 2 * MAXT * R * (SL * 2 + 16) + 2 * MAXT * R * 16 + 2 * MAXT * H * 2
+# The last two regions belong to the draft megakernel (convolution drafts): coefficient partials
+# [2][MAXT][R][192] fp32, then convolved slices [2][MAXT][R][SL] bf16.
+BUF_BYTES = (
+    2 * MAXT * R * SL * 2 + 2 * MAXT * R * 8 + 2 * MAXT * R * (SL * 2 + 16) + 2 * MAXT * R * 16 + 2 * MAXT * H * 2
+    + 2 * MAXT * R * 192 * 4 + 2 * MAXT * R * SL * 2
+)
 
 
 @functools.lru_cache(maxsize=None)

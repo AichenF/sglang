@@ -920,10 +920,9 @@ class DFlashDraftModel(nn.Module):
 
             self._tp_fast = DFlashTPFast.try_create(self)
         if getattr(self, "_tp_fast", None) is not None and self._tp_fast.applicable(hidden_states):
-            return LogitsProcessorOutput(
-                next_token_logits=None,
-                hidden_states=self._tp_fast.forward(positions, hidden_states, forward_batch),
-            )
+            fused = self._tp_fast.forward(positions, hidden_states, forward_batch)
+            if fused is not None:
+                return LogitsProcessorOutput(next_token_logits=None, hidden_states=fused)
 
         for layer in self.layers:
             hidden_states, residual = layer(
