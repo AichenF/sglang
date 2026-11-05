@@ -94,6 +94,8 @@ def _accept_sampling_core(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor],
+    uniform_samples: Optional[torch.Tensor] = None,
+    uniform_samples_final: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
@@ -127,10 +129,12 @@ def _accept_sampling_core(
     # The NPU implementation uses the candidate width as its row stride.  The
     # last value is intentionally unused because candidate slot 0 is the root.
     uniform_width = candidates.shape[1] if _is_npu else gamma
-    uniform_samples = torch.rand(
-        (bs, uniform_width), dtype=torch.float32, device=device
-    )
-    uniform_samples_final = torch.rand((bs,), dtype=torch.float32, device=device)
+    # Callers that pass the uniforms must draw them with these two calls, in this order.
+    if uniform_samples is None:
+        uniform_samples = torch.rand(
+            (bs, uniform_width), dtype=torch.float32, device=device
+        )
+        uniform_samples_final = torch.rand((bs,), dtype=torch.float32, device=device)
     chain_speculative_sampling_triton(
         predicts=predicts,
         accept_index=accept_index,
@@ -167,6 +171,8 @@ def accept_sampling(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
+    uniform_samples: Optional[torch.Tensor] = None,
+    uniform_samples_final: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
@@ -179,6 +185,8 @@ def accept_sampling(
         gamma=gamma,
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
+        uniform_samples=uniform_samples,
+        uniform_samples_final=uniform_samples_final,
     )
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
     accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
