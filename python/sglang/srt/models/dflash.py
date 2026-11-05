@@ -151,8 +151,16 @@ def candidate_topk(
     if tp:
         return ids.long(), vals, lse
     global_ids = ids.long() + int(lm_head.shard_indices.org_vocab_start_index)
-    gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
-    gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
+    if int(lm_head.org_vocab_size) <= (1 << 24):
+        # One all-gather of [vals | ids] instead of two; ids below 2^24 are exact in fp32.
+        lead = vals.shape[:-1]
+        packed = torch.cat((vals.float(), global_ids.float()), dim=-1)
+        gathered = tensor_model_parallel_all_gather(packed, dim=-1).view(*lead, -1, 2, k)
+        gathered_vals = gathered[..., 0, :].reshape(*lead, -1)
+        gathered_ids = gathered[..., 1, :].reshape(*lead, -1).long()
+    else:
+        gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
+        gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
     top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
     if lse is not None:
         lse = torch.logsumexp(
