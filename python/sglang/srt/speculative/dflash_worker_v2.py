@@ -328,11 +328,11 @@ def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
 
 
-def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
+def _selector_lattice(draft_model, pred_hidden, anchor_token_ids, ids_out=None):
     # Flattened to [N, H] and viewed back because the radix top-k kernel is 2D.
     bs, num_pred = pred_hidden.shape[0], pred_hidden.shape[1]
     candidate_ids, unary_logits = draft_model.compute_candidates(
-        pred_hidden.reshape(-1, pred_hidden.shape[-1])
+        pred_hidden.reshape(-1, pred_hidden.shape[-1]), ids_out=ids_out
     )
     candidate_ids = candidate_ids.view(bs, num_pred, -1)
     return candidate_ids, draft_model.candidate_selector.build_lattice(
@@ -393,7 +393,16 @@ class _SelectorDraftSampler:
         bs = hidden_states.shape[0] // self.block_size
         block_ids = input_ids.view(bs, self.block_size)
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :]  # pos 0 = anchor
-        candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
+        gamma = self.block_size - 1
+        candidate_out = self.candidate_out[:bs]
+        tokens_out = self.out[: bs * gamma].view(bs, gamma)
+        q_out = self.q_out[:bs]
+        candidate_ids, scores = _selector_lattice(
+            self.draft_model,
+            hs,
+            block_ids[:, 0],
+            ids_out=candidate_out.view(bs * gamma, -1),
+        )
         # In-graph philox draw: each replay advances the generator and redraws.
         tokens, q_rows = self.selector.sample_path(
             candidate_ids=candidate_ids,
@@ -401,10 +410,16 @@ class _SelectorDraftSampler:
             uniforms=self.uniforms[:bs].uniform_(),
             temperatures=self.temperatures[:bs],
             greedy_mask=self.greedy_mask[:bs],
+            tokens_out=tokens_out,
+            q_out=q_out,
         )
-        self.out[: tokens.numel()].copy_(tokens.reshape(-1))
-        self.candidate_out[:bs].copy_(candidate_ids)
-        self.q_out[:bs].copy_(q_rows)
+        # Paths that do not write the static buffers in place (no TP gather, CPU walk).
+        if tokens.data_ptr() != tokens_out.data_ptr():
+            tokens_out.copy_(tokens)
+        if candidate_ids.data_ptr() != candidate_out.data_ptr():
+            candidate_out.copy_(candidate_ids)
+        if q_rows.data_ptr() != q_out.data_ptr():
+            q_out.copy_(q_rows)
 
 
 class _DominoDraftSampler:
@@ -2966,6 +2981,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                     getattr(self._target_greedy_head, "mode", None),
                     max_tokens,
                 )
+
+        if self.selector is not None:
+            # Candidate rows are fp32 [values | ids], gathered as raw bits.
+            self.draft_model.candidate_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
+                max_tokens=min(max_tokens, 2048), enabled=True
+            )
 
         if envs.SGLANG_DFLASH_FC_MULTIMEM.get():
             from sglang.srt.models.dflash import DFlashDraftModel

@@ -11,7 +11,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.speculative.dflash import selector_walk_triton
+from sglang.kernels.ops.speculative.dflash import (
+    pack_candidates,
+    selector_walk_triton,
+    unpack_candidate_ids,
+)
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
@@ -117,6 +121,8 @@ def candidate_topk(
     k: int,
     *,
     with_partition: bool = False,
+    gatherer=None,
+    ids_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Global top-k candidates from the target head: hidden [N, H] -> ids / vals [N, K].
 
@@ -150,7 +156,17 @@ def candidate_topk(
         vals, ids = _radix_topk(logits, k)
     if tp:
         return ids.long(), vals, lse
-    global_ids = ids.long() + int(lm_head.shard_indices.org_vocab_start_index)
+    id_offset = int(lm_head.shard_indices.org_vocab_start_index)
+    if gatherer is not None and lse is None and int(lm_head.org_vocab_size) <= (1 << 24):
+        # Same packed rows and gather layout as below, but the pack and the id
+        # unpack are one kernel each and the gather is a multimem copy of the same bits.
+        rows = vals.shape[0]
+        packed = pack_candidates(vals, ids, id_offset)
+        gathered = gatherer(packed.view(torch.bfloat16)).view(torch.float32)
+        gathered = gathered.view(rows, -1, 2, k)
+        top_vals, sel = torch.topk(gathered[:, :, 0, :].reshape(rows, -1), k, dim=-1)
+        return unpack_candidate_ids(gathered, sel, out=ids_out), top_vals, None
+    global_ids = ids.long() + id_offset
     if int(lm_head.org_vocab_size) <= (1 << 24):
         # One all-gather of [vals | ids] instead of two; ids below 2^24 are exact in fp32.
         lead = vals.shape[:-1]
@@ -1254,10 +1270,13 @@ class CandidateSelector(nn.Module):
         uniforms: torch.Tensor,
         temperatures: torch.Tensor,
         greedy_mask: torch.Tensor,
+        tokens_out: Optional[torch.Tensor] = None,
+        q_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Walk one path, with q over the K candidates for the verify. greedy_mask
         rows take the argmax, selected rather than branched, so one captured graph
-        serves greedy and sampling batches alike."""
+        serves greedy and sampling batches alike. The CUDA walk writes into
+        tokens_out / q_out when given."""
         if scores.is_cuda:
             return selector_walk_triton(
                 candidate_ids=candidate_ids,
@@ -1265,6 +1284,8 @@ class CandidateSelector(nn.Module):
                 uniforms=uniforms,
                 temperatures=temperatures,
                 greedy_mask=greedy_mask,
+                tokens_out=tokens_out,
+                q_out=q_out,
             )
         top_k = self.top_k
         temps = temperatures.view(-1, 1)
@@ -1325,6 +1346,8 @@ class DFlash2DraftModel(DFlashDraftModel):
         # The draft has no head of its own; the worker points this at the target's
         # before capture.
         self.lm_head: Optional[nn.Module] = None
+        # Set by the worker before capture: multimem gather of the TP candidate rows.
+        self.candidate_gatherer = None
 
     def _transform_unary_logits(self, logits: torch.Tensor) -> torch.Tensor:
         logits = logits.float()
@@ -1336,13 +1359,17 @@ class DFlash2DraftModel(DFlashDraftModel):
         return logits
 
     def compute_candidates(
-        self, hidden: torch.Tensor
+        self, hidden: torch.Tensor, ids_out: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Top-k base candidates via the target lm_head: hidden [N, H] -> global
         candidate_ids / unary_logits [N, K]."""
         assert self.lm_head is not None, "draft_model.lm_head unset before capture"
         ids, vals, _ = candidate_topk(
-            hidden, self.lm_head, self.candidate_selector.top_k
+            hidden,
+            self.lm_head,
+            self.candidate_selector.top_k,
+            gatherer=self.candidate_gatherer,
+            ids_out=ids_out,
         )
         return ids, self._transform_unary_logits(vals)
 

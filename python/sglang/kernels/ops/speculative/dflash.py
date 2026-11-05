@@ -404,11 +404,22 @@ def selector_walk_triton(
     uniforms,
     temperatures,
     greedy_mask,
+    tokens_out=None,
+    q_out=None,
 ):
     batch, slots, top_k = candidate_ids.shape
-    tokens = torch.empty((batch, slots), dtype=torch.int64, device=scores.device)
-    q_rows = torch.empty(
-        (batch, slots, top_k), dtype=torch.float32, device=scores.device
+    # tokens_out [batch, slots] int64 / q_out [batch, slots, top_k] fp32, contiguous.
+    tokens = (
+        tokens_out
+        if tokens_out is not None
+        else torch.empty((batch, slots), dtype=torch.int64, device=scores.device)
+    )
+    q_rows = (
+        q_out
+        if q_out is not None
+        else torch.empty(
+            (batch, slots, top_k), dtype=torch.float32, device=scores.device
+        )
     )
     _selector_walk_kernel[(batch,)](
         scores.contiguous(),
@@ -423,3 +434,57 @@ def selector_walk_triton(
         num_warps=1,
     )
     return tokens, q_rows
+
+
+@triton.jit
+def _pack_candidates_kernel(vals_ptr, ids_ptr, out_ptr, id_offset, K: tl.constexpr):
+    row = tl.program_id(0)
+    cols = tl.arange(0, K)
+    vals = tl.load(vals_ptr + row * K + cols).to(tl.float32)
+    ids = tl.load(ids_ptr + row * K + cols).to(tl.int64) + id_offset
+    tl.store(out_ptr + row * 2 * K + cols, vals)
+    tl.store(out_ptr + row * 2 * K + K + cols, ids.to(tl.float32))
+
+
+def pack_candidates(vals: torch.Tensor, ids: torch.Tensor, id_offset: int) -> torch.Tensor:
+    """[N, K] values and shard-local ids -> [N, 2K] fp32 rows of [values | ids + offset].
+
+    Same bits as torch.cat((vals.float(), (ids.long() + offset).float()), -1);
+    ids stay exact while id + offset < 2**24.
+    """
+    rows, k = vals.shape
+    out = torch.empty((rows, 2 * k), dtype=torch.float32, device=vals.device)
+    if rows:
+        _pack_candidates_kernel[(rows,)](
+            vals.contiguous(), ids.contiguous(), out, int(id_offset), K=k, num_warps=1
+        )
+    return out
+
+
+@triton.jit
+def _unpack_candidate_ids_kernel(
+    gathered_ptr, sel_ptr, out_ptr, RANKS: tl.constexpr, K: tl.constexpr
+):
+    row = tl.program_id(0)
+    cols = tl.arange(0, K)
+    sel = tl.load(sel_ptr + row * K + cols)
+    src = row * RANKS * 2 * K + (sel // K) * 2 * K + K + sel % K
+    tl.store(out_ptr + row * K + cols, tl.load(gathered_ptr + src).to(tl.int64))
+
+
+def unpack_candidate_ids(
+    gathered: torch.Tensor, sel: torch.Tensor, out: torch.Tensor = None
+) -> torch.Tensor:
+    """gathered [N, ranks, 2, K] fp32 rows of [values | ids], sel [N, K] indices into the
+    flattened [ranks * K] values -> ids [N, K] int64 (out, if given, must be contiguous).
+
+    Same values as torch.gather(gathered[..., 1, :].reshape(N, -1).long(), -1, sel).
+    """
+    rows, ranks, _, k = gathered.shape
+    if out is None:
+        out = torch.empty((rows, k), dtype=torch.int64, device=gathered.device)
+    if rows:
+        _unpack_candidate_ids_kernel[(rows,)](
+            gathered, sel.contiguous(), out, RANKS=ranks, K=k, num_warps=1
+        )
+    return out
