@@ -116,6 +116,12 @@ class FlashAttentionMetadata:
     page_table: torch.Tensor = None
     # Page table for Sliding Window Attention
     swa_page_table: torch.Tensor = None
+    # page_size > 1, target verify (``token_tables``): the same tables at token granularity ([bs, tokens] int32
+    # req_to_token rows, and their full->SWA translation) for kernels that address the KV pool per token slot
+    # (MiMo-V2 fused attention blocks, fa_verify / swa_decode / bidir_decode, the DFlash draft megakernel). FA3 keeps
+    # reading the block tables above. None at page_size 1: there page_table / swa_page_table already are token tables.
+    page_table_1: torch.Tensor = None
+    swa_page_table_1: torch.Tensor = None
 
     pa_swa_page_table: torch.Tensor = None
     pa_swa_cache_seqlens: torch.Tensor = None
@@ -206,6 +212,10 @@ class FlashAttentionBackend(AttentionBackend):
         self.kv_cache_dtype_str = model_runner.kv_cache_dtype_str
         self.kv_cache_is_mxfp8 = self.kv_cache_dtype_str == "mxfp8"
         self.page_size = model_runner.page_size
+        # page_size > 1: also build token-level tables for target verify (FlashAttentionMetadata.page_table_1)
+        from sglang.srt.environ import envs
+
+        self.token_tables = self.page_size > 1 and envs.SGLANG_FA_TOKEN_TABLES.get()
         # Static page-table width (upper bound). The device-side page-table build
         # sizes to this constant, so no runtime host max is needed.
         self.max_num_pages = (
@@ -1286,14 +1296,31 @@ class FlashAttentionBackend(AttentionBackend):
         # Runs after KVIndexTranslator and before the `// page_size` reduction.
         # The unified-memory UnifiedKVPool and page-interleaved pools are
         # alternatives, so at most one translation fires.
+        kv_sharded = False
         if self._kv_shard_pool is not None and prepare_kv_shard_forward(
             self._kv_shard_pool,
             self.req_to_token,
             forward_batch,
         ):
+            kv_sharded = True
             metadata.page_table = self._kv_shard_pool.translate_loc_to_scratch(
                 metadata.page_table
             ).to(torch.int32)
+
+        # page_size > 1: keep the token-level target-verify tables (the fresh per-token gathers above) before the
+        # block-table reduction below (FlashAttentionMetadata.page_table_1)
+        if (
+            self.token_tables
+            and not _unified_read
+            and not kv_sharded
+            and self.topk <= 1
+            and forward_batch.forward_mode.is_target_verify()
+            and metadata.page_table is not None
+            and metadata.local_attn_metadata is None
+        ):
+            metadata.page_table_1 = metadata.page_table
+            if self.use_sliding_window_kv_pool:
+                metadata.swa_page_table_1 = metadata.swa_page_table
 
         # Convert the page table to a strided format which is needed by FA3 API
         if self.page_size > 1 and not _unified_read:
@@ -1385,6 +1412,24 @@ class FlashAttentionBackend(AttentionBackend):
             )
         return key_cache, value_cache
 
+    def get_token_mha_kv_cache(
+        self, layer: RadixAttention
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The layer's KV pool buffers as token-major ``[slots, heads, 1, dim]``-style views (page size 1), for the
+        kernels that address KV per token slot through the token-level tables (page_table_1)."""
+        key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        return (
+            paged_kv_view(key_cache, 1, layer.tp_k_head_num, layer.head_dim),
+            paged_kv_view(value_cache, 1, layer.tp_v_head_num, layer.v_head_dim),
+        )
+
+    def token_kv_tables(self, metadata: FlashAttentionMetadata):
+        """(full, swa) token-level KV tables of ``metadata`` for the per-token-slot kernels: the block tables at
+        page_size 1, the page_table_1 pair at page_size > 1 (None when not built)."""
+        if self.page_size == 1:
+            return metadata.page_table, metadata.swa_page_table
+        return metadata.page_table_1, metadata.swa_page_table_1
+
     def prepare_paged_mha_query(
         self,
         q: torch.Tensor,
@@ -1431,7 +1476,7 @@ class FlashAttentionBackend(AttentionBackend):
             return None
         if is_cp_active(forward_batch) or not forward_batch.forward_mode.is_target_verify():
             return None
-        if self.page_size != 1 or layer.logit_cap not in (0, 0.0) or layer.is_cross_attention:
+        if layer.logit_cap not in (0, 0.0) or layer.is_cross_attention:
             return None
         if layer.tp_k_head_num != 1 or layer.head_dim != layer.v_head_dim:
             return None
@@ -1444,7 +1489,15 @@ class FlashAttentionBackend(AttentionBackend):
             return None
         if self.local_attn_builder is not None and self.local_attn_builder.applies(layer, metadata):
             return None
-        if metadata.swa_spec_metadata is not None:
+        if self.page_size != 1:
+            # page_size > 1: the megakernel addresses KV per token slot -> the token-level tables + token-major views
+            if metadata.swa_spec_metadata is not None:
+                return None
+            page_table = metadata.swa_page_table_1 if self.use_sliding_window_kv_pool else metadata.page_table_1
+            if page_table is None:
+                return None
+            cache_seqlens, max_seqlen_q = metadata.cache_seqlens_int32, metadata.max_seq_len_q
+        elif metadata.swa_spec_metadata is not None:
             sm = metadata.swa_spec_metadata
             page_table, cache_seqlens, max_seqlen_q = sm.page_table, sm.cache_seqlens_int32, sm.max_seq_len_q
         else:
@@ -1462,7 +1515,7 @@ class FlashAttentionBackend(AttentionBackend):
                 return None
         else:
             loc = forward_batch.out_cache_loc
-        key_cache, value_cache = self.get_paged_mha_kv_cache(layer)
+        key_cache, value_cache = self.get_token_mha_kv_cache(layer)
         return dict(
             page_table=page_table,
             cache_seqlens=cache_seqlens,
@@ -1670,6 +1723,22 @@ class FlashAttentionBackend(AttentionBackend):
             key_cache, value_cache = self.get_paged_mha_kv_cache(
                 layer,
             )
+            # The per-token-slot kernels below (fa_verify, bidir_decode, swa_decode) read token-level tables over a
+            # token-major KV view; at page_size > 1 that is page_table_1 (when built), FA3 keeps the block tables.
+            tok_page_size, tok_page_table, tok_key_cache, tok_value_cache = (
+                self.page_size, page_table, key_cache, value_cache
+            )
+            if self.page_size > 1 and not use_local_attn and not (
+                is_swa_layer and metadata.swa_spec_metadata is not None
+            ):
+                tok_page_table = (
+                    metadata.swa_page_table_1
+                    if is_swa_layer and self.use_sliding_window_kv_pool
+                    else metadata.page_table_1
+                )
+                if tok_page_table is not None:
+                    tok_page_size = 1
+                    tok_key_cache, tok_value_cache = self.get_token_mha_kv_cache(layer)
             fav_ok = (
                 not cp_active
                 and not self.fa_skip_kv_cache
@@ -1687,7 +1756,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_head_dim=layer.v_head_dim,
                     window_size=window_size,
                     causal=causal,
-                    page_size=self.page_size,
+                    page_size=tok_page_size,
                     softcap=layer.logit_cap,
                     cache_seqlens=cache_seqlens,
                     max_seqlen_q=max_seqlen_q,
@@ -1798,9 +1867,9 @@ class FlashAttentionBackend(AttentionBackend):
                 # no prepare_varlen, KV read once per request, PDL-chained combine.
                 result = fa_verify_attention(
                     q.reshape(-1, layer.tp_q_head_num, layer.head_dim),
-                    key_cache,
-                    value_cache,
-                    page_table,
+                    tok_key_cache,
+                    tok_value_cache,
+                    tok_page_table,
                     cache_seqlens,
                     sm_scale=layer.scaling,
                     out=_fa_out,
@@ -1819,7 +1888,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_head_dim=layer.v_head_dim,
                     window_size=window_size,
                     causal=causal,
-                    page_size=self.page_size,
+                    page_size=tok_page_size,
                     softcap=layer.logit_cap,
                     cache_seqlens=cache_seqlens,
                     max_seqlen_q=max_seqlen_q,
@@ -1832,9 +1901,9 @@ class FlashAttentionBackend(AttentionBackend):
                 # a copy for a layout that cannot be viewed.
                 result = bidir_decode_attention(
                     q.reshape(-1, layer.tp_q_head_num, layer.head_dim),
-                    key_cache,
-                    value_cache,
-                    page_table,
+                    tok_key_cache,
+                    tok_value_cache,
+                    tok_page_table,
                     cache_seqlens,
                     block_tokens=max_seqlen_q,
                     sm_scale=layer.scaling,
@@ -1855,7 +1924,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_head_dim=layer.v_head_dim,
                     window_size=window_size,
                     causal=causal,
-                    page_size=self.page_size,
+                    page_size=tok_page_size,
                     softcap=layer.logit_cap,
                     cache_seqlens=cache_seqlens,
                     max_seqlen_q=max_seqlen_q,
@@ -1867,9 +1936,9 @@ class FlashAttentionBackend(AttentionBackend):
                 # the fused QKV output and this kernel takes explicit strides.
                 result = swa_decode_attention(
                     q.reshape(-1, layer.tp_q_head_num, layer.head_dim),
-                    key_cache,
-                    value_cache,
-                    page_table,
+                    tok_key_cache,
+                    tok_value_cache,
+                    tok_page_table,
                     cache_seqlens,
                     window_tokens=max_seqlen_q,
                     window_size=window_size[0] + 1,
@@ -2665,6 +2734,10 @@ class FlashAttentionBackend(AttentionBackend):
                     0, self.max_context_len, self.page_size, device=self.device
                 ),
             }
+            if self.token_tables and self.topk <= 1:
+                self.target_verify_metadata["page_table_1"] = torch.zeros(
+                    max_bs, self.max_context_len, dtype=torch.int32, device=self.device
+                )
 
             # topk<=1 never extracts the mask; both metadata paths gate on topk > 1.
             self._verify_mask = maybe_create_verify_mask(
@@ -2707,6 +2780,10 @@ class FlashAttentionBackend(AttentionBackend):
                     dtype=torch.int32,
                     device=self.device,
                 )
+                if "page_table_1" in self.target_verify_metadata:
+                    self.target_verify_metadata["swa_page_table_1"] = torch.zeros(
+                        max_bs, self.max_context_len, dtype=torch.int32, device=self.device
+                    )
                 self.draft_extend_metadata["swa_page_table"] = torch.zeros(
                     max_bs,
                     max_num_pages,
@@ -2928,10 +3005,14 @@ class FlashAttentionBackend(AttentionBackend):
                     : (bs + 1)
                 ]
                 metadata.page_table = self.target_verify_metadata["page_table"][:bs, :]
+                if "page_table_1" in self.target_verify_metadata:
+                    metadata.page_table_1 = self.target_verify_metadata["page_table_1"][:bs, :]
                 if self.use_sliding_window_kv_pool:
                     metadata.swa_page_table = self.target_verify_metadata[
                         "swa_page_table"
                     ][:bs, :]
+                    if "swa_page_table_1" in self.target_verify_metadata:
+                        metadata.swa_page_table_1 = self.target_verify_metadata["swa_page_table_1"][:bs, :]
                     metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[
                         :num_tokens
                     ]
@@ -3307,6 +3388,8 @@ class FlashAttentionBackend(AttentionBackend):
                         if has_swa
                         else None
                     ),
+                    page_table_1=metadata.page_table_1,
+                    swa_page_table_1=metadata.swa_page_table_1 if has_swa else None,
                 )
             else:
                 # When topk > 1, we need two specific target verify metadata, and then merge states

@@ -1291,6 +1291,11 @@ class Envs:
     # goal11-glue: FA backend replay prep: the SWA write-loc refill (gather through full_to_swa_index_mapping + copy into
     # the graph buffer + tail zero) as ONE kernel (kernels/ops/attention/swa_write_loc.py)
     SGLANG_FA_SWA_WLOC_FUSED = EnvBool(True)
+    # page_size > 1: the FA backend also builds token-level (page-size-1) target-verify tables
+    # (FlashAttentionMetadata.page_table_1 / swa_page_table_1) so the per-token-slot kernels (MiMo-V2 fused attention
+    # blocks, fa_verify, swa_decode, bidir_decode, DFlash draft megakernel) run on a paged KV pool instead of falling
+    # back to FA3. Off: those kernels fall back at page_size > 1 as before.
+    SGLANG_FA_TOKEN_TABLES = EnvBool(True)
     # goal11-post: the DFlash decode step's eager replay prep in front of each CUDA graph (draft: prepare_block + input
     # copies + FA metadata + page table; verify: input copies + SWA write loc + FA metadata + page tables) recorded and
     # run as ONE Triton launch per graph (kernels/ops/speculative/step_prep.py; exact eager fallback for anything else),

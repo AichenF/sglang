@@ -197,17 +197,21 @@ class FaBlock:
         md = backend.forward_metadata
         layer = attn.attn
         lab = getattr(backend, "local_attn_builder", None)
+        # token-level KV table (the kernel addresses the pool per token slot): md.page_table at page_size 1,
+        # md.page_table_1 at page_size > 1 (None when the backend does not build it -> fallback)
+        page_table = backend.token_kv_tables(md)[0] if hasattr(backend, "token_kv_tables") else (
+            md.page_table if backend.page_size == 1 else None)
         if (
             (lab is not None and lab.applies(layer, md))
-            or backend.page_size != 1
+            or page_table is None
             or getattr(layer, "logit_cap", 0) not in (0, 0.0, None)
             or getattr(layer, "is_cross_attention", False)
             or (getattr(layer, "sliding_window_size", -1) or -1) > -1
             or getattr(backend, "fa_skip_kv_cache", False)
         ):
-            _log_once("fb_backend", "fallback: backend (local %s, page %s)", lab is not None, backend.page_size)
+            _log_once("fb_backend", "fallback: backend (local %s, page %s, token table %s)", lab is not None,
+                      backend.page_size, page_table is not None)
             return None
-        page_table = md.page_table
         seqlens = md.cache_seqlens_int32
         if (
             page_table is None

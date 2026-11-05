@@ -408,21 +408,19 @@ class BlkLayer:
         md = backend.forward_metadata
         layer = attn.attn
         lab = getattr(backend, "local_attn_builder", None)
+        page_table = _token_table(backend, md)
         if (
             (lab is not None and lab.applies(layer, md))
             or getattr(md, "swa_spec_metadata", None) is not None
-            or backend.page_size != 1
+            or page_table is None
             or self.window not in (128, 129)
             or getattr(layer, "logit_cap", 0) not in (0, 0.0, None)
             or getattr(layer, "is_cross_attention", False)
         ):
-            _log_once("fb_backend", "fallback: backend (local %s, spec %s, page %s, window %s)", lab is not None,
-                      getattr(md, "swa_spec_metadata", None) is not None, backend.page_size, self.window)
+            _log_once("fb_backend", "fallback: backend (local %s, spec %s, page %s, token table %s, window %s)",
+                      lab is not None, getattr(md, "swa_spec_metadata", None) is not None, backend.page_size,
+                      page_table is not None, self.window)
             return None
-        if backend.use_sliding_window_kv_pool:
-            page_table = md.swa_page_table
-        else:
-            page_table = md.page_table
         seqlens = md.cache_seqlens_int32
         if (
             page_table is None
@@ -502,17 +500,18 @@ class BlkLayer:
         md = backend.forward_metadata
         layer = attn.attn
         lab = getattr(backend, "local_attn_builder", None)
+        page_table = _token_table(backend, md)
         if (
             (lab is not None and lab.applies(layer, md))
             or getattr(md, "swa_spec_metadata", None) is not None
-            or backend.page_size != 1
+            or page_table is None
             or self.window not in (128, 129)
             or getattr(layer, "logit_cap", 0) not in (0, 0.0, None)
             or getattr(layer, "is_cross_attention", False)
         ):
-            _log_once("mega_fb_backend", "mega fallback: backend")
+            _log_once("mega_fb_backend", "mega fallback: backend (page %s, token table %s)", backend.page_size,
+                      page_table is not None)
             return None
-        page_table = md.swa_page_table if backend.use_sliding_window_kv_pool else md.page_table
         seqlens = md.cache_seqlens_int32
         if (
             page_table is None
@@ -590,6 +589,18 @@ class BlkLayer:
         partial._blk_prepushed = True
         _log_once("ran_fa", "fused FA o_proj + push running")
         return partial
+
+
+def _token_table(backend, md):
+    """The token-level KV table the SWA kernels address the pool with (SWA-translated slots when the backend runs a
+    sliding-window pool): the block table at page_size 1, md.(swa_)page_table_1 at page_size > 1 (None: not built)."""
+    if hasattr(backend, "token_kv_tables"):
+        full, swa = backend.token_kv_tables(md)
+    elif backend.page_size == 1:
+        full, swa = md.page_table, md.swa_page_table
+    else:
+        return None
+    return swa if backend.use_sliding_window_kv_pool else full
 
 
 def mega_xflag_enabled() -> bool:

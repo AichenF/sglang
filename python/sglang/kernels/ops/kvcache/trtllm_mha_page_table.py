@@ -95,6 +95,64 @@ def create_trtllm_mha_kv_indices_triton(
         )
 
 
+@triton.jit
+def create_mha_kv_indices_with_token_table_triton(
+    req_to_token_ptr,  # [max_reqs, max_context_len], int32
+    req_pool_indices_ptr,  # [bs]
+    seq_lens_ptr,  # [bs], per-request KV length in tokens
+    full_to_swa_ptr,  # full->SWA token-slot lookup table, or dummy when not SWA
+    page_table_ptr,  # [bs, num_pages] int32 block ids (output)
+    swa_page_table_ptr,  # [bs, num_pages] int32 SWA block ids (output), or dummy
+    token_table_ptr,  # [bs, num_tokens] int32 token slots (output)
+    swa_token_table_ptr,  # [bs, num_tokens] int32 SWA token slots (output), or dummy
+    full_to_swa_numel,
+    req_to_token_stride: tl.constexpr,
+    page_table_stride: tl.constexpr,
+    token_table_stride: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HAS_SWA: tl.constexpr,
+):
+    """``create_trtllm_mha_kv_indices_triton`` plus the token-level (page-size-1) tables in the same pass.
+
+    Program ``(pid_req, pid_blk)`` loads every token slot of block ``pid_blk`` once, stores it to the token table
+    (``req_to_token`` row, as the page_size == 1 builder would), and stores ``slot // PAGE_SIZE`` at each page start to
+    the block table. The block-table values and the live range written (pages ``< cdiv(seq_len, PAGE_SIZE)``) are
+    exactly the plain builder's; the SWA tables likewise (``full_to_swa`` of the token / page-start slot).
+    """
+    pid_req = tl.program_id(0)
+    pid_blk = tl.program_id(1)
+
+    seq_len = tl.load(seq_lens_ptr + pid_req)
+    num_blocks = tl.cdiv(seq_len, _MHA_KV_INDEX_BLOCK_TOKENS_TL)
+    if pid_blk >= num_blocks:
+        return
+
+    req_pool_index = tl.load(req_pool_indices_ptr + pid_req)
+    pos = tl.arange(0, _MHA_KV_INDEX_BLOCK_TOKENS_TL) + pid_blk * _MHA_KV_INDEX_BLOCK_TOKENS_TL
+    mask = pos < seq_len
+    head = mask & ((pos % PAGE_SIZE) == 0)
+
+    slot = tl.load(
+        req_to_token_ptr
+        + req_pool_index.to(tl.int64) * req_to_token_stride
+        + pos.to(tl.int64),
+        mask=mask,
+    )
+    tok_off = pid_req * token_table_stride + pos
+    pg_off = pid_req * page_table_stride + pos // PAGE_SIZE
+    tl.store(token_table_ptr + tok_off, slot.to(tl.int32), mask=mask)
+    tl.store(page_table_ptr + pg_off, (slot // PAGE_SIZE).to(tl.int32), mask=head)
+    if HAS_SWA:
+        swa_index = tl.minimum(tl.maximum(slot, 0), full_to_swa_numel - 1)
+        swa_slot = tl.load(full_to_swa_ptr + swa_index.to(tl.int64), mask=mask)
+        tl.store(swa_token_table_ptr + tok_off, swa_slot.to(tl.int32), mask=mask)
+        tl.store(
+            swa_page_table_ptr + pg_off,
+            (swa_slot // PAGE_SIZE).to(tl.int32),
+            mask=head,
+        )
+
+
 def build_trtllm_mha_page_table(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -103,6 +161,8 @@ def build_trtllm_mha_page_table(
     page_size: int,
     swa_page_table: Optional[torch.Tensor] = None,
     full_to_swa: Optional[torch.Tensor] = None,
+    page_table_1: Optional[torch.Tensor] = None,
+    swa_page_table_1: Optional[torch.Tensor] = None,
 ) -> None:
     """Fill ``page_table`` (and ``swa_page_table`` when SWA) on-device, no D2H sync.
 
@@ -118,6 +178,7 @@ def build_trtllm_mha_page_table(
         step_prep.record(
             "pt", req_to_token=req_to_token, req_pool_indices=req_pool_indices, cache_seqlens=cache_seqlens,
             page_table=page_table, page_size=page_size, swa_page_table=swa_page_table, full_to_swa=full_to_swa,
+            page_table_1=page_table_1, swa_page_table_1=swa_page_table_1,
         )
         return
     has_swa = full_to_swa is not None
@@ -129,6 +190,34 @@ def build_trtllm_mha_page_table(
     )
     bs, num_pages = page_table.shape
     full_to_swa_numel = full_to_swa.numel() if has_swa else 0
+    if page_table_1 is not None:
+        # page_size > 1 with token-level tables (consumers that address KV per token, e.g. the MiMo-V2 fused
+        # attention kernels): one pass writes both granularities.
+        assert page_size > 1 and page_table_1.shape[0] == bs and page_table_1.stride(1) == 1
+        assert has_swa == (swa_page_table_1 is not None), (
+            "swa_page_table_1 must be given iff the SWA page table is"
+        )
+        assert swa_page_table_1 is None or swa_page_table_1.stride() == page_table_1.stride()
+        num_tokens = page_table_1.shape[1]
+        create_mha_kv_indices_with_token_table_triton[
+            (bs, triton.cdiv(num_tokens, _MHA_KV_INDEX_BLOCK_TOKENS))
+        ](
+            req_to_token,
+            req_pool_indices,
+            cache_seqlens,
+            full_to_swa,
+            page_table,
+            swa_page_table,
+            page_table_1,
+            swa_page_table_1,
+            full_to_swa_numel,
+            req_to_token.stride(0),
+            page_table.stride(0),
+            page_table_1.stride(0),
+            PAGE_SIZE=page_size,
+            HAS_SWA=has_swa,
+        )
+        return
     create_trtllm_mha_kv_indices_triton[
         (bs, get_num_mha_kv_index_blocks(num_pages, page_size))
     ](

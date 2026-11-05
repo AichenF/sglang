@@ -126,13 +126,14 @@ def _step_prep_body(
     wl_dst, wl_loc, wl_map, wl_map_len, wl_total,
     # FA metadata
     cs_ptr, cu_ptr, delta,
-    # page table (+ SWA page table)
-    r2t_ptr, r2t_stride, pt_ptr, pt_stride, spt_ptr, f2s_ptr, f2s_numel,
+    # page table (+ SWA page table); PAGE > 1: pt / spt are the token-level (page-size-1) tables and ppt / pspt the
+    # page-level block tables (slot // PAGE at each page start)
+    r2t_ptr, r2t_stride, pt_ptr, pt_stride, spt_ptr, f2s_ptr, f2s_numel, ppt_ptr, ppt_stride, pspt_ptr,
     B, T, NBLK,
     W: tl.constexpr, WP: tl.constexpr, BB: tl.constexpr, ZB: tl.constexpr, CHT: tl.constexpr,
     K0: tl.constexpr, K1: tl.constexpr, K2: tl.constexpr, LOC_KIND: tl.constexpr,
     HAS_PREP: tl.constexpr, HAS_WLOC: tl.constexpr, HAS_SWA_PT: tl.constexpr, HAS_TOK: tl.constexpr,
-    HAS_BIDX: tl.constexpr,
+    HAS_BIDX: tl.constexpr, PAGE: tl.constexpr,
 ):
     # the static (post-copy) per-request values every later op reads
     rpi = tl.load(rpi_src + b * rpi_src_stride).to(rpi_dst.dtype.element_ty)
@@ -247,17 +248,24 @@ def _step_prep_body(
                     zo = z + tl.arange(0, ZB)
                     tl.store(wl_dst + zo, tl.zeros((ZB,), wl_dst.dtype.element_ty), mask=zo < wl_total)
 
-    # page table chunk j of request b (create_trtllm_mha_kv_indices_triton, PAGE_SIZE 1)
+    # page table chunk j of request b (create_trtllm_mha_kv_indices_triton, PAGE_SIZE 1; PAGE > 1:
+    # create_mha_kv_indices_with_token_table_triton)
     if (j < NBLK) & (j * CHT < cache_len):
         page_idx = tl.arange(0, CHT) + j * CHT
         mask = page_idx < cache_len
         slot = tl.load(r2t_ptr + rpi.to(tl.int64) * r2t_stride + page_idx.to(tl.int64), mask=mask)
         out_off = b.to(tl.int64) * pt_stride + page_idx
         tl.store(pt_ptr + out_off, slot.to(tl.int32), mask=mask)
+        if PAGE > 1:
+            head = mask & ((page_idx % PAGE) == 0)
+            pg_off = b.to(tl.int64) * ppt_stride + page_idx // PAGE
+            tl.store(ppt_ptr + pg_off, (slot // PAGE).to(tl.int32), mask=head)
         if HAS_SWA_PT:
             swa_index = tl.minimum(tl.maximum(slot, 0), f2s_numel - 1)
             swa_slot = tl.load(f2s_ptr + swa_index.to(tl.int64), mask=mask)
             tl.store(spt_ptr + out_off, swa_slot.to(tl.int32), mask=mask)
+            if PAGE > 1:
+                tl.store(pspt_ptr + pg_off, (swa_slot // PAGE).to(tl.int32), mask=head)
 
 
 @triton.jit
@@ -269,12 +277,12 @@ def _step_prep_kernel(
     rpi_src, rpi_src_stride, rpi_dst, seq_src, seq_src_stride, seq_dst,
     wl_dst, wl_loc, wl_map, wl_map_len, wl_total,
     cs_ptr, cu_ptr, delta,
-    r2t_ptr, r2t_stride, pt_ptr, pt_stride, spt_ptr, f2s_ptr, f2s_numel,
+    r2t_ptr, r2t_stride, pt_ptr, pt_stride, spt_ptr, f2s_ptr, f2s_numel, ppt_ptr, ppt_stride, pspt_ptr,
     B, T, NBLK,
     W: tl.constexpr, WP: tl.constexpr, BB: tl.constexpr, ZB: tl.constexpr, CHT: tl.constexpr,
     K0: tl.constexpr, K1: tl.constexpr, K2: tl.constexpr, LOC_KIND: tl.constexpr,
     HAS_PREP: tl.constexpr, HAS_WLOC: tl.constexpr, HAS_SWA_PT: tl.constexpr, HAS_TOK: tl.constexpr,
-    HAS_BIDX: tl.constexpr,
+    HAS_BIDX: tl.constexpr, PAGE: tl.constexpr,
 ):
     _step_prep_body(
         tl.program_id(0), tl.program_id(1),
@@ -283,8 +291,9 @@ def _step_prep_kernel(
         r2t_width, tk_dst, tk_dst_stride, tk_c0, tk_c0_stride, tk_rest, tk_rest_stride, t0_src, t0_dst, t1_src, t1_dst,
         t2_src, t2_dst, rpi_src, rpi_src_stride, rpi_dst, seq_src, seq_src_stride, seq_dst, wl_dst, wl_loc, wl_map,
         wl_map_len, wl_total, cs_ptr, cu_ptr, delta, r2t_ptr, r2t_stride, pt_ptr, pt_stride, spt_ptr, f2s_ptr, f2s_numel,
+        ppt_ptr, ppt_stride, pspt_ptr,
         B, T, NBLK,
-        W, WP, BB, ZB, CHT, K0, K1, K2, LOC_KIND, HAS_PREP, HAS_WLOC, HAS_SWA_PT, HAS_TOK, HAS_BIDX,
+        W, WP, BB, ZB, CHT, K0, K1, K2, LOC_KIND, HAS_PREP, HAS_WLOC, HAS_SWA_PT, HAS_TOK, HAS_BIDX, PAGE,
     )
 
 
@@ -296,20 +305,22 @@ def _step_prep2_kernel(
     a_loc_stride, a_mask_token_id, a_r2t_width, a_tk_dst, a_tk_dst_stride, a_tk_c0, a_tk_c0_stride, a_tk_rest,
     a_tk_rest_stride, a_t0_src, a_t0_dst, a_t1_src, a_t1_dst, a_t2_src, a_t2_dst, a_rpi_src, a_rpi_src_stride, a_rpi_dst,
     a_seq_src, a_seq_src_stride, a_seq_dst, a_wl_dst, a_wl_loc, a_wl_map, a_wl_map_len, a_wl_total, a_cs_ptr, a_cu_ptr,
-    a_delta, a_r2t_ptr, a_r2t_stride, a_pt_ptr, a_pt_stride, a_spt_ptr, a_f2s_ptr, a_f2s_numel, a_B, a_T, a_NBLK,
+    a_delta, a_r2t_ptr, a_r2t_stride, a_pt_ptr, a_pt_stride, a_spt_ptr, a_f2s_ptr, a_f2s_numel,
+    a_ppt_ptr, a_ppt_stride, a_pspt_ptr, a_B, a_T, a_NBLK,
     # plan B (program_id(2) == 1)
     b_bonus_ptr, b_bonus_stride, b_bidx_ptr, b_prefix_ptr, b_prefix_stride, b_prep_rpi_ptr, b_prep_rpi_stride,
     b_prep_r2t_ptr, b_prep_r2t_stride, b_blk_out_ptr, b_blk_stride, b_pos_out_ptr, b_pos_stride, b_loc_out_ptr,
     b_loc_stride, b_mask_token_id, b_r2t_width, b_tk_dst, b_tk_dst_stride, b_tk_c0, b_tk_c0_stride, b_tk_rest,
     b_tk_rest_stride, b_t0_src, b_t0_dst, b_t1_src, b_t1_dst, b_t2_src, b_t2_dst, b_rpi_src, b_rpi_src_stride, b_rpi_dst,
     b_seq_src, b_seq_src_stride, b_seq_dst, b_wl_dst, b_wl_loc, b_wl_map, b_wl_map_len, b_wl_total, b_cs_ptr, b_cu_ptr,
-    b_delta, b_r2t_ptr, b_r2t_stride, b_pt_ptr, b_pt_stride, b_spt_ptr, b_f2s_ptr, b_f2s_numel, b_B, b_T, b_NBLK,
+    b_delta, b_r2t_ptr, b_r2t_stride, b_pt_ptr, b_pt_stride, b_spt_ptr, b_f2s_ptr, b_f2s_numel,
+    b_ppt_ptr, b_ppt_stride, b_pspt_ptr, b_B, b_T, b_NBLK,
     A_W: tl.constexpr, A_WP: tl.constexpr, A_BB: tl.constexpr, A_K0: tl.constexpr, A_K1: tl.constexpr,
     A_K2: tl.constexpr, A_LOC_KIND: tl.constexpr, A_HAS_PREP: tl.constexpr, A_HAS_WLOC: tl.constexpr,
-    A_HAS_SWA_PT: tl.constexpr, A_HAS_TOK: tl.constexpr, A_HAS_BIDX: tl.constexpr,
+    A_HAS_SWA_PT: tl.constexpr, A_HAS_TOK: tl.constexpr, A_HAS_BIDX: tl.constexpr, A_PAGE: tl.constexpr,
     B_W: tl.constexpr, B_WP: tl.constexpr, B_BB: tl.constexpr, B_K0: tl.constexpr, B_K1: tl.constexpr,
     B_K2: tl.constexpr, B_LOC_KIND: tl.constexpr, B_HAS_PREP: tl.constexpr, B_HAS_WLOC: tl.constexpr,
-    B_HAS_SWA_PT: tl.constexpr, B_HAS_TOK: tl.constexpr, B_HAS_BIDX: tl.constexpr,
+    B_HAS_SWA_PT: tl.constexpr, B_HAS_TOK: tl.constexpr, B_HAS_BIDX: tl.constexpr, B_PAGE: tl.constexpr,
     ZB: tl.constexpr, CHT: tl.constexpr,
 ):
     """goal12-glue: two recognised prep plans (the target verify's and the draft's) in ONE launch, grid
@@ -326,9 +337,9 @@ def _step_prep2_kernel(
                 a_tk_rest_stride, a_t0_src, a_t0_dst, a_t1_src, a_t1_dst, a_t2_src, a_t2_dst, a_rpi_src, a_rpi_src_stride,
                 a_rpi_dst, a_seq_src, a_seq_src_stride, a_seq_dst, a_wl_dst, a_wl_loc, a_wl_map, a_wl_map_len, a_wl_total,
                 a_cs_ptr, a_cu_ptr, a_delta, a_r2t_ptr, a_r2t_stride, a_pt_ptr, a_pt_stride, a_spt_ptr, a_f2s_ptr,
-                a_f2s_numel, a_B, a_T, a_NBLK,
+                a_f2s_numel, a_ppt_ptr, a_ppt_stride, a_pspt_ptr, a_B, a_T, a_NBLK,
                 A_W, A_WP, A_BB, ZB, CHT, A_K0, A_K1, A_K2, A_LOC_KIND, A_HAS_PREP, A_HAS_WLOC, A_HAS_SWA_PT, A_HAS_TOK,
-                A_HAS_BIDX,
+                A_HAS_BIDX, A_PAGE,
             )
     else:
         if j <= b_NBLK:
@@ -340,9 +351,9 @@ def _step_prep2_kernel(
                 b_tk_rest_stride, b_t0_src, b_t0_dst, b_t1_src, b_t1_dst, b_t2_src, b_t2_dst, b_rpi_src, b_rpi_src_stride,
                 b_rpi_dst, b_seq_src, b_seq_src_stride, b_seq_dst, b_wl_dst, b_wl_loc, b_wl_map, b_wl_map_len, b_wl_total,
                 b_cs_ptr, b_cu_ptr, b_delta, b_r2t_ptr, b_r2t_stride, b_pt_ptr, b_pt_stride, b_spt_ptr, b_f2s_ptr,
-                b_f2s_numel, b_B, b_T, b_NBLK,
+                b_f2s_numel, b_ppt_ptr, b_ppt_stride, b_pspt_ptr, b_B, b_T, b_NBLK,
                 B_W, B_WP, B_BB, ZB, CHT, B_K0, B_K1, B_K2, B_LOC_KIND, B_HAS_PREP, B_HAS_WLOC, B_HAS_SWA_PT, B_HAS_TOK,
-                B_HAS_BIDX,
+                B_HAS_BIDX, B_PAGE,
             )
 
 
@@ -385,8 +396,11 @@ def _plan(ops):
     meta = ops[-2][1]
     pt = ops[-1][1]
 
-    if meta["skip_page_table"] is not True or meta["page_size"] != 1 or pt["page_size"] != 1:
+    page = int(pt["page_size"])
+    if meta["skip_page_table"] is not True or int(meta["page_size"]) != page:
         return None, "metadata/page-table mode"
+    if page != 1 and (pt.get("page_table_1") is None or page & (page - 1) or CH % page):
+        return None, "page-table mode (page_size > 1 needs the token-level tables)"
     cs = meta["cache_seqlens_int32"]
     cu = meta["cu_seqlens_k"]
     B = int(cs.shape[0])
@@ -423,18 +437,32 @@ def _plan(ops):
     k_rpi, k_seq = k_rpi[0], k_seq[0]
     # page table
     r2t = pt["req_to_token"]
-    ptab = pt["page_table"]
+    # ptab / spt: the tables written per token (page_size 1: the block tables themselves; page_size > 1: the
+    # token-level tables, the block tables ppt / pspt are written at the page starts)
+    ptab = pt["page_table"] if page == 1 else pt["page_table_1"]
     if r2t.dim() != 2 or r2t.stride(1) != 1 or r2t.dtype != torch.int32:
         return None, "req_to_token"
     if ptab.dim() != 2 or ptab.shape[0] != B or ptab.stride(1) != 1 or ptab.dtype != torch.int32:
         return None, "page table"
-    spt, f2s = pt["swa_page_table"], pt["full_to_swa"]
+    f2s = pt["full_to_swa"]
+    spt = pt["swa_page_table"] if page == 1 else pt.get("swa_page_table_1")
     has_swa_pt = f2s is not None
     if has_swa_pt:
         if spt is None or spt.shape != ptab.shape or spt.stride() != ptab.stride() or spt.dtype != torch.int32:
             return None, "swa page table"
         if f2s.dim() != 1 or not f2s.is_contiguous() or not _is_int(f2s):
             return None, "full_to_swa"
+    ppt = pspt = None
+    if page != 1:
+        ppt, pspt = pt["page_table"], pt["swa_page_table"]
+        if ppt.dim() != 2 or ppt.shape[0] != B or ppt.stride(1) != 1 or ppt.dtype != torch.int32:
+            return None, "block table"
+        if ppt.shape[1] * page < ptab.shape[1]:
+            return None, "block table narrower than the token table"
+        if has_swa_pt and (
+            pspt is None or pspt.shape != ppt.shape or pspt.stride() != ppt.stride() or pspt.dtype != torch.int32
+        ):
+            return None, "swa block table"
     # SWA write loc: the loc it reads is resolved below (after the prepare forwarding is known)
     if wloc is not None:
         wd, wl, wm = wloc["dst"], wloc["loc"], wloc["mapping"]
@@ -515,7 +543,11 @@ def _plan(ops):
     keyed += [(meta["cache_seqlens_int32"], ("own", id(own))), (meta["cu_seqlens_k"][: B + 1], ("own", id(own))),
               (ptab[:B], ("own", id(own)))]
     if has_swa_pt:
-        keyed.append((pt["swa_page_table"][:B], ("own", id(own))))
+        keyed.append((spt[:B], ("own", id(own))))
+    if ppt is not None:
+        keyed.append((ppt[:B], ("own", id(own))))
+        if has_swa_pt:
+            keyed.append((pspt[:B], ("own", id(own))))
     if wloc is not None:
         keyed.append((wloc["dst"], ("own", id(own))))
     if prep is not None:
@@ -546,7 +578,7 @@ def _plan(ops):
                 return None, "a directly read input overlaps a recorded output"
     return dict(
         B=B, T=T, W=W, tok=tok, kinds=kinds, k_rpi=k_rpi, k_seq=k_seq, loc_kind=loc_kind, prep=prep, tko=tko, copy=copy,
-        wloc=wloc, meta=meta, pt=pt, has_swa_pt=has_swa_pt,
+        wloc=wloc, meta=meta, pt=pt, has_swa_pt=has_swa_pt, page=page, ptab=ptab, spt=spt, ppt=ppt, pspt=pspt,
         wkeys=[(_span(w), kk) for w, kk in keyed], rspans=rr, own=own,
     ), None
 
@@ -585,7 +617,7 @@ def _args(p):
     meta = p["meta"]
     prep = p["prep"]
     wloc = p["wloc"]
-    ptab = pt["page_table"]
+    ptab = p["ptab"]
     r2t = pt["req_to_token"]
     dummy = meta["cache_seqlens_int32"]
     if prep is not None:
@@ -609,9 +641,13 @@ def _args(p):
         wl_args = (dummy, dummy, dummy, 0, 0)
     if p["has_swa_pt"]:
         f2s = pt["full_to_swa"]
-        sw_args = (pt["swa_page_table"], f2s, int(f2s.numel()))
+        sw_args = (p["spt"], f2s, int(f2s.numel()))
     else:
         sw_args = (dummy, dummy, 0)
+    if p["ppt"] is not None:
+        pg_args = (p["ppt"], p["ppt"].stride(0), p["pspt"] if p["has_swa_pt"] else dummy)
+    else:
+        pg_args = (dummy, 0, dummy)
     tko = p["tko"]
     if tko is not None:
         tk_args = (tko["dst"], tko["dst"].stride(0), tko["col0"], tko["col0"].stride(0), tko["rest"], tko["rest"].stride(0))
@@ -626,14 +662,14 @@ def _args(p):
         rs, rs.stride(0), dsts[p["k_rpi"]], ss, ss.stride(0), dsts[p["k_seq"]],
         *wl_args,
         meta["cache_seqlens_int32"], meta["cu_seqlens_k"], int(meta["seq_len_delta"]),
-        r2t, r2t.stride(0), ptab, ptab.stride(0), *sw_args,
+        r2t, r2t.stride(0), ptab, ptab.stride(0), *sw_args, *pg_args,
         B, T, nblk,
     )
     const = dict(
         W=W, WP=triton.next_power_of_2(W), BB=max(16, triton.next_power_of_2(B + 1)),
         K0=p["kinds"][0], K1=p["kinds"][1], K2=p["kinds"][2], LOC_KIND=p["loc_kind"],
         HAS_PREP=prep is not None, HAS_WLOC=wloc is not None, HAS_SWA_PT=p["has_swa_pt"], HAS_TOK=tko is not None,
-        HAS_BIDX=prep is not None and prep.get("bonus_index") is not None,
+        HAS_BIDX=prep is not None and prep.get("bonus_index") is not None, PAGE=p["page"],
     )
     return args, const, nblk
 
@@ -706,11 +742,13 @@ def _outputs(p):
         out.append(("wloc", p["wloc"]["dst"]))
     out.append(("cache_seqlens", p["meta"]["cache_seqlens_int32"]))
     out.append(("cu_seqlens_k", p["meta"]["cu_seqlens_k"][: B + 1]))
-    pt = p["pt"]
-    cs = p["meta"]["cache_seqlens_int32"]
-    out.append(("page_table", pt["page_table"][:B]))
+    out.append(("page_table" if p["page"] == 1 else "page_table_1", p["ptab"][:B]))
     if p["has_swa_pt"]:
-        out.append(("swa_page_table", pt["swa_page_table"][:B]))
+        out.append(("swa_page_table" if p["page"] == 1 else "swa_page_table_1", p["spt"][:B]))
+    if p["ppt"] is not None:
+        out.append(("page_table", p["ppt"][:B]))
+        if p["has_swa_pt"]:
+            out.append(("swa_page_table", p["pspt"][:B]))
     return out
 
 
