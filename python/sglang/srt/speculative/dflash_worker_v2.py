@@ -2872,9 +2872,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         if envs.SGLANG_DFLASH_VP_ARGMAX.get():
             lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
             reason = None
-            if self.selector is not None or self._is_domino:
-                # Those verify paths consume the full logits every step.
-                reason = "selector/domino draft"
+            if self._is_domino:
+                # Domino's verify consumes the full logits every step.
+                reason = "domino draft"
             elif self.lilicorr is not None:
                 # LiLiCorr's verify has not been validated on the logits shard.
                 reason = "lilicorr draft"
@@ -3028,8 +3028,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         reason = None
         if int(tp_group.world_size) != 8:
             reason = f"tp {tp_group.world_size} != 8"
-        elif self.selector is not None or self.lilicorr is not None or self._is_domino:
-            reason = "selector/lilicorr/domino draft"
+        elif (self.selector is not None and self._selector_sampling_enabled) or self.lilicorr is not None or self._is_domino:
+            reason = "selector sampling/lilicorr/domino draft"
         elif not 2 <= int(self.block_size) <= 16:
             reason = f"block size {self.block_size}"
         if reason is None:
@@ -3234,8 +3234,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if predict is not None:
                 return predict.view(bs, block_size)
         fast = (
-            self.selector is None
-            and self._selector_sample is None
+            self._selector_sample is None
             and not batch.return_logprob
             and not batch.has_grammar
             and SIMULATE_ACC_LEN <= 0
@@ -3402,7 +3401,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             return
 
         if self.selector is not None:
-            if self._selector_sampling_enabled:
+            if self._selector_sampling_enabled or is_dflash_sampling_verify_available():
                 return
             if not self._warned_sampling_fallback and get_parallel().tp_rank == 0:
                 logger.warning(
