@@ -8,8 +8,8 @@ layer's transformed tensors (``w13_weight`` / ``w13_weight_scale`` / ``w13_weigh
 the kernel dequantizes Humming's fused-e8m0 layout in registers -- so there is no second copy of the weights and the
 prefill / large-batch path keeps running Humming unchanged.
 
-Enable with ``SGLANG_MIMO_FUSED_MOE=1`` (TP=8, EP=1, ``--moe-runner-backend humming`` with the W4A8 activation config,
-no DP attention).
+On by default (``SGLANG_MIMO_FUSED_MOE=0`` disables it); used only with TP=8, EP=1, no DP attention and
+``--moe-runner-backend humming`` with the W4A8 activation config, other setups keep the Humming path.
 
 Stage-boundary integration (``layers/layer_boundary``): the decoder layer hands the kernel the attention's o_proj partial
 BEFORE ``attn_boundary.finish`` records its declared attention-TP sum, plus the residual the attention prepare wrote into

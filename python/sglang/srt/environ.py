@@ -1070,7 +1070,7 @@ class Envs:
     SGLANG_HUMMING_MOE_GEMM_TYPE = EnvStr("")
     # Fused decode MoE over the Humming W4A8 weights: one kernel
     # for post-attention RMSNorm + router + top-8 + experts + TP all-reduce for batches of <= MAX_TOKENS tokens per rank.
-    SGLANG_MIMO_FUSED_MOE = EnvBool(False)
+    SGLANG_MIMO_FUSED_MOE = EnvBool(True)
     SGLANG_MIMO_FUSED_MOE_MAX_TOKENS = EnvInt(64)
 
     # ===================================================================
