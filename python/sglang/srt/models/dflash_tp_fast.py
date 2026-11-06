@@ -44,6 +44,7 @@ def _channelwise_fp8(linear) -> bool:
 
 
 def _supported_conv(conv) -> bool:
+    """A grouped convolution the draft megakernel runs (taps 2, groups of 16, block 8, BF16 projection)."""
     from sglang.srt.models.dflash import DFlashGroupedConv
 
     if type(conv) is not DFlashGroupedConv:
@@ -54,47 +55,10 @@ def _supported_conv(conv) -> bool:
         and w.dtype == torch.bfloat16
         and tuple(w.shape) == (2 * conv.taps * conv.num_groups, H)
         and tuple(conv.base_kernel.shape) == (2, conv.taps, H)
+        and conv.taps == 2
+        and conv.group_size == 16
+        and conv.block_size == 8
     )
-
-
-class _ConvParams:
-    """Per-sublayer constants of a DFlashGroupedConv in the layouts the fused path reads."""
-
-    def __init__(self, conv):
-        self.conv = conv
-        self.weight = conv.kernel_projection.weight
-        self.taps = conv.taps
-        self.groups = conv.num_groups
-        self.group_size = conv.group_size
-        self.base_in = conv.base_kernel[0].detach().to(torch.bfloat16).contiguous()
-        self.base_out = conv.base_kernel[1].detach().to(torch.bfloat16).contiguous()
-
-    def mega_supported(self) -> bool:
-        return self.taps == 2 and self.group_size == 16 and self.conv.block_size == 8
-
-    def mega_weights(self):
-        """-> (bf16 [1536, H] projection, rows [side][tap][group], fp32 [1536] unused scales, bf16 [2, 2, H] static
-        kernels)."""
-        w = self.weight.detach().to(torch.bfloat16).contiguous()
-        scale = torch.ones(w.shape[0], dtype=torch.float32, device=w.device)
-        base = torch.stack([self.base_in, self.base_out]).contiguous()
-        return w, scale, base
-
-    def prepare_quant(self, h, xq, xs):
-        """Convolve the normalized input and quantize it; returns the output-side coefficients."""
-        from sglang.kernels.ops.speculative.dflash_conv_quant import grouped_conv_quant
-
-        coefficients = torch.nn.functional.linear(h, self.weight).view(h.shape[0], 2, self.taps, self.groups)
-        grouped_conv_quant(
-            h, coefficients[:, 0], self.base_in, self.conv.block_size, self.group_size, xq, xs
-        )
-        return coefficients[:, 1]
-
-    def finish(self, summed, coefficients):
-        """Output convolution of the all-reduced projection, as the unfused layer applies it."""
-        from sglang.kernels.ops.speculative.dflash_grouped_conv import grouped_conv
-
-        return grouped_conv(summed, coefficients, self.base_out, self.conv.block_size, self.group_size)
 
 
 class DFlashTPFast:
@@ -117,18 +81,9 @@ class DFlashTPFast:
             self.skinny = skinny_fp8_pt_gemm
         # goal11-draft: the 5 layers at M = 32 as one persistent kernel (built at the first eager M = 32 forward)
         self.mega = None
-        self._mega_check_pending = False
         self.mega_state = "off" if not envs.SGLANG_DFLASH_MEGA.get() else "pending"
-        self.convs = [
-            tuple(None if c is None else _ConvParams(c) for c in (layer.attention_conv, layer.mlp_conv))
-            for layer in self.layers
-        ]
-        has_conv = any(c is not None for pair in self.convs for c in pair)
-        if has_conv and not all(c is not None and c.mega_supported() for pair in self.convs for c in pair):
-            self.mega_state = "off"
-        self.has_conv = has_conv
-        self._conv_checked = not has_conv
-        self._conv_failed = False
+        # convolution drafts run only in the megakernel; other batches take the original layers
+        self.has_conv = self.layers[0].attention_conv is not None
 
     @staticmethod
     def try_create(model) -> Optional["DFlashTPFast"]:
@@ -145,11 +100,12 @@ class DFlashTPFast:
                 return None
             if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
                 return None
+            has_conv = model.layers[0].attention_conv is not None
             for layer in model.layers:
                 if type(layer) is not DFlashDecoderLayer or type(layer.self_attn) is not DFlashAttention:
                     return None
                 for conv in (layer.attention_conv, layer.mlp_conv):
-                    if conv is not None and not _supported_conv(conv):
+                    if (conv is not None) != has_conv or (has_conv and not _supported_conv(conv)):
                         return None
                 if type(layer.input_layernorm) is not RMSNorm or type(layer.post_attention_layernorm) is not RMSNorm:
                     return None
@@ -352,10 +308,11 @@ class DFlashTPFast:
             d["k_cache"] = a["key_cache"]
             d["v_cache"] = a["value_cache"]
             if self.has_conv:
-                for tag, conv in zip(("a", "m"), self.convs[i]):
-                    wq, sc, base = conv.mega_weights()
-                    keep += [wq, sc, base]
-                    d["w_c" + tag], d["s_c" + tag], d["cb_" + tag] = wq, sc, base
+                for tag, conv in (("a", layer.attention_conv), ("m", layer.mlp_conv)):
+                    w = conv.kernel_projection.weight.detach().to(torch.bfloat16).contiguous()
+                    base = conv.base_kernel.detach().to(torch.bfloat16).contiguous()
+                    keep += [w, base]
+                    d["w_c" + tag], d["cb_" + tag] = w, base
             L.append(d)
         eps = float(self.layers[0].input_layernorm.variance_epsilon)
         for layer in self.layers:
@@ -414,33 +371,20 @@ class DFlashTPFast:
                     return None
                 if self.state.rank == 0:
                     logger.info(f"DFLASH draft megakernel self-check: {msg}")
-            else:
-                # checked at the first eager forward with real metadata (only without CUDA graphs)
-                self._mega_check_pending = envs.SGLANG_DFLASH_MEGA_CHECK.get()
-                if self.state.rank == 0:
-                    logger.info("DFLASH draft megakernel: no self-check (warmup / dummy metadata)")
+            elif self.state.rank == 0:
+                logger.info("DFLASH draft megakernel: no self-check (warmup / dummy metadata)")
             self.mega_state = "on"
             if self.state.rank == 0:
                 logger.info("DFLASH draft megakernel enabled (5 layers at M=32, one persistent kernel)")
-        if self._mega_check_pending and not torch.cuda.is_current_stream_capturing():
-            real = bool((args["cache_seqlens"] >= 16).all().item()) and bool((args["loc"] != 0).all().item())
-            if self._mega_agree(real):
-                self._mega_check_pending = False
-                ok, msg = self._mega_check(positions, hidden_states, forward_batch, args)
-                if not self._mega_agree(ok):
-                    self.mega_state, self.mega = "failed", None
-                    logger.warning(f"DFLASH draft megakernel disabled (self-check): {msg}")
-                    return None
-                if self.state.rank == 0:
-                    logger.info(f"DFLASH draft megakernel self-check: {msg}")
         out = torch.empty_like(hidden_states)
         self.mega.run(hidden_states, out, positions, args["cache_seqlens"], args["page_table"], args["loc"])
         return out
 
     def _mega_check(self, positions, hidden_states, forward_batch, args):
-        """Once, eager: the megakernel vs the fused-TP path on copies of this forward's input (both write the same block
-        rows to the draft KV cache). Also checks that the block rows are the last 8 page-table entries of each request
-        (the megakernel takes the new keys from qkv instead of re-reading the cache)."""
+        """Once, eager: the megakernel vs the fused-TP path (convolution drafts: the original layers) on copies of this
+        forward's input (both write the same block rows to the draft KV cache). Also checks that the block rows are the
+        last 8 page-table entries of each request (the megakernel takes the new keys from qkv instead of re-reading the
+        cache)."""
         try:
             pt = args["page_table"].cpu()
             sl = args["cache_seqlens"].cpu()
@@ -449,8 +393,14 @@ class DFlashTPFast:
                 n = int(sl[b])
                 if n < 8 or not torch.equal(pt[b, n - 8:n].to(torch.int64), loc[8 * b:8 * b + 8]):
                     return False, f"block rows of request {b} are not the last page-table entries"
-            h_ref = hidden_states.clone()
-            o_ref = self._forward_fused(positions, h_ref, forward_batch)
+            if self.has_conv:
+                x, residual = hidden_states.clone(), None
+                for layer in self.layers:
+                    x, residual = layer(positions, x, forward_batch, residual)
+                o_ref, h_ref = self.model.norm(x, residual)
+            else:
+                h_ref = hidden_states.clone()
+                o_ref = self._forward_fused(positions, h_ref, forward_batch)
             h_m = hidden_states.clone()
             o_m = torch.empty_like(o_ref)
             self.mega.run(h_m, o_m, positions, args["cache_seqlens"], args["page_table"], args["loc"])
@@ -461,62 +411,17 @@ class DFlashTPFast:
             rel = (d.norm() / o_ref.float().norm().clamp(min=1e-20)).item()
             mx = (d.abs().max() / o_ref.float().abs().max().clamp(min=1e-20)).item()
             dr = ((h_m.float() - h_ref.float()).norm() / h_ref.float().norm().clamp(min=1e-20)).item()
-            msg = f"out rel-L2 {rel:.3e} max-rel {mx:.3e} residual rel-L2 {dr:.3e}"
-            if not self.has_conv:
-                return rel < 0.3, msg
-            # convolution drafts: also against the unfused layers, with the fused path's bound
-            residual = None
-            x = hidden_states.clone()
-            for layer in self.layers:
-                x, residual = layer(positions, x, forward_batch, residual)
-            o_un, _ = self.model.norm(x, residual)
-            torch.cuda.synchronize()
-            ru = ((o_m.float() - o_un.float()).norm() / o_un.float().norm().clamp(min=1e-20)).item()
-            rf = ((o_ref.float() - o_un.float()).norm() / o_un.float().norm().clamp(min=1e-20)).item()
-            msg += f"; vs unfused layers: megakernel {ru:.3e}, fused path {rf:.3e}"
-            # The V1 megakernel itself is 5.4e-2 from the unfused layers on ShareGPT input: the fp8 activation quant
-            # amplifies summation-order ulps.
-            return rel < 0.3 and ru < 0.1, msg
+            bound = 0.1 if self.has_conv else 0.3
+            return rel < bound, f"out rel-L2 {rel:.3e} max-rel {mx:.3e} residual rel-L2 {dr:.3e}"
         except Exception as e:  # noqa: BLE001
             return False, f"exception {type(e).__name__}: {e}"
 
     def forward(self, positions, hidden_states, forward_batch) -> Optional[torch.Tensor]:
-        """None when the caller should run the unfused layers."""
+        """None: run the original layers."""
         out = self._mega_try(positions, hidden_states, forward_batch)
-        if out is not None:
+        if out is not None or self.has_conv:
             return out
-        if not self._conv_checked:
-            if torch.cuda.is_current_stream_capturing():
-                return None
-            self._conv_checked = True
-            ok, msg = self._conv_check(positions, hidden_states, forward_batch)
-            if not self._mega_agree(ok):
-                self._conv_failed = True
-                logger.warning(f"DFLASH TP fused path disabled for convolution layers (self-check): {msg}")
-            elif self.state.rank == 0:
-                logger.info(f"DFLASH TP fused path with convolution layers, self-check: {msg}")
-        if self._conv_failed:
-            return None
         return self._forward_fused(positions, hidden_states, forward_batch)
-
-    def _conv_check(self, positions, hidden_states, forward_batch):
-        """Once, eager: the fused path vs the unfused layers on copies of this forward's input."""
-        try:
-            h_ref = hidden_states.clone()
-            residual = None
-            x = h_ref
-            for layer in self.layers:
-                x, residual = layer(positions, x, forward_batch, residual)
-            o_ref, _ = self.model.norm(x, residual)
-            o_f = self._forward_fused(positions, hidden_states.clone(), forward_batch)
-            torch.cuda.synchronize()
-            if not bool(torch.isfinite(o_f).all()):
-                return False, "non-finite output"
-            d = o_f.float() - o_ref.float()
-            rel = (d.norm() / o_ref.float().norm().clamp(min=1e-20)).item()
-            return rel < 0.1, f"out rel-L2 {rel:.3e}"  # bound as in _mega_check
-        except Exception as e:  # noqa: BLE001
-            return False, f"exception {type(e).__name__}: {e}"
 
     def _forward_fused(self, positions, hidden_states, forward_batch) -> torch.Tensor:
         from sglang.kernels.ops.communication.dflash_tp_fused import rmsnorm_quant, silu_mul_quant
@@ -525,69 +430,34 @@ class DFlashTPFast:
         M = hidden_states.shape[0]
         dev = hidden_states.device
         layers = self.layers
-        def fp8_buffers():
-            return (
-                torch.empty(M, H, dtype=torch.float8_e4m3fn, device=dev),
-                torch.empty(M, dtype=torch.float32, device=dev),
-            )
-
-        def reduce_conv(part, conv, coefficients):
-            """All-reduce, then the output convolution on the sum (the unfused order)."""
-            summed = torch.empty(M, H, dtype=torch.bfloat16, device=dev)
-            st.all_reduce_raw(part, summed)
-            return conv.finish(summed, coefficients)
-
-        def norm_into_fp8(part, ln, conv):
-            """All-reduce + residual add + RMSNorm, then per-token fp8 quant.
-            Returns (xq, xs, None)."""
-            xq, xs = fp8_buffers()
-            st.arnq(part, residual, ln.weight, ln.variance_epsilon, xq, xs)
-            return xq, xs, None
-
+        xq = torch.empty(M, H, dtype=torch.float8_e4m3fn, device=dev)
+        xs = torch.empty(M, dtype=torch.float32, device=dev)
         ln0 = layers[0].input_layernorm
-        attn_conv0 = self.convs[0][0]
-        if attn_conv0 is None:
-            xq, xs = fp8_buffers()
-            rmsnorm_quant(hidden_states, ln0.weight, ln0.variance_epsilon, st.rank, xq, xs)
-            attn_coef = None
-        else:
-            xq, xs = fp8_buffers()
-            attn_coef = attn_conv0.prepare_quant(ln0(hidden_states), xq, xs)
+        rmsnorm_quant(hidden_states, ln0.weight, ln0.variance_epsilon, st.rank, xq, xs)
         # the unfused path also accumulates into the embedding buffer in place (residual = hidden_states)
         residual = hidden_states
         out = None
         for i, layer in enumerate(layers):
             attn, mlp = layer.self_attn, layer.mlp
-            attn_conv, mlp_conv = self.convs[i]
             qkv = self._gemm(attn.qkv_proj, xq, xs)
             a = self._attend(attn, qkv, positions, forward_batch)
             o_part = attn.o_proj.quant_method.apply(attn.o_proj, a)
-            if attn_conv is None:
-                xq, xs, mlp_coef = norm_into_fp8(o_part, layer.post_attention_layernorm, mlp_conv)
-            else:
-                # Conv layers: residual add + RMSNorm run as the unfused layer runs them.
-                attn_out = reduce_conv(o_part, attn_conv, attn_coef)
-                h, residual = layer.post_attention_layernorm(attn_out, residual)
-                xq, xs = fp8_buffers()
-                mlp_coef = mlp_conv.prepare_quant(h, xq, xs)
+            xq = torch.empty(M, H, dtype=torch.float8_e4m3fn, device=dev)
+            xs = torch.empty(M, dtype=torch.float32, device=dev)
+            ln = layer.post_attention_layernorm
+            st.arnq(o_part, residual, ln.weight, ln.variance_epsilon, xq, xs)
             gu = self._gemm(mlp.gate_up_proj, xq, xs)
             aq = torch.empty(M, INTER, dtype=torch.float8_e4m3fn, device=dev)
             asc = torch.empty(M, dtype=torch.float32, device=dev)
             silu_mul_quant(gu, aq, asc)
             d_part = self._gemm(mlp.down_proj, aq, asc)
-            if mlp_conv is None:
-                if i + 1 < len(layers):
-                    xq, xs, attn_coef = norm_into_fp8(d_part, layers[i + 1].input_layernorm, None)
-                else:
-                    out = torch.empty(M, H, dtype=torch.bfloat16, device=dev)
-                    norm = self.model.norm
-                    st.arnq(d_part, residual, norm.weight, norm.variance_epsilon, out, None)
-                continue
-            mlp_out = reduce_conv(d_part, mlp_conv, mlp_coef)
             if i + 1 < len(layers):
-                h, residual = layers[i + 1].input_layernorm(mlp_out, residual)
-                xq, xs = fp8_buffers()
-                attn_coef = self.convs[i + 1][0].prepare_quant(h, xq, xs)
+                xq = torch.empty(M, H, dtype=torch.float8_e4m3fn, device=dev)
+                xs = torch.empty(M, dtype=torch.float32, device=dev)
+                ln = layers[i + 1].input_layernorm
+                st.arnq(d_part, residual, ln.weight, ln.variance_epsilon, xq, xs)
             else:
-                out, residual = self.model.norm(mlp_out, residual)
+                out = torch.empty(M, H, dtype=torch.bfloat16, device=dev)
+                norm = self.model.norm
+                st.arnq(d_part, residual, norm.weight, norm.variance_epsilon, out, None)
         return out

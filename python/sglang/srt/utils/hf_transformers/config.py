@@ -318,12 +318,7 @@ class HfModelConfigParser(ModelConfigParserBase):
 
 
 def _normalize_dflash2_attention_config(config, raw_config):
-    """Resolve native DFlash2 fields before HF-generated defaults become policy.
-
-    Qwen3 fills absent layer_types with full_attention and can discard a supplied
-    sliding_window when use_sliding_window is absent. Consult the raw export to
-    distinguish these defaults from explicitly requested attention semantics.
-    """
+    """Take layer types, window and causality from the raw DFlash2 config, not the HF defaults."""
     if "DFlash2DraftModel" not in (raw_config.get("architectures") or []):
         return
     draft = raw_config.get("dflash_config") or {}
@@ -343,7 +338,6 @@ def _normalize_dflash2_attention_config(config, raw_config):
             raise ValueError("DFlash2 sliding attention requires a positive integer window")
         config.sliding_window = window
         config.use_sliding_window = True
-    # DFlash block attention has always been bidirectional unless declared otherwise.
     config.is_causal = raw_config.get("is_causal", False)
 
 

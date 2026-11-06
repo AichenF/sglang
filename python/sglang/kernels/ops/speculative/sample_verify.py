@@ -6,9 +6,9 @@ all-gather of the logits, no host sync, no rank-0 broadcast), and writes `predic
 layout (accepted rows -> their candidate, first rejected row -> the bonus, later rows -> -1) so the greedy accept
 kernel turns it into accept_len / bonus / commit lengths unchanged. Greedy requests get the vocab-parallel argmax.
 
-Candidate-selector drafts (``enable_selector``): a sampled request's draft tokens were drawn from the selector's sparse
-q over SEL_K candidates per position. The kernel then accepts with coin * q(x) < p(x) and draws the bonus from
-max(p - q, 0), with the coins of the reference path (``draw_selector_coins``: the same two torch.rand calls).
+Candidate-selector drafts (``enable_selector``): the draft tokens come from a sparse q over SEL_K candidates per
+position; the kernel accepts with coin * q(x) < p(x), draws the bonus from max(p - q, 0) and uses the reference path's
+coins (``draw_selector_coins``).
 
 ``SampleVerifyState`` owns this rank's receive buffer and the peers' mapped addresses, the per-row call counters and the
 static per-request parameter buffers that a captured graph reads (``stage``). The kernel reads the receive-buffer
@@ -28,7 +28,7 @@ MAXG = 16
 NB = 256
 NKEY = 65536
 SEL_K = 16
-MAXREQ = MAXN // 2  # requests of a verify block of >= 2 rows
+MAXREQ = MAXN // 2
 _R1_SLOT = (3 + NB // 2 + SEL_K // 4) * 16
 _R2_SLOT = (NB // 2) * 16
 BUF_BYTES = 2 * MAXN * R * _R1_SLOT + 2 * MAXN * R * _R2_SLOT + 2 * MAXN * 16
@@ -158,8 +158,7 @@ class SampleVerifyState:
 
     # ---- candidate-selector drafts ----
     def enable_selector(self, gamma: int) -> None:
-        """Static buffers a captured graph reads: candidate ids / q [MAXREQ, gamma, SEL_K] and the coins (level coins
-        [MAXREQ, gamma], then the final coins [MAXREQ], in one buffer so one broadcast covers both)."""
+        """Candidate ids / q [MAXREQ, gamma, SEL_K]; coins: level [MAXREQ, gamma], then final [MAXREQ]."""
         self.sel_gamma = int(gamma)
         self.sel_ids = torch.zeros((MAXREQ, gamma, SEL_K), dtype=torch.int64, device=self.device)
         self.sel_q = torch.zeros((MAXREQ, gamma, SEL_K), dtype=torch.float32, device=self.device)
@@ -171,8 +170,7 @@ class SampleVerifyState:
         self.sel_q[:bs].copy_(q_rows)
 
     def draw_selector_coins(self, bs: int) -> torch.Tensor:
-        """The reference path's uniforms, drawn in its order and shapes: torch.rand((bs, gamma)) then torch.rand((bs,)).
-        Returns the whole coin buffer (for a TP broadcast)."""
+        """The reference accept's draws, in its order: torch.rand((bs, gamma)), torch.rand((bs,))."""
         g = self.sel_gamma
         torch.rand((bs, g), dtype=torch.float32, device=self.device, out=self.sel_coins[: bs * g].view(bs, g))
         torch.rand((bs,), dtype=torch.float32, device=self.device, out=self.sel_coins[MAXREQ * g : MAXREQ * g + bs])
@@ -190,17 +188,12 @@ class SampleVerifyState:
         stamps: Optional[torch.Tensor] = None,
         skip_greedy: bool = False,
         selector: bool = False,
-        sel_ids: Optional[torch.Tensor] = None,
-        sel_q: Optional[torch.Tensor] = None,
-        level_coins: Optional[torch.Tensor] = None,
-        final_coins: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """logits: this rank's [n, Vs] bf16 shard; cand: [n] int64 verify input ids (block-major). Returns predict
         [n] int64 (written into ``out`` or the state's static buffer). coins (tests): fp32 [n/G * G + n/G].
         skip_greedy: when every staged request is greedy the kernel returns at once and leaves ``out`` and the call
         counters untouched (the caller takes the greedy argmax from elsewhere).
-        selector: use the state's selector buffers (ids, q, coins); tests may pass sel_ids / sel_q [n/G, G - 1, SEL_K]
-        and level_coins [n/G, G - 1] / final_coins [n/G] instead."""
+        selector: use the staged selector ids, q and coins."""
         n = int(logits.shape[0])
         assert logits.ndim == 2 and int(logits.shape[1]) == self.local_vocab and logits.dtype == torch.bfloat16
         assert 1 <= n <= MAXN and n % group == 0 and 2 <= group <= MAXG
@@ -208,22 +201,15 @@ class SampleVerifyState:
         if out is None:
             out = self.out
         nb = n // group
-        coin_ptr = coin_ld = final_ptr = 0
+        coin_ptr = coin_ld = final_ptr = sel_ids = sel_q = 0
         if coins is not None:
             assert coins.dtype == torch.float32 and coins.is_contiguous() and coins.numel() >= nb * group + nb
             coin_ptr, coin_ld, final_ptr = coins.data_ptr(), group, coins.data_ptr() + nb * group * 4
         if selector:
-            assert self.sel_ids is not None and self.sel_gamma == group - 1
-            sel_ids, sel_q = self.sel_ids, self.sel_q
             g = self.sel_gamma
-            level_coins, final_coins = self.sel_coins[: MAXREQ * g].view(MAXREQ, g), self.sel_coins[MAXREQ * g :]
-        if level_coins is not None:
-            assert level_coins.dtype == torch.float32 and level_coins.stride(1) == 1 and final_coins.is_contiguous()
-            coin_ptr, coin_ld, final_ptr = level_coins.data_ptr(), level_coins.stride(0), final_coins.data_ptr()
-        if sel_ids is not None:
-            assert sel_ids.dtype == torch.int64 and sel_q.dtype == torch.float32
-            assert sel_ids.is_contiguous() and sel_q.is_contiguous() and sel_ids.shape == sel_q.shape
-            assert tuple(sel_ids.shape[1:]) == (group - 1, SEL_K) and int(sel_ids.shape[0]) >= nb
+            assert self.sel_ids is not None and g == group - 1
+            coin_ptr, coin_ld, final_ptr = self.sel_coins.data_ptr(), g, self.sel_coins.data_ptr() + MAXREQ * g * 4
+            sel_ids, sel_q = self.sel_ids.data_ptr(), self.sel_q.data_ptr()
         assert self.ready or (skip_greedy and all(p[0] == 0 for p in (self._staged_key or ()))), "receive buffer not allocated"
         _module(_pdl()).run(
             logits,
@@ -246,8 +232,8 @@ class SampleVerifyState:
             0 if dbg is None else dbg.data_ptr(),
             0 if stamps is None else stamps.data_ptr(),
             int(bool(skip_greedy)),
-            0 if sel_ids is None else sel_ids.data_ptr(),
-            0 if sel_q is None else sel_q.data_ptr(),
+            sel_ids,
+            sel_q,
         )
         return out[:n]
 

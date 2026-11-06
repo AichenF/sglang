@@ -13,6 +13,7 @@ from torch import nn
 
 from sglang.kernels.ops.speculative.dflash import (
     pack_candidates,
+    selector_lattice_triton,
     selector_walk_triton,
     unpack_candidate_ids,
 )
@@ -123,12 +124,14 @@ def candidate_topk(
     with_partition: bool = False,
     gatherer=None,
     ids_out: Optional[torch.Tensor] = None,
+    rows_only: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Global top-k candidates from the target head: hidden [N, H] -> ids / vals [N, K].
 
     Under TP (vocab-sharded lm_head): local top-k per shard, all-gather K logits/ids (not
     the full vocab), then a global top-k -- identical candidates at O(tp*K) instead of
     O(vocab) gather bandwidth. with_partition also returns the full-vocabulary lse [N] fp32.
+    rows_only returns the gathered [N, tp, 2, K] rows instead (packed gather only).
     """
     # The worker screens the head before capture, but the eager fallbacks attach
     # whatever the target has.
@@ -158,25 +161,18 @@ def candidate_topk(
         return ids.long(), vals, lse
     id_offset = int(lm_head.shard_indices.org_vocab_start_index)
     if gatherer is not None and lse is None and int(lm_head.org_vocab_size) <= (1 << 24):
-        # Same packed rows and gather layout as below, but the pack and the id
-        # unpack are one kernel each and the gather is a multimem copy of the same bits.
+        # one gather of fp32 [vals | ids] rows (ids < 2^24 are exact in fp32)
         rows = vals.shape[0]
         packed = pack_candidates(vals, ids, id_offset)
         gathered = gatherer(packed.view(torch.bfloat16)).view(torch.float32)
         gathered = gathered.view(rows, -1, 2, k)
+        if rows_only:
+            return gathered
         top_vals, sel = torch.topk(gathered[:, :, 0, :].reshape(rows, -1), k, dim=-1)
         return unpack_candidate_ids(gathered, sel, out=ids_out), top_vals, None
     global_ids = ids.long() + id_offset
-    if int(lm_head.org_vocab_size) <= (1 << 24):
-        # One all-gather of [vals | ids] instead of two; ids below 2^24 are exact in fp32.
-        lead = vals.shape[:-1]
-        packed = torch.cat((vals.float(), global_ids.float()), dim=-1)
-        gathered = tensor_model_parallel_all_gather(packed, dim=-1).view(*lead, -1, 2, k)
-        gathered_vals = gathered[..., 0, :].reshape(*lead, -1)
-        gathered_ids = gathered[..., 1, :].reshape(*lead, -1).long()
-    else:
-        gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
-        gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
+    gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
+    gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
     top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
     if lse is not None:
         lse = torch.logsumexp(
@@ -1274,8 +1270,7 @@ class CandidateSelector(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Walk one path, with q over the K candidates for the verify. greedy_mask
         rows take the argmax, selected rather than branched, so one captured graph
-        serves greedy and sampling batches alike. The CUDA walk writes into
-        tokens_out / q_out when given."""
+        serves greedy and sampling batches alike."""
         if scores.is_cuda:
             return selector_walk_triton(
                 candidate_ids=candidate_ids,
@@ -1345,8 +1340,7 @@ class DFlash2DraftModel(DFlashDraftModel):
         # The draft has no head of its own; the worker points this at the target's
         # before capture.
         self.lm_head: Optional[nn.Module] = None
-        # Set by the worker before capture: multimem gather of the TP candidate rows.
-        self.candidate_gatherer = None
+        self.candidate_gatherer = None  # set by the worker
 
     def _transform_unary_logits(self, logits: torch.Tensor) -> torch.Tensor:
         logits = logits.float()
@@ -1371,6 +1365,38 @@ class DFlash2DraftModel(DFlashDraftModel):
             ids_out=ids_out,
         )
         return ids, self._transform_unary_logits(vals)
+
+    def compute_lattice(self, hidden, anchor_token_ids, ids_out=None):
+        """compute_candidates + build_lattice in one kernel after the packed gather, else None."""
+        selector = self.candidate_selector
+        k = selector.top_k
+        if (
+            self.candidate_gatherer is None
+            or not hidden.is_cuda
+            or int(self.lm_head.org_vocab_size) > (1 << 24)
+            or self.draft_config.output_multiplier != 1.0
+            or self.draft_config.final_logit_softcapping is not None
+            or k > 32
+            or selector.successor_codebook.dtype != torch.bfloat16
+        ):
+            return None
+        bs, slots, _ = hidden.shape
+        flat = hidden.reshape(bs * slots, -1)
+        gathered = candidate_topk(
+            flat, self.lm_head, k, gatherer=self.candidate_gatherer, rows_only=True
+        )
+        if ids_out is None:
+            ids_out = torch.empty((bs * slots, k), dtype=torch.int64, device=hidden.device)
+        ids = ids_out.view(bs, slots, k)
+        scores = selector_lattice_triton(
+            gathered,
+            anchor_token_ids,
+            selector.hidden_projection(flat).view(bs, slots, -1),
+            selector.predecessor_codebook,
+            selector.successor_codebook,
+            ids,
+        )
+        return ids, scores
 
 
 class MuseGlimmerAssistantModel(DFlashDraftModel):

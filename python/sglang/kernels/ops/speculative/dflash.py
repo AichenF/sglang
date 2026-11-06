@@ -408,7 +408,6 @@ def selector_walk_triton(
     q_out=None,
 ):
     batch, slots, top_k = candidate_ids.shape
-    # tokens_out [batch, slots] int64 / q_out [batch, slots, top_k] fp32, contiguous.
     tokens = (
         tokens_out
         if tokens_out is not None
@@ -447,11 +446,7 @@ def _pack_candidates_kernel(vals_ptr, ids_ptr, out_ptr, id_offset, K: tl.constex
 
 
 def pack_candidates(vals: torch.Tensor, ids: torch.Tensor, id_offset: int) -> torch.Tensor:
-    """[N, K] values and shard-local ids -> [N, 2K] fp32 rows of [values | ids + offset].
-
-    Same bits as torch.cat((vals.float(), (ids.long() + offset).float()), -1);
-    ids stay exact while id + offset < 2**24.
-    """
+    """[N, K] values and shard ids -> [N, 2K] fp32 rows [values | ids + id_offset]."""
     rows, k = vals.shape
     out = torch.empty((rows, 2 * k), dtype=torch.float32, device=vals.device)
     if rows:
@@ -475,11 +470,7 @@ def _unpack_candidate_ids_kernel(
 def unpack_candidate_ids(
     gathered: torch.Tensor, sel: torch.Tensor, out: torch.Tensor = None
 ) -> torch.Tensor:
-    """gathered [N, ranks, 2, K] fp32 rows of [values | ids], sel [N, K] indices into the
-    flattened [ranks * K] values -> ids [N, K] int64 (out, if given, must be contiguous).
-
-    Same values as torch.gather(gathered[..., 1, :].reshape(N, -1).long(), -1, sel).
-    """
+    """gathered [N, ranks, 2, K] rows [values | ids], sel [N, K] into the ranks * K values -> ids [N, K] int64."""
     rows, ranks, _, k = gathered.shape
     if out is None:
         out = torch.empty((rows, k), dtype=torch.int64, device=gathered.device)
@@ -488,3 +479,126 @@ def unpack_candidate_ids(
             gathered, sel.contiguous(), out, RANKS=ranks, K=k, num_warps=1
         )
     return out
+
+
+@triton.jit
+def _bitonic_step(k, i, v, slot, AXIS: tl.constexpr, SIZE: tl.constexpr, LOG_S: tl.constexpr):
+    # compare-exchange with slot ^ stride, the pair lies along AXIS
+    pk = k ^ tl.xor_sum(k, AXIS, keep_dims=True)
+    pi = i ^ tl.xor_sum(i, AXIS, keep_dims=True)
+    pv = v ^ tl.xor_sum(v, AXIS, keep_dims=True)
+    low = (slot & (1 << (LOG_S - AXIS))) == 0
+    ka = tl.where(low, k, pk).to(tl.float32, bitcast=True)
+    kb = tl.where(low, pk, k).to(tl.float32, bitcast=True)
+    va = tl.where(low, v, pv) != 0
+    vb = tl.where(low, pv, v) != 0
+    swap = ((((ka != ka) & (kb == kb)) | (ka > kb)) & va) | (~vb)
+    if SIZE < (1 << LOG_S):
+        up = (slot & SIZE) != 0
+    else:
+        up = slot < 0
+    x = swap == up
+    return tl.where(x, pk, k), tl.where(x, pi, i), tl.where(x, pv, v)
+
+
+@triton.jit
+def _gathered_topk(g_ptr, rows, R: tl.constexpr, K: tl.constexpr, LOG_S: tl.constexpr):
+    # torch.topk of two gathered rows with its tie order: values above the K-th, then
+    # values equal to it, each in index order, then torch's 2**LOG_S-slot bitonic sort
+    N: tl.constexpr = R * K
+    S: tl.constexpr = 1 << LOG_S
+    offs = tl.arange(0, N)[None, :]
+    base = rows[:, None] * N * 2
+    bits = tl.load(g_ptr + base + (offs // K) * 2 * K + offs % K).to(tl.uint32, bitcast=True)
+    vals = bits.to(tl.float32, bitcast=True)
+    flip = tl.where((bits >> 31) != 0, 0xFFFFFFFF, 0x80000000)
+    key = tl.where(vals != vals, 0xFFFFFFFF, bits ^ flip).to(tl.uint32)
+    kth = tl.max(tl.where(offs == K - 1, tl.sort(key, dim=1, descending=True), 0), axis=1)
+    above = key > kth[:, None]
+    tie = key == kth[:, None]
+    pos = tl.where(
+        above,
+        tl.cumsum(above.to(tl.int32), axis=1) - 1,
+        tl.sum(above.to(tl.int32), axis=1)[:, None] + tl.cumsum(tie.to(tl.int32), axis=1) - 1,
+    )
+    pos = tl.where(above | tie, pos, K)
+    at = pos[:, None, :] == tl.arange(0, K)[None, :, None]
+    k = tl.sum(tl.where(at, bits.to(tl.int32, bitcast=True)[:, None, :], 0), axis=2)
+    i = tl.sum(tl.where(at, offs[:, None, :], 0), axis=2)
+    # slots K.. are empty (key 0, invalid)
+    shape: tl.constexpr = [2] + [2] * LOG_S
+    zero = tl.zeros((2, S - K), tl.int32)
+    k = tl.reshape(tl.join(k, zero).permute(0, 2, 1), shape)
+    i = tl.reshape(tl.join(i, zero).permute(0, 2, 1), shape)
+    v = tl.reshape(tl.join(zero + 1, zero).permute(0, 2, 1), shape)
+    slot = tl.reshape(tl.arange(0, 2 * S) % S, shape)
+    for stage in tl.static_range(LOG_S):
+        for sub in tl.static_range(stage + 1):
+            k, i, v = _bitonic_step(k, i, v, slot, LOG_S - stage + sub, 2 << stage, LOG_S)
+    first = tl.arange(0, S // K)[None, :, None] == 0
+    k = tl.sum(tl.where(first, tl.reshape(k, [2, S // K, K]), 0), axis=1)
+    i = tl.sum(tl.where(first, tl.reshape(i, [2, S // K, K]), 0), axis=1)
+    ids = tl.load(g_ptr + rows[:, None] * N * 2 + (i // K) * 2 * K + K + i % K).to(tl.int64)
+    return k, ids
+
+
+@triton.jit
+def _selector_lattice_kernel(
+    g_ptr,
+    anchor_ptr,
+    anchor_stride,
+    hidden_ptr,
+    pred_ptr,
+    succ_ptr,
+    ids_ptr,
+    scores_ptr,
+    SLOTS: tl.constexpr,
+    R: tl.constexpr,
+    K: tl.constexpr,
+    LOG_S: tl.constexpr,
+    RANK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.arange(0, K)
+    # this slot's candidates and the previous slot's (the anchor for slot 0)
+    two = tl.arange(0, 2)
+    k, ids = _gathered_topk(g_ptr, tl.maximum(row - two, 0), R, K, LOG_S)
+    own = two[:, None] == 0
+    vals = tl.sum(tl.where(own, k, 0), axis=0).to(tl.float32, bitcast=True)
+    pred = tl.sum(tl.where(own, 0, ids), axis=0)
+    ids = tl.sum(tl.where(own, ids, 0), axis=0)
+    tl.store(ids_ptr + row * K + cols, ids)
+    pred = tl.where(row % SLOTS == 0, tl.load(anchor_ptr + (row // SLOTS) * anchor_stride), pred)
+    r = tl.arange(0, RANK)
+    h = tl.load(hidden_ptr + row * RANK + r).to(tl.float32)
+    a = tl.load(pred_ptr + pred[:, None] * RANK + r[None, :]).to(tl.float32)
+    b = tl.load(succ_ptr + ids[:, None] * RANK + r[None, :])
+    dots = tl.dot((a * h[None, :]).to(tl.bfloat16), tl.trans(b))
+    scores = vals[None, :] + dots.to(tl.bfloat16).to(tl.float32)
+    tl.store(scores_ptr + (row * K + cols[:, None]) * K + cols[None, :], scores)
+
+
+def selector_lattice_triton(
+    gathered, anchor_ids, hidden, predecessor_table, successor_table, ids_out
+):
+    """torch.topk of the gathered [bs * slots, ranks, 2, K] rows + build_lattice -> ids_out, scores [bs, slots, K, K]."""
+    rows, ranks, _, k = gathered.shape
+    bs, slots, rank = hidden.shape
+    scores = torch.empty((bs, slots, k, k), dtype=torch.float32, device=hidden.device)
+    _selector_lattice_kernel[(rows,)](
+        gathered,
+        anchor_ids,
+        anchor_ids.stride(0),
+        hidden,
+        predecessor_table,
+        successor_table,
+        ids_out,
+        scores,
+        SLOTS=slots,
+        R=ranks,
+        K=k,
+        LOG_S=5,
+        RANK=rank,
+        num_warps=2,
+    )
+    return scores

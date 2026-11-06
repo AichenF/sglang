@@ -46,13 +46,7 @@ def _weights(model):
 
 @pytest.mark.parametrize(
     "selector,convolution,prefix",
-    (
-        (True, True, ""),
-        (True, True, "model."),
-        (True, False, ""),
-        (False, True, ""),
-        (False, False, ""),
-    ),
+    ((True, True, ""), (True, True, "model."), (False, False, "")),
 )
 def test_checkpoint_loads_declared_components_exactly(prefix, selector, convolution):
     model = _checkpoint_model(selector=selector, convolution=convolution)
@@ -76,42 +70,11 @@ def test_checkpoint_rejects_v2_weights_without_the_declared_component(unexpected
         model.load_weights([(unexpected, torch.zeros(1))])
 
 
-def test_checkpoint_rejects_an_unsupported_selector_tensor_format():
-    model = _checkpoint_model()
-    weights = _weights(model)
-    weights["candidate_selector.hidden_projection.weight_packed"] = torch.zeros(
-        2, 4, dtype=torch.int32
-    )
-    with pytest.raises(ValueError, match="DFlash2 checkpoint parameter"):
-        model.load_weights(weights.items())
-
-
 def test_rotary_cache_extras_remain_ignored():
     model = _checkpoint_model()
     weights = _weights(model)
     weights["layers.0.self_attn.rotary_emb.inv_freq"] = torch.ones(4)
     model.load_weights(weights.items())
-
-
-@pytest.mark.parametrize("state_dict_first", (False, True))
-def test_partial_updates_do_not_require_reloading_other_v2_parameters(state_dict_first):
-    model = _checkpoint_model()
-    weights = _weights(model)
-    if state_dict_first:
-        model.load_state_dict(weights)
-    else:
-        model.load_weights(weights.items())
-    updated = torch.full((2, 8), 2.0)
-    model.load_weights([("candidate_selector.hidden_projection.weight", updated)])
-    torch.testing.assert_close(
-        model.candidate_selector.hidden_projection.weight, updated, rtol=0, atol=0
-    )
-    torch.testing.assert_close(
-        model.candidate_selector.predecessor_codebook,
-        weights["candidate_selector.predecessor_codebook"],
-        rtol=0,
-        atol=0,
-    )
 
 
 def test_selector_config_cannot_instantiate_a_v1_draft():

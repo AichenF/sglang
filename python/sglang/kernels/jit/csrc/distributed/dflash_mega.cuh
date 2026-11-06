@@ -100,18 +100,13 @@ constexpr int SMEM_BYTES = 232448;
 constexpr float FP8_MAX = 448.f;
 enum { PH_QKV = 0, PH_O = 1, PH_GU = 2, PH_DN = 3, PH_CA = 4, PH_CM = 5 };
 constexpr int NPH = 6;
-// per-layer GEMM order; PH_CA / PH_CM are the convolution coefficient projections (no tiles without convolution)
+// PH_CA / PH_CM: convolution coefficient projections, run by the all-reduce token CTAs
 __device__ constexpr int PH_ORDER[NPH] = {PH_CA, PH_QKV, PH_O, PH_CM, PH_GU, PH_DN};
-constexpr int CF_N = 1536;   // coefficient rows: input side (768), then output side [tap][group] (768)
-constexpr int CF_G = H / 16;   // 384 groups of 16 channels
-// The coefficient projection (BF16, as the reference nn.Linear) runs split-K over the TP ranks inside the all-reduce
-// token CTAs: rank r multiplies its 768-column slice of the normalized rows of all 32 tokens by W[:, slice r]
-// (24 64-row tiles, one per token CTA, 12 units of 128 bytes), the fp32 partials of every rank are exchanged and summed
-// in rank order, then rounded to BF16 once.
-constexpr int CF_TILES = CF_N / 64;  // 24
+constexpr int CF_N = 1536;  // coefficient rows [input, output][tap][group]
+constexpr int CF_G = H / 16;
+constexpr int CF_TILES = CF_N / 64;
 constexpr int CF_NU = 12;
-// C_Y: normalized sublayer input (hn) written, one arrival per token CTA
-enum { C_LAUNCH = 0, C_X = 1, C_ATT = 2, C_ACT = 3, C_CF = 5, C_Y = 6, C_QKV = 8, C_N = 64 };
+enum { C_LAUNCH = 0, C_X = 1, C_ATT = 2, C_ACT = 3, C_Y = 6, C_QKV = 8, C_N = 64 };
 
 // smem layout (bytes from the 1024-aligned dynamic base)
 constexpr int MISC_BYTES = 2048;
@@ -133,15 +128,14 @@ constexpr int64_t AG_OFF = RS_OFF + RS_BYTES + ST_BYTES;
 constexpr int64_t AG_BYTES = 2LL * MT * R * AG_SLOT;
 constexpr int64_t AX_BYTES = 2LL * MT * R * 16;
 constexpr int64_t EM_BYTES = 2LL * MT * H * 2;
-// convolution drafts, after dflash_tp_fused's regions: the coefficient partials of each rank's 48 channel groups
-// [2 parity][MT token][R source][CS_N] fp32, then the convolved BF16 slices [2 parity][MT token][R source][SL]
-constexpr int CS_N = 4 * (CF_G / R);  // 192 coefficients per rank: [input, output][tap][48 groups]
+// convolution drafts: coefficient partials [2][MT][R][CS_N] fp32, then convolved slices [2][MT][R][SL] bf16
+constexpr int CS_N = 4 * (CF_G / R);
 constexpr int64_t CP_OFF = AG_OFF + AG_BYTES + AX_BYTES + EM_BYTES;
 constexpr int64_t GX_OFF = CP_OFF + 2LL * MT * R * CS_N * 4;
 
 struct LayerP {
-  const float* sw[NPH];           // per-channel weight scales: qkv [2304], o [6144], gate_up [4096], down [6144], ca / cm [1536]
-  const __nv_bfloat16* cbase[2][2];  // convolution static kernels [attention, mlp][input, output] -> bf16 [2 taps][H]
+  const float* sw[4];             // per-channel weight scales: qkv [2304], o [6144], gate_up [4096], down [6144]
+  const __nv_bfloat16* cbase[2][2];  // convolution base kernels [attention, mlp][input, output] -> [2 taps][H]
   const __nv_bfloat16* ln_in;     // input_layernorm [H]
   const __nv_bfloat16* ln_post;   // post_attention_layernorm [H]
   const __nv_bfloat16* qn;        // q_norm [128]
@@ -152,8 +146,8 @@ struct LayerP {
 };
 
 struct Plan {
-  int16_t tile[NPH][NCL][2][MAXT_PH];  // [phase][cluster][k-group][i]: global 64-row tile ids
-  int16_t n[NPH][NCL][2];
+  int16_t tile[4][NCL][2][MAXT_PH];  // [phase][cluster][k-group][i]: global 64-row tile ids
+  int16_t n[4][NCL][2];
   int16_t nslot[NCL];
 };
 
@@ -182,11 +176,8 @@ struct Params {
   unsigned* cnt;            // [C_N]
   int* calls;               // [MT] tp_arnq per-token call counters
   uint8_t* peer[R];
-  __nv_bfloat16* hn;        // [2 * NL][MT][H] normed sublayer inputs (convolution only)
+  __nv_bfloat16* hn;        // [2 * NL][MT][H] normalized sublayer inputs (convolution)
   __nv_bfloat16* coef;      // [2 * NL][MT][CF_N] convolution coefficients
-  __nv_bfloat16* xconv;     // optional diagnostics [2 (before, after)][2 * NL][MT][H]: the owned slice around the
-                            // output convolution of every all-reduce
-  unsigned* amaxc;          // unused
   int conv;
   int rank;
   int nl;                   // layers run (5; fewer only in tests -- the epoch counters are padded at the end)
@@ -305,11 +296,6 @@ DEV void wait_ge(const unsigned* p, unsigned target) {
 DEV float ldcg_bf(const __nv_bfloat16* p) {
   return __uint_as_float(static_cast<uint32_t>(__ldcg(reinterpret_cast<const unsigned short*>(p))) << 16);
 }
-DEV unsigned ld_vol_u32(const unsigned* p) {
-  unsigned v;
-  asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
-  return v;
-}
 DEV uint4 ldcg_v4(const void* p) {
   uint4 v;
   asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
@@ -353,7 +339,7 @@ DEV uint32_t pack_bf2(float lo, float hi) {
   return *reinterpret_cast<const uint32_t*>(&v);
 }
 DEV float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
-// 1 / per-token fp8 scale as the reference per-token quant computes it (sm_90 fast-math build: rcp.approx.ftz)
+// the reference per-token quant multiplies by rcp.approx.ftz(scale)
 DEV float rcp_scale(float sc) {
   float r;
   asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(sc));
@@ -472,7 +458,6 @@ DEV bool uit_settle(const Params& p, int c, int rank, UIt& it) {
   while (it.l < p.nl) {
     it.ph = PH_ORDER[it.oi];
     if (it.ph == PH_CA || it.ph == PH_CM) {
-      // token CTA ai takes coefficient tile ai over this rank's K slice
       const int ai = (c - AR0) * CS + rank;
       it.nt = (p.conv && c >= AR0 && c < AR0 + 4 && ai < CF_TILES) ? 1 : 0;
       it.cft = ai;
@@ -480,7 +465,7 @@ DEV bool uit_settle(const Params& p, int c, int rank, UIt& it) {
       it.ks = p.rank;
       it.tl = nullptr;
     } else {
-      const bool s8 = (it.ph != PH_O && it.ph != PH_DN);
+      const bool s8 = (it.ph == PH_QKV || it.ph == PH_GU);
       const int g = s8 ? 0 : (rank >> 2);
       it.nu = s8 ? 6 : 4;
       it.ks = s8 ? rank : (rank & 3);
@@ -523,7 +508,7 @@ DEV void uit_issue(const Params& p, const UIt& it, bool pf, uint8_t* dst, uint64
   const bool cf = (it.ph == PH_CA || it.ph == PH_CM);
   const int t0 = cf ? it.cft : it.tl[2 * it.sl];
   const int t1 = (!cf && 2 * it.sl + 1 < it.nt) ? it.tl[2 * it.sl + 1] : -1;
-  const int kc = (it.ks * it.nu + it.u) * ((it.ph == PH_CA || it.ph == PH_CM) ? 64 : 128);  // elements
+  const int kc = (it.ks * it.nu + it.u) * (cf ? 64 : 128);  // elements
 #pragma unroll
   for (int w = 0; w < 2; ++w) {
     const int t = w ? t1 : t0;
@@ -672,24 +657,17 @@ DEV void cf_load_x(const Params& p, uint8_t* X, int e, int src, int hf, int ctid
   }
 }
 
-// Convolution tail of a token CTA once the normalized input hn[e][t] of sublayer e is written (convolution drafts):
-// 1. token CTAs 0..23 each multiply this rank's K slice of hn[e] (all 32 tokens) by one 64-row tile of the coefficient
-//    projection (BF16, fp32 accumulate) and push the fp32 partial columns to every rank;
-// 2. every token CTA sums the 8 rank partials of its token in rank order and rounds once to BF16 (input-side
-//    coefficients for its convolution, output-side ones for the output convolution of this sublayer);
-// 3. it convolves its full row (row t - 1 of the block from hn), takes the per-token amax and quantizes the result the
-//    way the reference per-token quant does, into the x buffer of event e, then releases C_X.
+// After hn[e] is written: split-K coefficient projection over the ranks (one 64-row tile per token CTA), rank-ordered
+// sum of the fp32 partials with one BF16 rounding, input convolution of the owned slice, slice all-gather, then the
+// per-token fp8 quant into the x buffer of event e.
 DEV void conv_tail(const Params& p, Smem& s, int t, int e, int ctid, unsigned E, int& cslot, uint32_t& cpar) {
   const int lane = ctid & 31, warp = ctid >> 5, wg = ctid >> 7, ww = (ctid >> 5) & 3;
   const int ai = (static_cast<int>(cluster_id_x()) - AR0) * CS + static_cast<int>(cluster_rank());
   const unsigned ytgt = (E * 10u + static_cast<unsigned>(e) + 1u) * 32u;
-  const int sl0 = 90 + 10 * (e & 1);  // detailed stamps (layer STAMP_L)
-  if (ctid == 0) dstamp(p, e >> 1, sl0);
   if (ctid == 0) red_release(p.cnt + C_Y, 1u);
   float* stage = reinterpret_cast<float*>(s.greg + XREG);  // [MT][64] fp32 partial of this CTA's tile
   if (ctid == 0) wait_ge(p.cnt + C_Y, ytgt);
   bar_sync(1, NCT);
-  if (ctid == 0) dstamp(p, e >> 1, sl0 + 1);
   if (ai < CF_TILES) {
     uint8_t* X = s.greg;
     cf_load_x(p, X, e, p.rank, 0, ctid);
@@ -716,7 +694,6 @@ DEV void conv_tail(const Params& p, Smem& s, int t, int e, int ctid, unsigned E,
       }
       mbar_wait(&s.full[slot], par);
       {
-        // both warpgroups issue (a predicated wgmma serializes); the second half of the slab is unused
         const uint64_t da = make_desc(s.ring + slot * SLAB + wg * TILEB);
         const uint64_t db = make_desc(X + (u >= 6 ? u - 6 : u) * XU);
         wgmma_fence();
@@ -734,7 +711,6 @@ DEV void conv_tail(const Params& p, Smem& s, int t, int e, int ctid, unsigned E,
     wgmma_wait<0>();
     __syncwarp();
     if (lane == 0) mbar_arrive(&s.empty[prev]);
-    if (ctid == 0) dstamp(p, e >> 1, sl0 + 2);
     if (wg == 0) {
 #pragma unroll
       for (int r = 0; r < 16; ++r) {
@@ -744,7 +720,7 @@ DEV void conv_tail(const Params& p, Smem& s, int t, int e, int ctid, unsigned E,
       }
     }
     bar_sync(1, NCT);
-    // reduce-scatter push: each coefficient row goes to the rank owning its 48 groups (Lamport-marked words)
+    // push each coefficient row to the rank that owns its groups
     for (int i = ctid; i < MT * 64; i += NCT) {
       const int tok = i >> 6, rho = i & 63;
       const int j = ai * 64 + rho, side = j / (CF_N / 2), rem = j % (CF_N / 2), tap = rem / CF_G, g = rem % CF_G;
@@ -754,14 +730,13 @@ DEV void conv_tail(const Params& p, Smem& s, int t, int e, int ctid, unsigned E,
           p.peer[q] + CP_OFF + (((static_cast<int64_t>(ph) * MT + tok) * R + p.rank) * CS_N + li) * 4);
       asm volatile("st.global.u32 [%0], %1;" ::"l"(dst), "r"(nz(__float_as_uint(stage[tok * 64 + rho]))) : "memory");
     }
-    if (ctid == 0) dstamp(p, e >> 1, sl0 + 3);
   }
   bar_sync(1, NCT);  // the tile GEMM's X / stage regions are reused below
   float* rcv = reinterpret_cast<float*>(s.greg);                       // [R][CS_N] this token's partials
   float* coef = reinterpret_cast<float*>(s.greg + R * CS_N * 4);       // [CS_N] this rank's coefficients
   __nv_bfloat16* xrow = reinterpret_cast<__nv_bfloat16*>(s.greg + 8192);  // [H] convolved row
   const int ph = (s.calls0[t] + e) & 1;
-  // ---- this rank's coefficients of token t: rank-ordered sum of the 8 partials, one BF16 rounding ----
+  // ---- coefficients of token t: rank-ordered sum, one BF16 rounding ----
   {
     uint8_t* base = p.peer[p.rank] + CP_OFF + (static_cast<int64_t>(ph) * MT + t) * R * CS_N * 4;
     constexpr int NV = R * CS_N / 4;  // 384 16-byte words
@@ -783,7 +758,6 @@ DEV void conv_tail(const Params& p, Smem& s, int t, int e, int ctid, unsigned E,
         }
       }
     } while (!done);
-    if (ctid == 0) dstamp(p, e >> 1, sl0 + 4);
 #pragma unroll
     for (int j = 0; j < 2; ++j) {
       if (!have[j]) continue;
@@ -803,7 +777,7 @@ DEV void conv_tail(const Params& p, Smem& s, int t, int e, int ctid, unsigned E,
         __float2bfloat16_rn(cb);
   }
   bar_sync(1, NCT);
-  // ---- input convolution of this rank's slice (fp32, BF16 output), all-gathered with the other ranks' slices ----
+  // ---- input convolution of the owned slice, then all-gather ----
   const int pos = t & (BLK - 1);
   if (ctid < SL / 8) {
     const int c0 = p.rank * SL + ctid * 8, gl = ctid >> 1;
@@ -889,8 +863,6 @@ DEV void conv_tail(const Params& p, Smem& s, int t, int e, int ctid, unsigned E,
   float am = 0.f;
 #pragma unroll
   for (int w = 0; w < NCT / 32; ++w) am = fmaxf(am, s.red[8 + w]);
-  // the reference per-token quant: scale = amax * (1 / 448) (its fast-math build multiplies by the reciprocal),
-  // zero rows -> scale 0 and a zero reciprocal
   const float scale = am * (1.f / FP8_MAX);
   const float inv = scale != 0.f ? rcp_scale(scale) : 0.f;
   uint8_t* qrow = p.xq + (static_cast<int64_t>(e & 1) * MT + t) * H;
@@ -909,7 +881,6 @@ DEV void conv_tail(const Params& p, Smem& s, int t, int e, int ctid, unsigned E,
   }
   if (ctid == 0) p.xs[(e & 1) * MT + t] = scale;
   bar_sync(1, NCT);
-  if (ctid == 0) dstamp(p, e >> 1, sl0 + 5);
   if (ctid == 0) red_release(p.cnt + C_X, 1u);
 }
 
@@ -957,8 +928,7 @@ DEV void allreduce(const Params& p, Smem& s, int t, int kar, int ctid, unsigned 
     *reinterpret_cast<uint2*>(s_h + rank * SL + col) = hb;
   }
   if (p.conv) {
-    // output convolution on the reduced BF16 rows, before the residual add (the reference order); row t - 1 of the
-    // block is reduced by the previous CTA of this cluster, which publishes its slice in `own`
+    // output convolution before the residual add; row t - 1 comes from the previous CTA of the cluster
     const int pos = t & (BLK - 1);
     const uint32_t crank = cluster_rank();
     __nv_bfloat16* own = reinterpret_cast<__nv_bfloat16*>(s.greg + H * 4 + H * 2);
@@ -986,11 +956,6 @@ DEV void allreduce(const Params& p, Smem& s, int t, int kar, int ctid, unsigned 
         lo += (bf_lo(s1w[j]) + d1) * bf_lo(pw[j]);
         hi += (bf_hi(s1w[j]) + d1) * bf_hi(pw[j]);
         o[j] = pack_bf2(lo, hi);
-      }
-      if (p.xconv) {
-        __nv_bfloat16* d0p = p.xconv + (static_cast<int64_t>(kar) * MT + t) * H + c0;
-        *reinterpret_cast<uint2*>(d0p) = hb;
-        *reinterpret_cast<uint2*>(d0p + static_cast<int64_t>(2 * NL) * MT * H) = make_uint2(o[0], o[1]);
       }
       hb = make_uint2(o[0], o[1]);
       *reinterpret_cast<uint2*>(s_h + rank * SL + col) = hb;
@@ -1244,8 +1209,7 @@ DEV void phase0(const Params& p, Smem& s, int t, int ctid, unsigned E, int& cslo
 template <int PH>
 DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsigned E, int& cslot, uint32_t& cpar, int& gph,
                int& xph) {
-  static_assert(PH != PH_CA && PH != PH_CM, "the coefficient projections run in the all-reduce token CTAs");
-  constexpr bool S8 = (PH != PH_O && PH != PH_DN);
+  constexpr bool S8 = (PH == PH_QKV || PH == PH_GU);
   constexpr int NU = S8 ? 6 : 4;
   constexpr int NS = S8 ? 8 : 4;
   constexpr int ROWS = S8 ? 8 : 16;
@@ -1275,8 +1239,7 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
   }
   // ---- X operand ----
   if constexpr (S8) {
-    const int e = 2 * l + ((PH == PH_GU || PH == PH_CM) ? 1 : 0);
-    {
+    const int e = 2 * l + (PH == PH_GU ? 1 : 0);
     const unsigned tgt = (E * 11u + static_cast<unsigned>(e) + 1u) * 32u;
     if (ctid < 32) {
       if (ctid == 0) wait_ge(p.cnt + C_X, tgt);
@@ -1296,7 +1259,6 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
     mbar_wait(s.xbar, xph & 1);
     ++xph;
     if (ctid == 0) dstamp(p, l, 40 + PH * 4);
-    }
   } else {
     const unsigned tgt = (E * 5u + static_cast<unsigned>(l) + 1u) * (PH == PH_O ? 64u : static_cast<unsigned>(GRID));
     if (ctid < 32) {
@@ -2052,16 +2014,16 @@ struct DFlashMega {
   }
 
   // blob: host uint8 [sizeof(Params)]; ptrs: host int64 (layout below); ivals: host int64; fvals: host float32;
-  // plan: host int16 [NPH*NCL*2*MAXT_PH + NPH*NCL*2 + NCL]
+  // plan: host int16 [4*NCL*2*MAXT_PH + 4*NCL*2 + NCL]
   static void fill(tvm::ffi::TensorView blob, tvm::ffi::TensorView ptrs, tvm::ffi::TensorView ivals,
                    tvm::ffi::TensorView fvals, tvm::ffi::TensorView plan) {
     using namespace host;
     using namespace dflash_mega;
     RuntimeCheck(blob.numel() >= static_cast<int64_t>(sizeof(Params)));
-    constexpr int NPL = NPH + 11;
-    RuntimeCheck(ptrs.numel() == NL * NPL + 16 + R, "dflash_mega: pointer table size");
+    constexpr int NPL = 15;
+    RuntimeCheck(ptrs.numel() == NL * NPL + 14 + R, "dflash_mega: pointer table size");
     RuntimeCheck(ivals.numel() == 8 && fvals.numel() == 4);
-    RuntimeCheck(plan.numel() == NPH * NCL * 2 * MAXT_PH + NPH * NCL * 2 + NCL);
+    RuntimeCheck(plan.numel() == 4 * NCL * 2 * MAXT_PH + 4 * NCL * 2 + NCL);
     const int64_t* pp = static_cast<const int64_t*>(ptrs.data_ptr());
     const int64_t* iv = static_cast<const int64_t*>(ivals.data_ptr());
     const float* fv = static_cast<const float*>(fvals.data_ptr());
@@ -2069,8 +2031,8 @@ struct DFlashMega {
     std::memset(&prm, 0, sizeof(prm));
     for (int l = 0; l < NL; ++l) {
       const int64_t* q = pp + l * NPL;
-      for (int ph = 0; ph < NPH; ++ph) prm.L[l].sw[ph] = reinterpret_cast<const float*>(q[ph]);
-      q += NPH;
+      for (int ph = 0; ph < 4; ++ph) prm.L[l].sw[ph] = reinterpret_cast<const float*>(q[ph]);
+      q += 4;
       prm.L[l].ln_in = reinterpret_cast<const __nv_bfloat16*>(q[0]);
       prm.L[l].ln_post = reinterpret_cast<const __nv_bfloat16*>(q[1]);
       prm.L[l].qn = reinterpret_cast<const __nv_bfloat16*>(q[2]);
@@ -2095,9 +2057,7 @@ struct DFlashMega {
     prm.stamps = reinterpret_cast<unsigned long long*>(q[11]);
     prm.hn = reinterpret_cast<__nv_bfloat16*>(q[12]);
     prm.coef = reinterpret_cast<__nv_bfloat16*>(q[13]);
-    prm.xconv = reinterpret_cast<__nv_bfloat16*>(q[14]);
-    prm.amaxc = reinterpret_cast<unsigned*>(q[15]);
-    for (int i = 0; i < R; ++i) prm.peer[i] = reinterpret_cast<uint8_t*>(q[16 + i]);
+    for (int i = 0; i < R; ++i) prm.peer[i] = reinterpret_cast<uint8_t*>(q[14 + i]);
     prm.rank = static_cast<int>(iv[0]);
     prm.cs_stride = iv[1];
     prm.cs_f32 = static_cast<int>(iv[2]);
@@ -2114,15 +2074,15 @@ struct DFlashMega {
     prm.sm_scale = fv[3];
     const int16_t* pl = static_cast<const int16_t*>(plan.data_ptr());
     std::memcpy(prm.plan.tile, pl, sizeof(prm.plan.tile));
-    std::memcpy(prm.plan.n, pl + NPH * NCL * 2 * MAXT_PH, sizeof(prm.plan.n));
-    std::memcpy(prm.plan.nslot, pl + NPH * NCL * 2 * MAXT_PH + NPH * NCL * 2, sizeof(prm.plan.nslot));
+    std::memcpy(prm.plan.n, pl + 4 * NCL * 2 * MAXT_PH, sizeof(prm.plan.n));
+    std::memcpy(prm.plan.nslot, pl + 4 * NCL * 2 * MAXT_PH + 4 * NCL * 2, sizeof(prm.plan.nslot));
     for (int cc = 0; cc < NCL; ++cc) {
       const int ns = prm.plan.nslot[cc];
       const int greg = cc < NATT ? GREG_ATT : GREG_FULL;
       const int kv = cc < NATT ? KV_BYTES : 0;
       RuntimeCheck(ns >= 2 && ns <= MAX_SLOT && MISC_BYTES + ns * SLAB + greg + kv <= SMEM_BYTES,
                    "dflash_mega: ring does not fit");
-      for (int ph = 0; ph < NPH; ++ph)
+      for (int ph = 0; ph < 4; ++ph)
         for (int g = 0; g < 2; ++g) {
           const int n = prm.plan.n[ph][cc][g];
           RuntimeCheck(n >= 0 && n <= MAXT_PH && (cc >= NATT || n <= 4), "dflash_mega: plan tile count");

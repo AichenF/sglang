@@ -66,7 +66,7 @@ struct Params {
   const __nv_bfloat16* gamma;     // [H]
   uint8_t* out_q;                 // mode 0: [M, H] e4m3
   float* out_scale;               // mode 0: [M]
-  __nv_bfloat16* out_bf16;        // mode 1: normalized [M, H]; mode 3: raw BF16 TP sum
+  __nv_bfloat16* out_bf16;        // mode 1: [M, H]
   int* calls;                     // [MAXT] per-token call counters (local)
   uint8_t* peer[R];               // every rank's receive buffer (this rank's own at [rank])
   float eps;
@@ -140,8 +140,7 @@ __device__ __forceinline__ uint16_t pack_e4m3x2(float lo, float hi) {
   return r;
 }
 
-// kMode 0: per-token fp8 (+ scale [M]); 1: bf16; 2: per-token-group-128 fp8 in the DeepGEMM pre-quantized layout;
-// 3: the gathered BF16 TP sum, without residual addition, normalization or quantization.
+// kMode 0: per-token fp8 (+ scale [M]); 1: bf16; 2: per-token-group-128 fp8 in the DeepGEMM pre-quantized layout.
 // The all-reduce result h = bf16(sum of the partials in rank order) is bitwise the custom all-reduce's; every rank then
 // gets the full h row and computes x = f32(h) + f32(residual) (unrounded), residual_out = bf16(x) and flashinfer
 // FusedAddRMSNormKernel's exact arithmetic (64 virtual threads, ordered fma chains over columns 512 v + 8 t' + e, warp
@@ -172,21 +171,18 @@ __global__ void __launch_bounds__(THREADS) tp_arnq_kernel(const __grid_constant_
   ARNQ_STAMP(0);
   const int call = p.calls[t];
   const int phase = call & 1;
-  __nv_bfloat16* rrow = nullptr;
-  if constexpr (kMode != 3) rrow = p.residual + static_cast<int64_t>(t) * H;
+  __nv_bfloat16* const rrow = p.residual + static_cast<int64_t>(t) * H;  // full residual row (replicated, in place)
   const __nv_bfloat16* prow = p.partial + static_cast<int64_t>(t) * H;
   const int col = tid * 4;  // within the owned slice (tid < ACT)
   // goal11-post: the phase-5 residual chunks and phase-7 gamma chunks of this thread are issued now (they do not
   // depend on the exchange); their L2/HBM latency hides behind the two NVLink phases. In situ (layer-0 arnq after
   // fa_block, residual and gamma cold) the norm + quant tail was 5.5 us of mostly dependent load latency.
   uint4 rpre[3], gpre[3];
-  if constexpr (kMode != 3) {
 #pragma unroll
-    for (int c = 0; c < 3; ++c) {
-      const int e = c * THREADS * 8 + tid * 8;
-      rpre[c] = *reinterpret_cast<const uint4*>(rrow + e);
-      gpre[c] = __ldg(reinterpret_cast<const uint4*>(p.gamma + e));
-    }
+  for (int c = 0; c < 3; ++c) {
+    const int e = c * THREADS * 8 + tid * 8;
+    rpre[c] = *reinterpret_cast<const uint4*>(rrow + e);
+    gpre[c] = __ldg(reinterpret_cast<const uint4*>(p.gamma + e));
   }
 
   // ---- 1. reduce-scatter push: peer q gets columns [q*SL, (q+1)*SL) of our partial ----
@@ -315,20 +311,6 @@ __global__ void __launch_bounds__(THREADS) tp_arnq_kernel(const __grid_constant_
   }
   __syncthreads();
   ARNQ_STAMP(3);
-  if constexpr (kMode == 3) {
-    // The owner reduction has already rounded to BF16; preserve that boundary
-    // before the caller applies its output convolution and residual/norm.
-#pragma unroll
-    for (int c = 0; c < 3; ++c) {
-      const int e = c * THREADS * 8 + tid * 8;
-      *reinterpret_cast<uint4*>(p.out_bf16 + static_cast<int64_t>(t) * H + e) =
-          *reinterpret_cast<const uint4*>(s_h + e);
-    }
-    __syncthreads();
-    ARNQ_STAMP(5);
-    if (tid == 0) p.calls[t] = call + 1;
-    return;
-  }
   // ---- 5. x = f32(h) + f32(r) (unrounded) -> s_v; residual_out = bf16(x) ----
 #pragma unroll
   for (int c = 0; c < 3; ++c) {
@@ -1082,8 +1064,7 @@ __global__ void __launch_bounds__(THREADS) embed_nq_kernel(const __grid_constant
 
 template <bool kUsePDL>
 struct DFlashTPFused {
-  // mode 0: out_q [M, H] e4m3 + out_scale [M]; modes 1/3: normalized/raw out_bf16 [M, H].
-  // peers: int64 [8] receive-buffer addresses.
+  // mode 0: out_q [M, H] e4m3 + out_scale [M]; mode 1: out_bf16 [M, H]. peers: int64 [8] receive-buffer addresses.
   static void arnq(
       tvm::ffi::TensorView partial,
       tvm::ffi::TensorView residual,
@@ -1099,28 +1080,11 @@ struct DFlashTPFused {
       int64_t pre) {
     using namespace host;
     using namespace dflash_tp;
-    if (mode == 3) {
-      auto rows = SymbolicSize{"M"};
-      auto device = SymbolicDevice{};
-      TensorMatcher({rows, H})
-          .with_strides({H, 1})
-          .with_dtype<__nv_bfloat16>()
-          .with_device<kDLCUDA>(device)
-          .ensure_alignment(16)
-          .verify(partial)
-          .verify(out);
-      TensorMatcher({MAXT}).with_strides({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device).verify(calls);
-      TensorMatcher({R}).with_strides({1}).with_dtype<int64_t>().with_device<kDLCPU>().verify(peers);
-      RuntimeCheck(rank >= 0 && rank < R);
-    }
     const int M = static_cast<int>(partial.size(0));
     // (a single row's stride is irrelevant: the kernel uses the dense row pitch)
     RuntimeCheck(M >= 1 && M <= MAXT && partial.size(1) == H && (M == 1 || partial.stride(0) == H) && partial.stride(1) == 1);
-    if (mode != 3) {
-      RuntimeCheck(residual.size(0) >= M && residual.size(1) == H && (residual.size(0) == 1 || residual.stride(0) == H));
-      RuntimeCheck(gamma.numel() == H);
-    }
-    RuntimeCheck(peers.numel() == R && calls.numel() >= MAXT);
+    RuntimeCheck(residual.size(0) >= M && residual.size(1) == H && (residual.size(0) == 1 || residual.stride(0) == H));
+    RuntimeCheck(gamma.numel() == H && peers.numel() == R && calls.numel() >= MAXT);
     RuntimeCheck(out.size(0) >= M && out.size(1) == H && (out.size(0) == 1 || out.stride(0) == H));
     Params prm{};
     prm.partial = static_cast<const __nv_bfloat16*>(partial.data_ptr());
@@ -1135,10 +1099,7 @@ struct DFlashTPFused {
     prm.M = M;
     prm.stamps = reinterpret_cast<unsigned long long*>(stamps);
     prm.pre = pre != 0 ? 1 : 0;
-    if (mode == 3) {
-      prm.out_bf16 = static_cast<__nv_bfloat16*>(out.data_ptr());
-      LaunchKernel(dim3(MAXT), dim3(THREADS), partial.device()).enable_pdl(kUsePDL)(tp_arnq_kernel<3, kUsePDL>, prm);
-    } else if (mode == 2) {
+    if (mode == 2) {
       // out_scale: [H/128, sx_ld] fp32 (column-major group scales)
       RuntimeCheck(out.dtype().bits == 8 && out_scale.ndim() == 2 && out_scale.size(0) == H / 128 && out_scale.stride(1) == 1);
       prm.sx_ld = static_cast<int>(out_scale.stride(0));

@@ -20,11 +20,9 @@
 // broadcast. Round 3: the rank whose shard holds the sampled bonus token (prefix of per-rank kept mass in vocab
 // order) scans its row and pushes the token id to every rank.
 //
-// Candidate-selector drafts (sel_ids != nullptr): a sampled request's draft token at row j was drawn from a sparse q
-// over the K candidate ids of that position. Row j accepts iff coin * q(x) < p(x) (q(x) in (0, 1]) and the bonus at the
-// first rejected row is drawn from max(p - q, 0); only the K candidates differ from p, so each owner sends their bf16
-// logits in round 1 and every rank subtracts min(p_c, q_c) from the owner's kept mass. Without sel_ids the draft is
-// deterministic (q = one-hot) and the kernel runs the path above unchanged.
+// Candidate-selector drafts (sel_ids != nullptr): the draft token of row j comes from a sparse q over K candidates. Row
+// j accepts iff coin * q(x) < p(x) and the bonus is drawn from max(p - q, 0): the candidates' owners send their logits in
+// round 1 and every rank subtracts min(p_c, q_c) from the owner's kept mass.
 //
 // Output: predict [n] int64 in the greedy-verify layout (predict[b, j] = candidate j+1 for accepted rows, the bonus
 // at the first rejected row, -1 after it), consumed by the unchanged greedy accept kernel. Greedy requests (mode 0)
@@ -33,7 +31,8 @@
 // worker captures the kernel next to the in-graph greedy argmax, which then serves the batch.
 //
 // Uniforms: Philox4x32-10(seed, (call, request, k)) with the per-row call counter (identical on every rank), or explicit
-// coin buffers (level coins [b, j] at b * coin_ld + j, final coin [b]), e.g. the torch.rand draws of the reference path. Transport as in dflash_tp_fused: pushes into the peers' CUDA-IPC receive buffers,
+// coins (level coin [b, j] at b * coin_ld + j, final coin [b]). Transport as in dflash_tp_fused: pushes into the peers'
+// CUDA-IPC receive buffers,
 // every 8-byte half {payload, tag} with tag = (call + 1) | 2^30, two phases alternated by the per-row call counter.
 // The buffer addresses come from a device table, so a captured graph does not fix them (the worker allocates the
 // receive buffers after the KV cache and graph capture; until then it stages every batch greedy).
@@ -66,7 +65,7 @@ constexpr int HDR_V = 3;      // 16-B header vectors of a round-1 message
 constexpr int HIST_V = NB / 2;  // 16-B vectors of a histogram {h, tag, h, tag}
 constexpr int R1_V = HDR_V + HIST_V;
 constexpr int SEL_K = 16;     // selector candidates per position
-constexpr int SEL_V = SEL_K / 4;  // 16-B vectors carrying the K owned bf16 logits (two per 32-bit payload)
+constexpr int SEL_V = SEL_K / 4;  // 16-B vectors of the owned candidate logits
 constexpr int64_t R1_SLOT = (R1_V + SEL_V) * 16;
 constexpr int64_t R2_SLOT = HIST_V * 16;
 constexpr int64_t R3_SLOT = 16;
@@ -97,14 +96,14 @@ struct SVParams {
   int n;
   int G;
   unsigned long long seed;
-  const float* coins;           // optional level coins, row b at b * coin_ld (j < G - 1); nullptr -> Philox
+  const float* coins;           // optional level coins [b * coin_ld + j]; nullptr -> Philox
   int coin_ld;
-  const float* coins_final;     // final coin of request b (with coins)
+  const float* coins_final;     // [b]
   float* dbg;                   // optional [n, DBG]
   unsigned long long* stamps;   // optional [MAXN, 16] %globaltimer per phase (diagnostics)
   int skip_greedy;              // 1: return at once when every request is greedy (mode 0)
-  const int64_t* sel_ids;       // optional [n/G, G - 1, SEL_K] candidate ids of the selector's sparse q (contiguous)
-  const float* sel_q;           // [n/G, G - 1, SEL_K] q over sel_ids; read for sampled requests only
+  const int64_t* sel_ids;       // optional [n/G, G - 1, SEL_K] selector candidate ids
+  const float* sel_q;           // [n/G, G - 1, SEL_K] q over sel_ids
 };
 
 __device__ __forceinline__ unsigned long long gtime() {
@@ -261,11 +260,11 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
   __shared__ int s_acc[MAXG];
   __shared__ float s_tsum[THREADS];
   __shared__ int s_lastv[THREADS];
-  __shared__ uint32_t s_selw[R][SEL_K / 2];  // received candidate logits, two bf16 per word, by source rank
-  __shared__ uint32_t s_selraw[SEL_K];       // this rank's owned candidate logits (0 if not owned)
-  __shared__ uint32_t s_selmask;             // bit k: this rank owns candidate k
-  __shared__ int s_seli[SEL_K];              // candidate ids (-1: out of vocabulary or a repeated id)
-  __shared__ float s_selq[SEL_K];            // q, non-probabilities as 0
+  __shared__ uint32_t s_selw[R][SEL_K / 2];  // received candidate logits by source rank
+  __shared__ uint32_t s_selraw[SEL_K];       // owned candidate logits (0 if not owned)
+  __shared__ uint32_t s_selmask;             // bit k: candidate k is owned here
+  __shared__ int s_seli[SEL_K];              // candidate ids (-1: invalid or repeated)
+  __shared__ float s_selq[SEL_K];
   __shared__ float s_sele[SEL_K];            // kept mass relative to M (0 outside the top-p set)
   __shared__ int s_selown[SEL_K];            // owner rank of a kept candidate, else -1
 
@@ -442,7 +441,7 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
       if (tid < SEL_K) {
         const int64_t c = p.sel_ids[base + tid];
         int id = (c >= 0 && c < p.vocab) ? static_cast<int>(c) : -1;
-        for (int k = 0; k < tid; ++k)  // a repeated id keeps its first q (dense q holds one value per id)
+        for (int k = 0; k < tid; ++k)  // a repeated id keeps its first q, as the dense q does
           if (id >= 0 && p.sel_ids[base + k] == c) id = -1;
         const float q = p.sel_q[base + tid];
         s_seli[tid] = id;
@@ -612,7 +611,7 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
   const float cj = (j < G - 1) ? coin(p, call, b, j) : 1.f;
   float tp = in_k ? __fdiv_rn(e_c, SK) : 0.f;
   bool acc = (j < G - 1) && tp > 0.f && cj < tp;
-  if (sel) {  // the drafted token's q; an id outside the candidates has q = 0 and is rejected
+  if (sel) {  // q(x) = 0 outside the candidates: rejected
     const int64_t x = p.cand[static_cast<int64_t>(b) * G + j + 1];
     float qx = 0.f, ex = 0.f;
     for (int k = 0; k < SEL_K; ++k)
@@ -658,9 +657,9 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
     float sub[R];
 #pragma unroll
     for (int s = 0; s < R; ++s) sub[s] = (!sel && s == owner) ? rejmass : 0.f;
-    if (sel) {  // residual max(p - q, 0): the owner's kept mass loses min(p_c, q_c) per candidate (mass units)
+    if (sel) {  // max(p - q, 0): the owner loses min(p_c, q_c) per candidate; the rejected token (p < q) loses p
       const int64_t x = p.cand[static_cast<int64_t>(b) * G + j + 1];
-      for (int k = 0; k < SEL_K; ++k)  // the rejected token had p < q, so it leaves no residual
+      for (int k = 0; k < SEL_K; ++k)
         if (s_selown[k] >= 0) sub[s_selown[k]] += s_seli[k] == x ? s_sele[k] : fminf(s_sele[k], s_selq[k] * SK);
     }
     float total = 0.f;

@@ -30,9 +30,7 @@ QKV_TILES = 36
 O_TILES = 96
 GU_TILES = 64
 DN_TILES = 96
-CF_TILES = 24  # convolution coefficient projection: 1536 rows
-NPH = 6
-PHASES = ("qkv", "o", "gu", "dn", "ca", "cm")
+NPH = 6  # weight maps per layer: qkv, o, gate_up, down, convolution coefficients (attention, mlp)
 NSLOT_ATT = 6
 NSLOT_FULL = 10
 
@@ -109,19 +107,14 @@ def default_plan() -> Dict[str, object]:
     gucaps = [4] * NATT + [5, 5, 5, 5, 4, 4, 4]
     gu = _assign(GU_TILES, gucaps)
     plan["gu"] = [[g, []] for g in gu]
-    for name in ("ca", "cm"):
-        cf = _assign(CF_TILES, [2] * NCL)
-        plan[name] = [[t, []] for t in cf]
     plan["nslot"] = [NSLOT_ATT] * NATT + [NSLOT_FULL] * (NCL - NATT)
     return plan
 
 
-def plan_tensor(plan: Dict[str, object], conv: bool = False) -> torch.Tensor:
-    tile = torch.full((NPH, NCL, 2, MAXT_PH), -1, dtype=torch.int16)
-    n = torch.zeros((NPH, NCL, 2), dtype=torch.int16)
-    for ph, name in enumerate(PHASES):
-        if name in ("ca", "cm") and not conv:
-            continue
+def plan_tensor(plan: Dict[str, object]) -> torch.Tensor:
+    tile = torch.full((4, NCL, 2, MAXT_PH), -1, dtype=torch.int16)
+    n = torch.zeros((4, NCL, 2), dtype=torch.int16)
+    for ph, name in enumerate(("qkv", "o", "gu", "dn")):
         seen = []
         for c in range(NCL):
             for g in range(2):
@@ -131,7 +124,7 @@ def plan_tensor(plan: Dict[str, object], conv: bool = False) -> torch.Tensor:
                 for i, t in enumerate(ts):
                     tile[ph, c, g, i] = t
                 seen += ts
-        total = {"qkv": QKV_TILES, "o": O_TILES, "gu": GU_TILES, "dn": DN_TILES, "ca": CF_TILES, "cm": CF_TILES}[name]
+        total = {"qkv": QKV_TILES, "o": O_TILES, "gu": GU_TILES, "dn": DN_TILES}[name]
         assert sorted(seen) == list(range(total)), f"plan {name}: tiles not a partition"
     nslot = torch.tensor(plan["nslot"], dtype=torch.int16)
     return torch.cat([tile.flatten(), n.flatten(), nslot])
@@ -148,9 +141,8 @@ class DFlashMegaState:
       sinks                   -- [16] bf16/fp32 or None
       k_cache, v_cache        -- bf16 [slots, 1, 128]
     and, for convolution drafts (all layers or none):
-      w_ca, w_cm              -- bf16 [1536, H] coefficient projections (attention, mlp), rows [side][tap][group]
-      s_ca, s_cm              -- fp32 [1536] (unused: the projections run in BF16)
-      cb_a, cb_m              -- bf16 [2 (input, output), 2 taps, H] static kernels
+      w_ca, w_cm              -- bf16 [1536, H] coefficient projections (attention, mlp)
+      cb_a, cb_m              -- bf16 [2 (input, output), 2 taps, H] base kernels
     """
 
     def __init__(
@@ -181,10 +173,6 @@ class DFlashMegaState:
         self.maps = torch.zeros((NL * NPH + 2) * 128, dtype=torch.uint8, device=dev)
         self.hn = torch.zeros(2 * NL, MT, H, dtype=torch.bfloat16, device=dev) if self.conv else None
         self.coef = torch.zeros(2 * NL, MT, 1536, dtype=torch.bfloat16, device=dev) if self.conv else None
-        # diagnostics: the owned slice before / after every output convolution
-        dump = self.conv and bool(os.environ.get("SGLANG_DFLASH_MEGA_CONV_DUMP"))
-        self.xconv = torch.zeros(2, 2 * NL, MT, H, dtype=torch.bfloat16, device=dev) if dump else None
-        self.amaxc = None
         self.xq = torch.zeros(2 * MT * H, dtype=torch.uint8, device=dev)
         self.xs = torch.zeros(2 * MT, dtype=torch.float32, device=dev)
         self.qkv = torch.zeros(2, MT, 2304, dtype=torch.bfloat16, device=dev)
@@ -219,10 +207,7 @@ class DFlashMegaState:
         self.mod.build_maps(self.maps, torch.tensor(wptr, dtype=torch.int64), self.xq)
         ptrs = []
         for L in layers:
-            for k in ("s_qkv", "s_o", "s_gu", "s_dn", "s_ca", "s_cm"):
-                if k not in L:
-                    ptrs.append(0)
-                    continue
+            for k in ("s_qkv", "s_o", "s_gu", "s_dn"):
                 s = L[k]
                 assert s.dtype == torch.float32 and s.is_contiguous()
                 ptrs.append(s.data_ptr())
@@ -234,12 +219,8 @@ class DFlashMegaState:
             ptrs.append(L["k_cache"].data_ptr())
             ptrs.append(L["v_cache"].data_ptr())
             for k in ("cb_a", "cb_m"):
-                if k not in L:
-                    ptrs += [0, 0]
-                    continue
-                cb = L[k]
-                assert cb.dtype == torch.bfloat16 and cb.is_contiguous()
-                ptrs += [cb[0].data_ptr(), cb[1].data_ptr()]
+                cb = L.get(k)
+                ptrs += [0, 0] if cb is None else [cb[0].data_ptr(), cb[1].data_ptr()]
         peers = tp_state.peers.tolist()
         ptrs += [
             self.maps.data_ptr(), final_norm.data_ptr(), cos_sin_cache.data_ptr(), self.xq.data_ptr(),
@@ -248,8 +229,6 @@ class DFlashMegaState:
             0 if self.stamps is None else self.stamps.data_ptr(),
             0 if self.hn is None else self.hn.data_ptr(),
             0 if self.coef is None else self.coef.data_ptr(),
-            0 if self.xconv is None else self.xconv.data_ptr(),
-            0 if self.amaxc is None else self.amaxc.data_ptr(),
         ] + peers
         sinks = [L.get("sinks") for L in layers]
         sink_f32 = int(sinks[0] is not None and sinks[0].dtype == torch.float32)
@@ -263,7 +242,7 @@ class DFlashMegaState:
         fvals = torch.tensor([eps, qk_eps, v_scale, sm_scale], dtype=torch.float32)
         self.plan = plan or default_plan()
         self.blob = torch.zeros(int(self.mod.params_bytes()), dtype=torch.uint8)
-        self.mod.fill(self.blob, torch.tensor(ptrs, dtype=torch.int64), ivals, fvals, plan_tensor(self.plan, self.conv))
+        self.mod.fill(self.blob, torch.tensor(ptrs, dtype=torch.int64), ivals, fvals, plan_tensor(self.plan))
         torch.cuda.synchronize(dev)
 
     def max_clusters(self) -> int:

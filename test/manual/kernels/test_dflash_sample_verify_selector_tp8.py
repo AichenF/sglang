@@ -2,14 +2,8 @@
 
     torchrun --nproc-per-node 8 test/manual/kernels/test_dflash_sample_verify_selector_tp8.py
 
-The kernel gets the candidate ids / q of each draft position and the uniforms the reference draws (torch.rand of
-shapes (bs, G - 1) and (bs,)); the reference is the selector path of the DFlash worker: dense q scattered from the
-sparse q, then dspark_accept.accept_sampling with the same uniforms. Every accept length and bonus token must match;
-a mismatch is reported with its margin in fp64 (accept test |coin * q - p| / p, bonus distance to a CDF boundary).
-
-Environment:
-    SVS_MODE    comma-separated sections (default "eager,graph")
-    SVS_TRIALS  trials of the eager section (default 600)
+Reference: the worker's selector accept (dense q scattered from the sparse q, then dspark_accept.accept_sampling) with
+the same coins (same CUDA seed). Accept lengths and bonus tokens must match; greedy rows must equal torch.argmax.
 """
 
 import os
@@ -27,27 +21,23 @@ cpu = dist.new_group(backend="gloo")
 dev = torch.device("cuda", rank)
 
 from sglang.kernels.ops.speculative.dspark.dspark_accept import accept_sampling  # noqa: E402
-from sglang.kernels.ops.speculative.sample_verify import (  # noqa: E402
-    SEL_K,
-    SampleVerifyState,
-)
+from sglang.kernels.ops.speculative.sample_verify import SEL_K, SampleVerifyState  # noqa: E402
 from sglang.srt.sampling.sampling_params import TOP_K_ALL  # noqa: E402
 
-MODES = set(os.environ.get("SVS_MODE", "eager,graph").split(","))
-Vs = 19072  # a 152576-entry vocabulary over 8 ranks
+Vs = 19072
 V = Vs * ws
 G = 8
 GAMMA = G - 1
 vs0 = rank * Vs
+TRIALS = int(os.environ.get("SVS_TRIALS", "600"))
+
+st = SampleVerifyState(dev, cpu, list(range(ws)), rank, local_vocab=Vs, vocab_start=vs0, vocab=V, seed=1234)
+st.enable_selector(GAMMA)
 
 
 def log(*a):
     if rank == 0:
         print(*a, flush=True)
-
-
-st = SampleVerifyState(dev, cpu, list(range(ws)), rank, local_vocab=Vs, vocab_start=vs0, vocab=V, seed=1234)
-st.enable_selector(GAMMA)
 
 
 def make_logits(n, gen, kinds):
@@ -126,187 +116,97 @@ def make_case(trial, gen):
     return bs, n, full, params, ids, q, cand
 
 
-def draft_input_for(params):
-    """max_top_k / uniform_top_k_value as DFlashDraftInputV2 derives them from the requests' top_k."""
+def reference(full, params, ids, q, cand, bs, seed):
     tks = [1 if p[0] == 0 else TOP_K_ALL for p in params]
-    return SimpleNamespace(max_top_k=max(max(tks), 1), uniform_top_k_value=tks[0] if len(set(tks)) == 1 else None)
-
-
-def reference(full, params, ids, q, cand, U, UF, bs):
-    """The worker's selector accept (_selector_sampling_accept) with the given uniforms."""
-    dp = torch.zeros((bs, GAMMA, V), dtype=torch.float32, device=dev)
-    dp.scatter_(-1, ids, q)
+    info = sampling_info_for(params)
+    draft_input = SimpleNamespace(max_top_k=max(tks), uniform_top_k_value=tks[0] if len(set(tks)) == 1 else None)
+    dp = torch.zeros((bs, GAMMA, V), dtype=torch.float32, device=dev).scatter_(-1, ids, q)
+    torch.cuda.manual_seed(seed)
     acc, bonus, _ = accept_sampling(
-        candidates=cand.view(bs, G),
-        target_logits=full.float(),
-        draft_probs=dp,
-        sampling_info=sampling_info_for(params),
-        draft_input=draft_input_for(params),
-        gamma=GAMMA,
-        verify_num_draft_tokens=G,
-        cutoff_verify_lens=None,
-        uniform_samples=U,
-        uniform_samples_final=UF,
+        candidates=cand.view(bs, G), target_logits=full.float(), draft_probs=dp, sampling_info=info,
+        draft_input=draft_input, gamma=GAMMA, verify_num_draft_tokens=G, cutoff_verify_lens=None,
     )
-    return acc.long(), bonus.long()
+    return acc.tolist(), bonus.tolist()
 
 
-def decode_predict(pred, cand, bs):
-    p = pred.view(bs, G)
-    c = cand.view(bs, G)
-    acc, bon = [], []
+def run_kernel(shard, cand, params, ids, q, bs, seed, out=None):
+    st.stage(params)
+    st.stage_selector(ids, q)
+    torch.cuda.manual_seed(seed)
+    st.draw_selector_coins(bs)
+    return st.run(shard, cand, G, out=out, selector=True)
+
+
+def decode(pred, cand, bs):
+    p, c = pred.view(bs, G).tolist(), cand.view(bs, G).tolist()
+    acc = []
     for b in range(bs):
         a = 0
-        while a < GAMMA and int(p[b, a]) == int(c[b, a + 1]):
+        while a < GAMMA and p[b][a] == c[b][a + 1]:
             a += 1
         acc.append(a)
-        bon.append(int(p[b, a]))
-    return acc, bon
-
-
-def exact_p(row_bf16, T, top_p):
-    q = torch.softmax(row_bf16.double() / T, dim=-1)
-    if top_p < 1.0:
-        qs, _ = torch.sort(q, descending=True)
-        cs = torch.cumsum(qs, 0)
-        k = int(torch.searchsorted(cs, torch.tensor([top_p], dtype=torch.float64, device=dev)))
-        keep = q >= qs[min(k, qs.numel() - 1)]
-    else:
-        keep = q > 0
-    t = torch.where(keep, q, torch.zeros_like(q))
-    return t / t.sum()
-
-
-def margin(full, params, ids, q, cand, U, UF, b, ka, ra):
-    """fp64 margins of the decision that differs: the accept test at the first differing row, else the bonus CDF."""
-    T, top_p = params[b][1], params[b][2]
-    j = min(ka, ra)
-    p = exact_p(full[b * G + j], T, top_p)
-    x = int(cand[b * G + j + 1])
-    if ka != ra and j < GAMMA:
-        qx = float(q[b, j][ids[b, j] == x].sum())
-        px = float(p[x])
-        return f"accept row {j}: coin*q={float(U[b, j]) * qx:.9g} p={px:.9g} rel {abs(float(U[b, j]) * qx - px) / max(px, 1e-30):.3g}"
-    dq = torch.zeros(V, dtype=torch.float64, device=dev)
-    if j < GAMMA:
-        dq.scatter_(0, ids[b, j], q[b, j].double())
-        w = torch.clamp(p - dq, min=0.0)
-    else:
-        w = p
-    cw = torch.cumsum(w, 0)
-    u = float(UF[b]) * float(cw[-1])
-    idx = int(torch.searchsorted(cw, torch.tensor([u], dtype=torch.float64, device=dev), right=True))
-    lo = float(cw[idx - 1]) if idx > 0 else 0.0
-    hi = float(cw[min(idx, V - 1)])
-    return f"bonus: u={u:.9g} in [{lo:.9g}, {hi:.9g}) of total {float(cw[-1]):.9g}, rel distance {min(u - lo, hi - u) / float(cw[-1]):.3g}"
+    return acc, [p[b][acc[b]] for b in range(bs)]
 
 
 def same_on_all_ranks(t):
-    tc = t.detach().contiguous().cpu()
-    if tc.dtype == torch.bfloat16:
-        tc = tc.view(torch.int16).to(torch.int32)
-    g = [torch.empty_like(tc) for _ in range(ws)]
-    dist.all_gather(g, tc, group=cpu)
+    g = [torch.empty_like(t.cpu()) for _ in range(ws)]
+    dist.all_gather(g, t.cpu(), group=cpu)
     return all(torch.equal(g[0], x) for x in g)
 
 
-bad_total = 0
+gen = torch.Generator(device=dev).manual_seed(2025)
+c = dict(req=0, acc_bad=0, bon_bad=0, greedy_bad=0, rank_bad=0)
+for trial in range(TRIALS):
+    bs, _, full, params, ids, q, cand = make_case(trial, gen)
+    pred = run_kernel(full[:, vs0 : vs0 + Vs].contiguous(), cand, params, ids, q, bs, 1000 + trial).clone()
+    racc, rbon = reference(full, params, ids, q, cand, bs, 1000 + trial)
+    kacc, kbon = decode(pred, cand, bs)
+    c["rank_bad"] += int(not same_on_all_ranks(pred))
+    for b in range(bs):
+        if params[b][0] == 0:
+            c["greedy_bad"] += int(not torch.equal(pred[b * G : (b + 1) * G], full[b * G : (b + 1) * G].float().argmax(-1)))
+            continue
+        c["req"] += 1
+        c["acc_bad"] += int(kacc[b] != racc[b])
+        c["bon_bad"] += int(kacc[b] == racc[b] and kbon[b] != rbon[b])
+        if (kacc[b], kbon[b]) != (racc[b], rbon[b]):
+            log(f"  mismatch trial {trial} b {b} {params[b]}: kernel {kacc[b]}/{kbon[b]}, reference {racc[b]}/{rbon[b]}")
+log(f"[eager] {TRIALS} trials: {c}")
+bad = c["acc_bad"] + c["bon_bad"] + c["greedy_bad"] + c["rank_bad"]
 
-if "eager" in MODES:
-    gen = torch.Generator(device=dev)
-    gen.manual_seed(2025)
-    n_trials = int(os.environ.get("SVS_TRIALS", "600"))
-    c = dict(req=0, rows_rejected=0, acc_bad=0, bon_bad=0, greedy_bad=0, rank_bad=0, bonus_eq_cand=0)
-    for trial in range(n_trials):
-        bs, n, full, params, ids, q, cand = make_case(trial, gen)
-        torch.cuda.manual_seed(1000 + trial)  # same CUDA generator state on every rank, as in the server
-        U = torch.rand((bs, GAMMA), dtype=torch.float32, device=dev)
-        UF = torch.rand((bs,), dtype=torch.float32, device=dev)
-        assert same_on_all_ranks(full) and same_on_all_ranks(cand) and same_on_all_ranks(U), "inputs differ"
-        shard = full[:, vs0 : vs0 + Vs].contiguous()
-        st.stage(params)
-        pred = st.run(shard, cand, G, sel_ids=ids, sel_q=q, level_coins=U, final_coins=UF).clone()
-        torch.cuda.synchronize()
-        racc, rbon = reference(full, params, ids, q, cand, U, UF, bs)
-        kacc, kbon = decode_predict(pred, cand, bs)
-        c["rank_bad"] += 0 if same_on_all_ranks(pred) else 1
-        for b in range(bs):
-            if params[b][0] == 0:
-                am = torch.argmax(full[b * G : (b + 1) * G].float(), dim=-1)
-                c["greedy_bad"] += 0 if torch.equal(pred[b * G : (b + 1) * G], am) else 1
-                continue
-            c["req"] += 1
-            c["rows_rejected"] += int(kacc[b] < GAMMA)
-            a_bad = kacc[b] != int(racc[b])
-            b_bad = not a_bad and kbon[b] != int(rbon[b])
-            c["acc_bad"] += int(a_bad)
-            c["bon_bad"] += int(b_bad)
-            if a_bad or b_bad:
-                log(f"  mismatch trial {trial} b {b} params {params[b]}: accept kernel {kacc[b]} ref {int(racc[b])}, "
-                    f"bonus kernel {kbon[b]} ref {int(rbon[b])}; "
-                    + margin(full, params, ids, q, cand, U, UF, b, kacc[b], int(racc[b])))
-        if trial % 100 == 99:
-            log(f"[eager] {trial + 1} trials: {c}")
-    fails = int(c["acc_bad"] + c["bon_bad"] + c["greedy_bad"] + c["rank_bad"])
-    log(f"[eager] {n_trials} trials, {c['req']} sampled requests ({c['rows_rejected']} with a rejection): accept-length "
-        f"mismatches {c['acc_bad']}, bonus mismatches {c['bon_bad']}, greedy != argmax {c['greedy_bad']}, "
-        f"ranks disagree {c['rank_bad']}")
-    t = torch.tensor([fails], device=dev)
-    dist.all_reduce(t)
-    log(f"[eager] RESULT {'OK' if int(t) == 0 else 'MISMATCHES (see margins above)'}")
-    bad_total += int(t)
+# graph: the worker's layout (static state buffers refreshed before each replay) against eager and the reference
+gen = torch.Generator(device=dev).manual_seed(99)
+cases = [cs for cs in (make_case(8 * k, gen) for k in range(6)) if cs[0] == 4]
+logits_buf = torch.empty((32, Vs), dtype=torch.bfloat16, device=dev)
+cand_buf = torch.empty(32, dtype=torch.int64, device=dev)
+out_buf = torch.empty(32, dtype=torch.int64, device=dev)
+_, _, full0, params0, ids0, q0, cand0 = cases[0]
+logits_buf.copy_(full0[:, vs0 : vs0 + Vs])
+cand_buf.copy_(cand0)
+run_kernel(logits_buf, cand_buf, params0, ids0, q0, 4, 0, out=out_buf)
+torch.cuda.synchronize()
+graph = torch.cuda.CUDAGraph()
+with torch.cuda.graph(graph):
+    st.run(logits_buf, cand_buf, G, out=out_buf, selector=True)
+gbad = 0
+for k, (_, _, full, params, ids, q, cand) in enumerate(cases * 3):
+    st.stage(params)
+    st.stage_selector(ids, q)
+    torch.cuda.manual_seed(5000 + k)
+    st.draw_selector_coins(4)
+    logits_buf.copy_(full[:, vs0 : vs0 + Vs])
+    cand_buf.copy_(cand)
+    graph.replay()
+    g_out = out_buf.clone()
+    e_out = st.run(logits_buf, cand_buf, G, out=torch.empty_like(out_buf), selector=True).clone()
+    racc, rbon = reference(full, params, ids, q, cand, 4, 5000 + k)
+    kacc, kbon = decode(g_out, cand, 4)
+    ok = torch.equal(g_out, e_out) and same_on_all_ranks(g_out)
+    ok = ok and all(params[b][0] == 0 or (kacc[b], kbon[b]) == (racc[b], rbon[b]) for b in range(4))
+    gbad += int(not ok)
+log(f"[graph] {len(cases) * 3} replays, mismatches {gbad}")
 
-if "graph" in MODES:
-    # the worker's layout: state buffers (ids, q, coins) at fixed addresses, refreshed before each replay
-    gen = torch.Generator(device=dev)
-    gen.manual_seed(99)
-    bs, n = 4, 32
-    cases = [make_case(8 * k, gen) for k in range(6)]
-    cases = [cs for cs in cases if cs[0] == bs]
-    logits_buf = torch.empty((n, Vs), dtype=torch.bfloat16, device=dev)
-    cand_buf = torch.empty(n, dtype=torch.int64, device=dev)
-    out_buf = torch.empty(n, dtype=torch.int64, device=dev)
-    _, _, full0, params0, ids0, q0, cand0 = cases[0]
-    st.stage(params0)
-    st.stage_selector(ids0, q0)
-    st.draw_selector_coins(bs)
-    logits_buf.copy_(full0[:, vs0 : vs0 + Vs])
-    cand_buf.copy_(cand0)
-    s = torch.cuda.Stream()
-    s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s):
-        st.run(logits_buf, cand_buf, G, out=out_buf, selector=True)
-    torch.cuda.current_stream().wait_stream(s)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        st.run(logits_buf, cand_buf, G, out=out_buf, selector=True)
-    gbad = 0
-    for k, (_, _, full, params, ids, q, cand) in enumerate(cases * 3):
-        torch.cuda.manual_seed(5000 + k)
-        st.stage(params)
-        st.stage_selector(ids, q)
-        coins = st.draw_selector_coins(bs).clone()
-        logits_buf.copy_(full[:, vs0 : vs0 + Vs])
-        cand_buf.copy_(cand)
-        graph.replay()
-        torch.cuda.synchronize()
-        g_out = out_buf.clone()
-        g = st.sel_gamma
-        e_out = st.run(
-            logits_buf, cand_buf, G, out=torch.empty_like(out_buf), sel_ids=ids, sel_q=q,
-            level_coins=coins[: bs * g].view(bs, g), final_coins=coins[32 * g : 32 * g + bs],
-        ).clone()
-        racc, rbon = reference(full, params, ids, q, cand, coins[: bs * g].view(bs, g), coins[32 * g : 32 * g + bs], bs)
-        kacc, kbon = decode_predict(g_out, cand, bs)
-        same = torch.equal(g_out, e_out)
-        dec = all(params[b][0] == 0 or (kacc[b] == int(racc[b]) and kbon[b] == int(rbon[b])) for b in range(bs))
-        gbad += int(not same) + int(not dec) + int(not same_on_all_ranks(g_out))
-    t = torch.tensor([gbad], device=dev)
-    dist.all_reduce(t)
-    log(f"[graph] {len(cases) * 3} replays: graph == eager and == reference: {'OK' if int(t) == 0 else f'FAIL ({int(t)})'}")
-    bad_total += int(t)
-
-dist.barrier()
-log(f"ALL {'OK' if bad_total == 0 else 'NOT OK'}")
+t = torch.tensor([bad + gbad], device=dev)
+dist.all_reduce(t)
+log(f"ALL {'OK' if int(t) == 0 else 'NOT OK'}")
 dist.destroy_process_group()
