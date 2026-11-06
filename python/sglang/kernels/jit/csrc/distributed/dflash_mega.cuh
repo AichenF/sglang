@@ -1405,7 +1405,9 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
     bar_sync(1, NCT);
     if (ctid == 0) {
       dstamp(p, l, 121);
-      for (int k = 0; k < nt; ++k) red_release(p.cnt + C_QKV + tl[k], 1u);
+      // one fence for all of the CTA's tiles (a fence per tile also waits for the previous tile's increment)
+      if (nt > 0) __threadfence();
+      for (int k = 0; k < nt; ++k) atomicAdd(p.cnt + C_QKV + tl[k], 1u);
       dstamp(p, l, 122);
       if (DM_QUIET && nt > 0) { volatile int* relc = s.misc + 2; *relc = *relc + 1; }   // -> the producer's held units
     }
@@ -1443,7 +1445,7 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
       if (ctid == 0) {
         dstamp(p, l, 125);
         __threadfence();  // the warp's amax atomics before the release
-        red_release(p.cnt + C_ACT, 1u);
+        atomicAdd(p.cnt + C_ACT, 1u);
         dstamp(p, l, 126);
         if (DM_QUIET) { volatile int* relc = s.misc + 2; *relc = *relc + 1; }
       }
