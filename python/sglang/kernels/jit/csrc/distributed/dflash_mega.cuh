@@ -104,8 +104,8 @@ constexpr int NPH = 6;
 __device__ constexpr int PH_ORDER[NPH] = {PH_CA, PH_QKV, PH_O, PH_CM, PH_GU, PH_DN};
 constexpr int CF_N = 1536;  // coefficient rows [input, output][tap][group]
 constexpr int CF_G = H / 16;
-constexpr int CF_TILES = CF_N / 64;
-constexpr int CF_NU = 12;
+constexpr int CF_TILES = 24;  // CTAs taking a K chunk of one of the rank's 3 coefficient tiles
+constexpr int CF_NU = 6;
 enum { C_LAUNCH = 0, C_X = 1, C_ATT = 2, C_ACT = 3, C_Y = 6, C_QKV = 8, C_N = 64 };
 
 // smem layout (bytes from the 1024-aligned dynamic base)
@@ -128,10 +128,9 @@ constexpr int64_t AG_OFF = RS_OFF + RS_BYTES + ST_BYTES;
 constexpr int64_t AG_BYTES = 2LL * MT * R * AG_SLOT;
 constexpr int64_t AX_BYTES = 2LL * MT * R * 16;
 constexpr int64_t EM_BYTES = 2LL * MT * H * 2;
-// convolution drafts: coefficient partials [2][MT][R][CS_N] fp32, then convolved slices [2][MT][R][SL] bf16
+// convolution drafts: input-side coefficients of each rank's 48 groups [2][MT][R][CS_N / 2] bf16 ([tap][group])
 constexpr int CS_N = 4 * (CF_G / R);
-constexpr int64_t CP_OFF = AG_OFF + AG_BYTES + AX_BYTES + EM_BYTES;
-constexpr int64_t GX_OFF = CP_OFF + 2LL * MT * R * CS_N * 4;
+constexpr int64_t CX_OFF = AG_OFF + AG_BYTES + AX_BYTES + EM_BYTES;
 
 struct LayerP {
   const float* sw[4];             // per-channel weight scales: qkv [2304], o [6144], gate_up [4096], down [6144]
@@ -421,6 +420,7 @@ struct Smem {
   uint64_t* combbar;
   uint64_t* combok;
   uint64_t* hbar;     // all-reduce token CTAs: the previous block row's reduced slice is ready (output convolution)
+  uint64_t* cbar;     // coefficient tile partials of the cluster received (DSMEM)
   int* calls0;        // [MT]
   float* sx;          // [MT]
   float* sinv;        // [MT]
@@ -458,11 +458,11 @@ DEV bool uit_settle(const Params& p, int c, int rank, UIt& it) {
   while (it.l < p.nl) {
     it.ph = PH_ORDER[it.oi];
     if (it.ph == PH_CA || it.ph == PH_CM) {
-      const int ai = (c - AR0) * CS + rank;
-      it.nt = (p.conv && c >= AR0 && c < AR0 + 4 && ai < CF_TILES) ? 1 : 0;
-      it.cft = ai;
+      // all-reduce cluster AR0 + j takes coefficient tile j, its CTA k the K chunk k
+      it.nt = (p.conv && c >= AR0 && c < AR0 + CF_TILES / CS) ? 1 : 0;
+      it.cft = c - AR0;
       it.nu = CF_NU;
-      it.ks = p.rank;
+      it.ks = rank;
       it.tl = nullptr;
     } else {
       const bool s8 = (it.ph == PH_QKV || it.ph == PH_GU);
@@ -506,9 +506,10 @@ DEV bool mbar_test(uint64_t* b, uint32_t parity) {
 DEV void uit_issue(const Params& p, const UIt& it, bool pf, uint8_t* dst, uint64_t* bar, uint64_t pol) {
   const CUtensorMap* map = p.maps + it.l * NPH + it.ph;
   const bool cf = (it.ph == PH_CA || it.ph == PH_CM);
+  // coefficient units: the two 64-column chunks of a 128-column K step of one tile
   const int t0 = cf ? it.cft : it.tl[2 * it.sl];
-  const int t1 = (!cf && 2 * it.sl + 1 < it.nt) ? it.tl[2 * it.sl + 1] : -1;
-  const int kc = (it.ks * it.nu + it.u) * (cf ? 64 : 128);  // elements
+  const int t1 = cf ? it.cft : (2 * it.sl + 1 < it.nt ? it.tl[2 * it.sl + 1] : -1);
+  const int kc = (it.ks * it.nu + it.u) * 128;  // elements
 #pragma unroll
   for (int w = 0; w < 2; ++w) {
     const int t = w ? t1 : t0;
@@ -522,8 +523,9 @@ DEV void uit_issue(const Params& p, const UIt& it, bool pf, uint8_t* dst, uint64
         tma2d(map, dst + w * TILEB + 4096, bar, kc, INTER + t * 32, pol);
       }
     } else {
-      if (pf) tma_prefetch_l2(map, kc, t * 64);
-      else tma2d(map, dst + w * TILEB, bar, kc, t * 64, pol);
+      const int k = cf ? kc + 64 * w : kc;
+      if (pf) tma_prefetch_l2(map, k, t * 64);
+      else tma2d(map, dst + w * TILEB, bar, k, t * 64, pol);
     }
   }
 }
@@ -582,7 +584,7 @@ DEV void producer(const Params& p, Smem& s, int c, int rank) {
     }
 #endif
     if (ld.sl == 0 && ld.u == 0 && ld.ph != PH_QKV) dstamp(p, ld.l, 60 + ld.ph);
-    const int t1 = (2 * ld.sl + 1 < ld.nt) ? 1 : 0;
+    const int t1 = (ld.ph == PH_CA || ld.ph == PH_CM || 2 * ld.sl + 1 < ld.nt) ? 1 : 0;
     mbar_expect_tx(&s.full[slot], (1 + t1) * TILEB);
     uit_issue(p, ld, false, s.ring + slot * SLAB, &s.full[slot], pol);
     vld = uit_next(p, c, rank, ld);
@@ -646,61 +648,100 @@ DEV void gather(const Params& p, Smem& s, int b, int rank, int lane) {
   }
 }
 
-// half hf (units 6 hf .. 6 hf + 5) of this rank's slice of the normalized BF16 sublayer input e -> X units 0..5
-DEV void cf_load_x(const Params& p, uint8_t* X, int e, int src, int hf, int ctid) {
-  const __nv_bfloat16* xp = p.hn + static_cast<int64_t>(e) * MT * H + src * (CF_NU * 64) + hf * 6 * 64;
-#pragma unroll 2
-  for (int i = ctid; i < MT * 6 * 8; i += NCT) {
-    const int t = i / 48, ch = i - t * 48, u = ch >> 3, cc = ch & 7;
-    const uint4 v = ldcg_v4(xp + static_cast<int64_t>(t) * H + u * 64 + cc * 8);
-    *reinterpret_cast<uint4*>(X + u * XU + t * 128 + ((cc ^ (t & 7)) * 16)) = v;
+// K chunk kch (768 columns) of the normalized input e, all 32 tokens -> X chunks 0..11 (64 columns each)
+DEV void cf_load_x(const Params& p, uint8_t* X, int e, int kch, int ctid) {
+  const __nv_bfloat16* xp = p.hn + static_cast<int64_t>(e) * MT * H + kch * SL;
+  constexpr int PER = MT * (SL / 8) / NCT;  // 12: all loads in flight before the stores
+  uint4 v[PER];
+#pragma unroll
+  for (int k = 0; k < PER; ++k) {
+    const int i = ctid + k * NCT, t = i / (SL / 8), ch = i - t * (SL / 8), u = ch >> 3, cc = ch & 7;
+    v[k] = ldcg_v4(xp + static_cast<int64_t>(t) * H + u * 64 + cc * 8);
+  }
+#pragma unroll
+  for (int k = 0; k < PER; ++k) {
+    const int i = ctid + k * NCT, t = i / (SL / 8), ch = i - t * (SL / 8), u = ch >> 3, cc = ch & 7;
+    *reinterpret_cast<uint4*>(X + u * XU + t * 128 + ((cc ^ (t & 7)) * 16)) = v[k];
   }
 }
 
-// After hn[e] is written: split-K coefficient projection over the ranks (one 64-row tile per token CTA), rank-ordered
-// sum of the fp32 partials with one BF16 rounding, input convolution of the owned slice, slice all-gather, then the
-// per-token fp8 quant into the x buffer of event e.
+// After hn[e] is written: this rank's 192 coefficient rows (3 tiles) split-K over the 8 CTAs of all-reduce clusters
+// 0..2, partials summed over DSMEM in rank order with one BF16 rounding; the input-side ones go to every rank, and
+// every token CTA convolves its full row and quantizes it into the x buffer of event e.
 DEV void conv_tail(const Params& p, Smem& s, int t, int e, int ctid, unsigned E, int& cslot, uint32_t& cpar) {
   const int lane = ctid & 31, warp = ctid >> 5, wg = ctid >> 7, ww = (ctid >> 5) & 3;
   const int ai = (static_cast<int>(cluster_id_x()) - AR0) * CS + static_cast<int>(cluster_rank());
   const unsigned ytgt = (E * 10u + static_cast<unsigned>(e) + 1u) * 32u;
   if (ctid == 0) red_release(p.cnt + C_Y, 1u);
-  float* stage = reinterpret_cast<float*>(s.greg + XREG);  // [MT][64] fp32 partial of this CTA's tile
+  float* stage = reinterpret_cast<float*>(s.greg);  // [MT][64] fp32 partial of warpgroup 1 (after the K loop)
   if (ctid == 0) wait_ge(p.cnt + C_Y, ytgt);
   bar_sync(1, NCT);
+  // full-row convolution inputs: row t, row t - 1 of the block, the base taps
+  const int pos = t & (BLK - 1);
+  const __nv_bfloat16* hr = p.hn + (static_cast<int64_t>(e) * MT + t) * H;
+  const __nv_bfloat16* cb = p.L[e >> 1].cbase[e & 1][0];
+  uint4 ha[3], hp[3], s0[3], s1[3];
+  auto load_conv_inputs = [&]() {
+#pragma unroll
+    for (int cc = 0; cc < 3; ++cc) {
+      const int c0 = cc * NCT * 8 + ctid * 8;
+      ha[cc] = ldcg_v4(hr + c0);
+      hp[cc] = pos ? ldcg_v4(hr - H + c0) : make_uint4(0u, 0u, 0u, 0u);
+      s0[cc] = __ldg(reinterpret_cast<const uint4*>(cb + c0));
+      s1[cc] = __ldg(reinterpret_cast<const uint4*>(cb + H + c0));
+    }
+  };
   if (ai < CF_TILES) {
+    // warpgroup w multiplies ring units 3w .. 3w + 2; the two fp32 partials are summed
     uint8_t* X = s.greg;
-    cf_load_x(p, X, e, p.rank, 0, ctid);
+    const int kch = static_cast<int>(cluster_rank());
+    if (ctid == 0) mbar_expect_tx(s.cbar, 8u * 8u * MT * 4u);  // 8 rows x 32 tokens fp32 from each of the 8 CTAs
+    cf_load_x(p, X, e, kch, ctid);
     fence_proxy_async_shared();
     bar_sync(1, NCT);
+    load_conv_inputs();  // in flight during the tile
+    constexpr int UW = CF_NU / 2;
+    const int ns = s.nslot, c0 = cslot;
+    const uint32_t p0 = cpar;
+    auto slot_of = [&](int u, uint32_t& par) {
+      int x = c0 + u;
+      uint32_t pr = p0;
+      while (x >= ns) {
+        x -= ns;
+        pr ^= 1u;
+      }
+      par = pr;
+      return x;
+    };
+    // every ring unit takes one arrival per warp: the other warpgroup's units are released without being read
+    if (wg == 1) {
+#pragma unroll 1
+      for (int u = 0; u < UW; ++u) {
+        uint32_t pr;
+        const int sl = slot_of(u, pr);
+        __syncwarp();
+        if (lane == 0) mbar_arrive(&s.empty[sl]);
+      }
+    }
     float acc[16];
 #pragma unroll
     for (int r = 0; r < 16; ++r) acc[r] = 0.f;
     int prev = -1;
 #pragma unroll 1
-    for (int u = 0; u < CF_NU; ++u) {
-      if (u == 6) {
-        wgmma_wait<0>();
-        bar_sync(1, NCT);
-        cf_load_x(p, X, e, p.rank, 1, ctid);
-        fence_proxy_async_shared();
-        bar_sync(1, NCT);
-      }
-      const int slot = cslot;
-      const uint32_t par = cpar;
-      if (++cslot == s.nslot) {
-        cslot = 0;
-        cpar ^= 1u;
-      }
+    for (int i = 0; i < UW; ++i) {
+      const int u = UW * wg + i;
+      uint32_t par;
+      const int slot = slot_of(u, par);
       mbar_wait(&s.full[slot], par);
-      {
-        const uint64_t da = make_desc(s.ring + slot * SLAB + wg * TILEB);
-        const uint64_t db = make_desc(X + (u >= 6 ? u - 6 : u) * XU);
-        wgmma_fence();
+      wgmma_fence();
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const uint64_t da = make_desc(s.ring + slot * SLAB + h * TILEB);
+        const uint64_t db = make_desc(X + (2 * u + h) * XU);
 #pragma unroll
         for (int kk = 0; kk < 4; ++kk) wgmma_m64n32k16_bf16(acc, da + 2 * kk, db + 2 * kk);
-        wgmma_commit();
       }
+      wgmma_commit();
       if (prev >= 0) {
         wgmma_wait<1>();
         __syncwarp();
@@ -712,6 +753,21 @@ DEV void conv_tail(const Params& p, Smem& s, int t, int e, int ctid, unsigned E,
     __syncwarp();
     if (lane == 0) mbar_arrive(&s.empty[prev]);
     if (wg == 0) {
+#pragma unroll 1
+      for (int u = UW; u < CF_NU; ++u) {
+        uint32_t pr;
+        const int sl = slot_of(u, pr);
+        __syncwarp();
+        if (lane == 0) mbar_arrive(&s.empty[sl]);
+      }
+    }
+    {
+      uint32_t pr;
+      cslot = slot_of(CF_NU, pr);
+      cpar = pr;
+    }
+    bar_sync(1, NCT);  // both warpgroups' wgmma reads of X are done: X becomes the staging / receive area
+    if (wg == 1) {
 #pragma unroll
       for (int r = 0; r < 16; ++r) {
         const int rho = 16 * ww + (lane >> 2) + 8 * ((r >> 1) & 1);
@@ -720,141 +776,91 @@ DEV void conv_tail(const Params& p, Smem& s, int t, int e, int ctid, unsigned E,
       }
     }
     bar_sync(1, NCT);
-    // push each coefficient row to the rank that owns its groups
-    for (int i = ctid; i < MT * 64; i += NCT) {
-      const int tok = i >> 6, rho = i & 63;
-      const int j = ai * 64 + rho, side = j / (CF_N / 2), rem = j % (CF_N / 2), tap = rem / CF_G, g = rem % CF_G;
-      const int q = g / (CF_G / R), li = side * (CS_N / 2) + tap * (CF_G / R) + (g % (CF_G / R));
-      const int ph = (s.calls0[tok] + e) & 1;
-      unsigned* dst = reinterpret_cast<unsigned*>(
-          p.peer[q] + CP_OFF + (((static_cast<int64_t>(ph) * MT + tok) * R + p.rank) * CS_N + li) * 4);
-      asm volatile("st.global.u32 [%0], %1;" ::"l"(dst), "r"(nz(__float_as_uint(stage[tok * 64 + rho]))) : "memory");
-    }
-  }
-  bar_sync(1, NCT);  // the tile GEMM's X / stage regions are reused below
-  float* rcv = reinterpret_cast<float*>(s.greg);                       // [R][CS_N] this token's partials
-  float* coef = reinterpret_cast<float*>(s.greg + R * CS_N * 4);       // [CS_N] this rank's coefficients
-  __nv_bfloat16* xrow = reinterpret_cast<__nv_bfloat16*>(s.greg + 8192);  // [H] convolved row
-  const int ph = (s.calls0[t] + e) & 1;
-  // ---- coefficients of token t: rank-ordered sum, one BF16 rounding ----
-  {
-    uint8_t* base = p.peer[p.rank] + CP_OFF + (static_cast<int64_t>(ph) * MT + t) * R * CS_N * 4;
-    constexpr int NV = R * CS_N / 4;  // 384 16-byte words
-    uint4 d[2];
-    bool have[2];
+    float* recv = reinterpret_cast<float*>(s.greg + 2 * CF_NU * XU);  // [8 K chunks][8 rows][32 token positions]
+    if (wg == 0) {
+      const uint32_t rbase = smem_u32(recv), rbar = smem_u32(s.cbar);
 #pragma unroll
-    for (int j = 0; j < 2; ++j) {
-      have[j] = j * NCT + ctid < NV;
-      d[j] = have[j] ? ld_vol_v4(base + (j * NCT + ctid) * 16) : make_uint4(1u, 1u, 1u, 1u);
-    }
-    bool done;
-    do {
-      done = true;
-#pragma unroll
-      for (int j = 0; j < 2; ++j) {
-        if (d[j].x == 0u || d[j].y == 0u || d[j].z == 0u || d[j].w == 0u) {
-          d[j] = ld_vol_v4(base + (j * NCT + ctid) * 16);
-          done = false;
-        }
+      for (int r = 0; r < 16; ++r) {
+        const int rho = 16 * ww + (lane >> 2) + 8 * ((r >> 1) & 1);
+        const int tok = 8 * (r >> 2) + 2 * (lane & 3) + (r & 1);
+        acc[r] += stage[tok * 64 + rho];
       }
-    } while (!done);
 #pragma unroll
-    for (int j = 0; j < 2; ++j) {
-      if (!have[j]) continue;
-      st_v4(base + (j * NCT + ctid) * 16, make_uint4(0u, 0u, 0u, 0u));
-      *reinterpret_cast<uint4*>(rcv + (j * NCT + ctid) * 4) = make_uint4(unz(d[j].x), unz(d[j].y), unz(d[j].z), unz(d[j].w));
+      for (int hf = 0; hf < 2; ++hf) {
+        const int rho = 16 * ww + (lane >> 2) + 8 * hf;
+        const int owner = rho >> 3, lrow = rho & 7;
+        const uint32_t off = static_cast<uint32_t>(((kch * 8 + lrow) * 32 + (lane & 3) * 8) * 4);
+        const uint32_t dst = mapa(rbase + off, owner), bar = mapa(rbar, owner);
+        const int r0 = 2 * hf;
+        st_async_v4(dst, acc[r0], acc[r0 + 1], acc[r0 + 4], acc[r0 + 5], bar);
+        st_async_v4(dst + 16, acc[r0 + 8], acc[r0 + 9], acc[r0 + 12], acc[r0 + 13], bar);
+      }
+    }
+    mbar_wait_cluster(s.cbar, static_cast<uint32_t>(e & 1));
+    {
+      // rows 8 kch .. 8 kch + 7 of tile (ai / 8): rank-ordered sum of the 8 K chunks, one BF16 rounding
+      const int tok = ctid >> 3, rr = ctid & 7;
+      float v = 0.f;
+#pragma unroll
+      for (int q = 0; q < CS; ++q) v += recv[(q * 8 + rr) * 32 + tpos(tok)];
+      const int li0 = (ai >> 3) * 64 + kch * 8, li = li0 + rr;  // row of W_r: [side][tap][group]
+      const int side = li / (CS_N / 2), tap = (li % (CS_N / 2)) / (CF_G / R), gl = li % (CF_G / R);
+      const __nv_bfloat16 bv = __float2bfloat16_rn(v);
+      p.coef[(static_cast<int64_t>(e) * MT + tok) * CF_N + side * (CF_N / 2) + tap * CF_G + p.rank * (CF_G / R) + gl] = bv;
+      if (li0 < CS_N / 2) {
+        // input side: the 8 rows of this token (lanes 8 j .. 8 j + 7) as one 16-byte piece, lane rr pushes it to rank rr
+        const uint32_t bits = static_cast<uint32_t>(__bfloat16_as_ushort(bv));
+        uint32_t w[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+          const uint32_t lo = __shfl_sync(0xffffffffu, bits, (lane & ~7) | (2 * k));
+          const uint32_t hi = __shfl_sync(0xffffffffu, bits, (lane & ~7) | (2 * k + 1));
+          w[k] = lo | (hi << 16);
+        }
+        const int php = (s.calls0[tok] + e) & 1;
+        st_v4(p.peer[rr] + CX_OFF + ((static_cast<int64_t>(php) * MT + tok) * R + p.rank) * CS_N + li0 * 2,
+              make_uint4(nz(w[0]), nz(w[1]), nz(w[2]), nz(w[3])));
+      }
+    }
+  } else {
+    load_conv_inputs();
+  }
+  // ---- input-side coefficients of all 384 groups ----
+  float* cf = reinterpret_cast<float*>(s.greg + 8192);
+  const int ph = (s.calls0[t] + e) & 1;
+  if (ctid < R * (CS_N / 16)) {
+    const int q = ctid / (CS_N / 16), v = ctid - q * (CS_N / 16);
+    uint8_t* sp = p.peer[p.rank] + CX_OFF + ((static_cast<int64_t>(ph) * MT + t) * R + q) * CS_N + v * 16;
+    const uint4 d = poll_ll_v4(sp);
+    st_v4(sp, make_uint4(0u, 0u, 0u, 0u));
+    // rows 8 v .. 8 v + 7 of source q's input side: tap v / 6, groups 48 q + 8 (v % 6) ..
+    float* dst = cf + (v / 6) * CF_G + q * (CF_G / R) + (v % 6) * 8;
+    const uint32_t w[4] = {d.x, d.y, d.z, d.w};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      dst[2 * j] = bf_lo(w[j]);
+      dst[2 * j + 1] = bf_hi(w[j]);
     }
   }
   bar_sync(1, NCT);
-  if (ctid < CS_N) {
-    float v = 0.f;
+  // ---- input convolution of the full row (fp32, BF16 output) and per-token fp8 quant ----
+  uint32_t xb[3][4];
+  float amx = 0.f;
 #pragma unroll
-    for (int q = 0; q < R; ++q) v += rcv[q * CS_N + ctid];
-    const float cb = bf16r(v);
-    coef[ctid] = cb;
-    const int side = ctid / (CS_N / 2), tap = (ctid % (CS_N / 2)) / (CF_G / R), gl = ctid % (CF_G / R);
-    p.coef[(static_cast<int64_t>(e) * MT + t) * CF_N + side * (CF_N / 2) + tap * CF_G + p.rank * (CF_G / R) + gl] =
-        __float2bfloat16_rn(cb);
-  }
-  bar_sync(1, NCT);
-  // ---- input convolution of the owned slice, then all-gather ----
-  const int pos = t & (BLK - 1);
-  if (ctid < SL / 8) {
-    const int c0 = p.rank * SL + ctid * 8, gl = ctid >> 1;
-    const float d0 = coef[gl], d1 = coef[CF_G / R + gl];
-    const __nv_bfloat16* hr = p.hn + (static_cast<int64_t>(e) * MT + t) * H + c0;
-    const __nv_bfloat16* cb0 = p.L[e >> 1].cbase[e & 1][0] + c0;
-    const uint4 a = ldcg_v4(hr);
-    const uint4 b = pos ? ldcg_v4(hr - H) : make_uint4(0u, 0u, 0u, 0u);
-    const uint4 s0 = __ldg(reinterpret_cast<const uint4*>(cb0));
-    const uint4 s1 = __ldg(reinterpret_cast<const uint4*>(cb0 + H));
-    const uint32_t aw[4] = {a.x, a.y, a.z, a.w}, bw[4] = {b.x, b.y, b.z, b.w};
-    const uint32_t s0w[4] = {s0.x, s0.y, s0.z, s0.w}, s1w[4] = {s1.x, s1.y, s1.z, s1.w};
-    uint32_t o[4];
+  for (int cc = 0; cc < 3; ++cc) {
+    const int g = (cc * NCT * 8 + ctid * 8) >> 4;
+    const float d0 = cf[g], d1 = cf[CF_G + g];
+    const uint32_t aw[4] = {ha[cc].x, ha[cc].y, ha[cc].z, ha[cc].w}, bw[4] = {hp[cc].x, hp[cc].y, hp[cc].z, hp[cc].w};
+    const uint32_t s0w[4] = {s0[cc].x, s0[cc].y, s0[cc].z, s0[cc].w}, s1w[4] = {s1[cc].x, s1[cc].y, s1[cc].z, s1[cc].w};
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       float lo = (bf_lo(s0w[j]) + d0) * bf_lo(aw[j]);
       float hi = (bf_hi(s0w[j]) + d0) * bf_hi(aw[j]);
       lo += (bf_lo(s1w[j]) + d1) * bf_lo(bw[j]);
       hi += (bf_hi(s1w[j]) + d1) * bf_hi(bw[j]);
-      o[j] = pack_bf2(lo, hi);
+      xb[cc][j] = pack_bf2(lo, hi);
+      amx = fmaxf(amx, fmaxf(fabsf(bf_lo(xb[cc][j])), fabsf(bf_hi(xb[cc][j]))));
     }
-    *reinterpret_cast<uint4*>(xrow + c0) = make_uint4(o[0], o[1], o[2], o[3]);
-    const uint4 m = make_uint4(nz(o[0]), nz(o[1]), nz(o[2]), nz(o[3]));
-#pragma unroll 1
-    for (int di = 0; di < R - 1; ++di) {
-      const int q = di + (di >= p.rank);
-      st_v4(p.peer[q] + GX_OFF + ((static_cast<int64_t>(ph) * MT + t) * R + p.rank) * (SL * 2) + ctid * 16, m);
-    }
-  }
-  {
-    constexpr int NV = (R - 1) * (SL / 8);  // 672
-    constexpr int PER = (NV + NCT - 1) / NCT;
-    uint8_t* mine = p.peer[p.rank];
-    uint4 d[PER];
-    uint8_t* slp[PER];
-#pragma unroll
-    for (int j = 0; j < PER; ++j) {
-      const int k = j * NCT + ctid;
-      slp[j] = nullptr;
-      d[j] = make_uint4(1u, 1u, 1u, 1u);
-      if (k < NV) {
-        const int di = k / (SL / 8), v = k - di * (SL / 8), q = di + (di >= p.rank);
-        slp[j] = mine + GX_OFF + ((static_cast<int64_t>(ph) * MT + t) * R + q) * (SL * 2) + v * 16;
-        d[j] = ld_vol_v4(slp[j]);
-      }
-    }
-    bool done;
-    do {
-      done = true;
-#pragma unroll
-      for (int j = 0; j < PER; ++j) {
-        if (d[j].x == 0u || d[j].y == 0u || d[j].z == 0u || d[j].w == 0u) {
-          d[j] = ld_vol_v4(slp[j]);
-          done = false;
-        }
-      }
-    } while (!done);
-#pragma unroll
-    for (int j = 0; j < PER; ++j) {
-      const int k = j * NCT + ctid;
-      if (k < NV) {
-        st_v4(slp[j], make_uint4(0u, 0u, 0u, 0u));
-        const int di = k / (SL / 8), v = k - di * (SL / 8), q = di + (di >= p.rank);
-        *reinterpret_cast<uint4*>(xrow + q * SL + v * 8) = make_uint4(unz(d[j].x), unz(d[j].y), unz(d[j].z), unz(d[j].w));
-      }
-    }
-  }
-  bar_sync(1, NCT);
-  // ---- per-token fp8 quant of the full convolved row ----
-  uint32_t xb[3][4];
-  float amx = 0.f;
-#pragma unroll
-  for (int cc = 0; cc < 3; ++cc) {
-    const uint4 v = *reinterpret_cast<const uint4*>(xrow + cc * NCT * 8 + ctid * 8);
-    xb[cc][0] = v.x; xb[cc][1] = v.y; xb[cc][2] = v.z; xb[cc][3] = v.w;
-#pragma unroll
-    for (int j = 0; j < 4; ++j) amx = fmaxf(amx, fmaxf(fabsf(bf_lo(xb[cc][j])), fabsf(bf_hi(xb[cc][j]))));
   }
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) amx = fmaxf(amx, __shfl_xor_sync(0xffffffffu, amx, o));
@@ -899,6 +905,8 @@ DEV void allreduce(const Params& p, Smem& s, int t, int kar, int ctid, unsigned 
   __nv_bfloat16* const rrow = p.hidden + static_cast<int64_t>(t) * H;
   const int col = ctid * 4;
   constexpr int ACT = SL / 4;  // 192
+  // the output-side coefficients of event kar were written before every token CTA released C_X of that event
+  if (p.conv && ctid == NCT - 1) wait_ge(p.cnt + C_X, (E * 11u + static_cast<unsigned>(kar) + 1u) * 32u);
   // ---- owner reduce of the 8 pushed partial slices, in rank order ----
   uint2 hb = make_uint2(0u, 0u);
   if (ctid < ACT) {
@@ -1855,6 +1863,7 @@ __global__ void __launch_bounds__(THREADS, 1) dflash_mega_kernel(const __grid_co
     s.combbar = s.xbar + 4;
     s.combok = s.xbar + 5;
     s.hbar = s.xbar + 6;
+    s.cbar = s.xbar + 7;
     s.calls0 = reinterpret_cast<int*>(m + 320);
     s.sx = reinterpret_cast<float*>(m + 448);
     s.sinv = reinterpret_cast<float*>(m + 576);
@@ -1882,6 +1891,7 @@ __global__ void __launch_bounds__(THREADS, 1) dflash_mega_kernel(const __grid_co
     mbar_init(s.combbar, 1);
     mbar_init(s.combok, CS);
     mbar_init(s.hbar, 1);
+    mbar_init(s.cbar, 1);
     s.misc[2] = 0;   // DM_QUIET release counter
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
@@ -1997,7 +2007,7 @@ struct DFlashMega {
     const int64_t* wp = static_cast<const int64_t*>(wptr.data_ptr());
     CUtensorMap h[NL * NPH + 2];
     std::memset(h, 0, sizeof(h));
-    const uint64_t N[NPH] = {QKV_N, H, 2 * INTER, H, CF_N, CF_N};
+    const uint64_t N[NPH] = {QKV_N, H, 2 * INTER, H, CS_N, CS_N};
     const uint64_t K[NPH] = {H, INTER, H, INTER, H, H};
     for (int l = 0; l < NL; ++l)
       for (int ph = 0; ph < NPH; ++ph) {

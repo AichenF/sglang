@@ -141,7 +141,8 @@ class DFlashMegaState:
       sinks                   -- [16] bf16/fp32 or None
       k_cache, v_cache        -- bf16 [slots, 1, 128]
     and, for convolution drafts (all layers or none):
-      w_ca, w_cm              -- bf16 [1536, H] coefficient projections (attention, mlp)
+      w_ca, w_cm              -- bf16 [192, H] coefficient projection rows of this rank's 48 groups (attention, mlp),
+                                 [side][tap][group]
       cb_a, cb_m              -- bf16 [2 (input, output), 2 taps, H] base kernels
     """
 
@@ -193,7 +194,7 @@ class DFlashMegaState:
                 wptr.append(w.data_ptr())
         exp = {"w_qkv": (2304, H), "w_o": (H, 2048), "w_gu": (4096, H), "w_dn": (H, 2048)}
         if self.conv:
-            exp.update({"w_ca": (1536, H), "w_cm": (1536, H), "cb_a": (2, 2, H), "cb_m": (2, 2, H)})
+            exp.update({"w_ca": (192, H), "w_cm": (192, H), "cb_a": (2, 2, H), "cb_m": (2, 2, H)})
         for L in layers:
             for k, shp in exp.items():
                 assert tuple(L[k].shape) == shp, (k, tuple(L[k].shape))
