@@ -13,6 +13,7 @@ from torch import nn
 
 from sglang.kernels.ops.speculative.dflash import (
     pack_candidates,
+    selector_lattice_triton,
     selector_walk_triton,
     unpack_candidate_ids,
 )
@@ -123,12 +124,14 @@ def candidate_topk(
     with_partition: bool = False,
     gatherer=None,
     ids_out: Optional[torch.Tensor] = None,
+    rows_only: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Global top-k candidates from the target head: hidden [N, H] -> ids / vals [N, K].
 
     Under TP (vocab-sharded lm_head): local top-k per shard, all-gather K logits/ids (not
     the full vocab), then a global top-k -- identical candidates at O(tp*K) instead of
     O(vocab) gather bandwidth. with_partition also returns the full-vocabulary lse [N] fp32.
+    rows_only returns the gathered [N, tp, 2, K] rows instead (packed gather only).
     """
     # The worker screens the head before capture, but the eager fallbacks attach
     # whatever the target has.
@@ -163,6 +166,8 @@ def candidate_topk(
         packed = pack_candidates(vals, ids, id_offset)
         gathered = gatherer(packed.view(torch.bfloat16)).view(torch.float32)
         gathered = gathered.view(rows, -1, 2, k)
+        if rows_only:
+            return gathered
         top_vals, sel = torch.topk(gathered[:, :, 0, :].reshape(rows, -1), k, dim=-1)
         return unpack_candidate_ids(gathered, sel, out=ids_out), top_vals, None
     global_ids = ids.long() + id_offset
@@ -1360,6 +1365,38 @@ class DFlash2DraftModel(DFlashDraftModel):
             ids_out=ids_out,
         )
         return ids, self._transform_unary_logits(vals)
+
+    def compute_lattice(self, hidden, anchor_token_ids, ids_out=None):
+        """compute_candidates + build_lattice in one kernel after the packed gather, else None."""
+        selector = self.candidate_selector
+        k = selector.top_k
+        if (
+            self.candidate_gatherer is None
+            or not hidden.is_cuda
+            or int(self.lm_head.org_vocab_size) > (1 << 24)
+            or self.draft_config.output_multiplier != 1.0
+            or self.draft_config.final_logit_softcapping is not None
+            or k > 32
+            or selector.successor_codebook.dtype != torch.bfloat16
+        ):
+            return None
+        bs, slots, _ = hidden.shape
+        flat = hidden.reshape(bs * slots, -1)
+        gathered = candidate_topk(
+            flat, self.lm_head, k, gatherer=self.candidate_gatherer, rows_only=True
+        )
+        if ids_out is None:
+            ids_out = torch.empty((bs * slots, k), dtype=torch.int64, device=hidden.device)
+        ids = ids_out.view(bs, slots, k)
+        scores = selector_lattice_triton(
+            gathered,
+            anchor_token_ids,
+            selector.hidden_projection(flat).view(bs, slots, -1),
+            selector.predecessor_codebook,
+            selector.successor_codebook,
+            ids,
+        )
+        return ids, scores
 
 
 class MuseGlimmerAssistantModel(DFlashDraftModel):

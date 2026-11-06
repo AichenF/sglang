@@ -328,6 +328,9 @@ def _is_all_greedy(sampling_info) -> bool:
 
 
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids, ids_out=None):
+    fused = draft_model.compute_lattice(pred_hidden, anchor_token_ids, ids_out)
+    if fused is not None:
+        return fused
     # Flattened to [N, H] and viewed back because the radix top-k kernel is 2D.
     bs, num_pred = pred_hidden.shape[0], pred_hidden.shape[1]
     candidate_ids, unary_logits = draft_model.compute_candidates(

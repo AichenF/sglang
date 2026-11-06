@@ -6,6 +6,7 @@ import torch
 
 from sglang.kernels.ops.speculative.dflash import (
     pack_candidates,
+    selector_lattice_triton,
     selector_walk_triton,
     unpack_candidate_ids,
 )
@@ -67,6 +68,52 @@ class TestCandidatePack(unittest.TestCase):
         self.assertTrue(torch.equal(ref_tokens, tokens))
         self.assertTrue(torch.equal(ref_q.view(torch.int32), q.view(torch.int32)))
 
+    def test_fused_lattice(self):
+        from sglang.srt.models.dflash import CandidateSelector
+
+        gen = torch.Generator(device="cuda").manual_seed(3)
+        vocab, slots = 4096, 7
+
+        def steps(shape, top, scale):  # small steps keep every product and sum exact
+            return torch.randint(-top, top + 1, shape, device="cuda", generator=gen) / scale
+
+        sel = CandidateSelector(hidden_size=64, vocab_size=vocab, state_rank=256, top_k=K).cuda().bfloat16()
+        with torch.no_grad():
+            for p in sel.parameters():
+                p.copy_(steps(p.shape, 3 if p.shape[0] == vocab else 1, 4))
+        for bs in (1, 2, 3, 4):
+            rows = bs * slots
+            vals = steps((rows, RANKS, K), 4, 2)  # ties within and across ranks
+            vals[..., -2:] = -0.0
+            vals = vals.sort(dim=-1, descending=True).values
+            ids = torch.randint(0, vocab, vals.shape, device="cuda", generator=gen).float()
+            gathered = torch.stack((vals, ids), dim=2)
+            hidden = steps((bs, slots, 64), 1, 1).bfloat16()
+            anchor = torch.randint(0, vocab, (bs, 8), device="cuda", generator=gen)[:, 0]
+            top_vals, top = torch.topk(gathered[:, :, 0, :].reshape(rows, -1), K, dim=-1)
+            ref_ids = unpack_candidate_ids(gathered, top).view(bs, slots, K)
+            ref_scores = sel.build_lattice(
+                candidate_ids=ref_ids,
+                unary_logits=top_vals.view(bs, slots, K),
+                hidden_states=hidden,
+                anchor_token_ids=anchor,
+            )
+            new_ids = torch.empty_like(ref_ids)
+            projected = sel.hidden_projection(hidden.view(rows, -1)).view(bs, slots, -1)
+            new_scores = selector_lattice_triton(
+                gathered, anchor, projected, sel.predecessor_codebook, sel.successor_codebook, new_ids
+            )
+            self.assertTrue(torch.equal(ref_ids, new_ids))
+            self.assertTrue(torch.equal(ref_scores.view(torch.int32), new_scores.view(torch.int32)))
+            walk = dict(
+                uniforms=torch.rand(bs, slots, device="cuda", generator=gen),
+                temperatures=torch.full((bs,), 0.7, device="cuda"),
+                greedy_mask=torch.arange(bs, device="cuda") % 2 == 0,
+            )
+            ref = selector_walk_triton(candidate_ids=ref_ids, scores=ref_scores, **walk)
+            new = selector_walk_triton(candidate_ids=new_ids, scores=new_scores, **walk)
+            for a, b in zip(ref, new):
+                self.assertTrue(torch.equal(a.view(torch.int32), b.view(torch.int32)))
 
 if __name__ == "__main__":
     unittest.main()
