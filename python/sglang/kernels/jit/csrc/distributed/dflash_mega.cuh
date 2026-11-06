@@ -1830,10 +1830,13 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
     if (lane == 0) s.red[16 + warp] = amx;
   }
   bar_sync(1, NCT);
+  float amx = 0.f;
   if (ctid == 0) {
-    float amx = 0.f;
 #pragma unroll
     for (int w = 0; w < 8; ++w) amx = fmaxf(amx, s.red[16 + w]);
+  }
+  bar_sync(1, NCT);  // the next GEMM phase reuses s.red for its weight scales
+  if (ctid == 0) {
     unsigned* am = p.amax + ((((E & 1u) * 2u + 0u) * NL + l) * MT);
     if (amx > 0.f) atomicMax(am + BLK * b + rank, __float_as_uint(amx));
     dstamp(p, l, 114);
