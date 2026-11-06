@@ -4,8 +4,6 @@
 creation over the TP group's CPU group; every rank must create it at the same point) and the per-token call
 counters. ``arnq`` = reduce-scatter + residual add (residual [M, H] replicated, updated in place) + RMSNorm + per-token FP8
 quant (or bf16) + all-gather of a row-parallel projection's partial output, in one kernel (two NVLink hops).
-``all_reduce_raw`` stops at the BF16 TP sum, before residual addition and normalization,
-so a trained output convolution can run at that boundary.
 """
 
 import functools
@@ -17,8 +15,7 @@ H = 6144
 R = 8
 SL = H // R
 MAXT = 32
-# The last two regions belong to the draft megakernel (convolution drafts): coefficient partials
-# [2][MAXT][R][192] fp32, then convolved slices [2][MAXT][R][SL] bf16.
+# the last two regions are the draft megakernel's (convolution drafts): coefficient partials, convolved slices
 BUF_BYTES = (
     2 * MAXT * R * SL * 2 + 2 * MAXT * R * 8 + 2 * MAXT * R * (SL * 2 + 16) + 2 * MAXT * R * 16 + 2 * MAXT * H * 2
     + 2 * MAXT * R * 192 * 4 + 2 * MAXT * R * SL * 2
@@ -137,30 +134,8 @@ class DFlashTPState:
             1 if prepushed else 0,
         )
 
-    def all_reduce_raw(
-        self,
-        partial: torch.Tensor,
-        out: torch.Tensor,
-        prepushed: bool = False,
-    ) -> None:
-        """Write the rank-ordered FP32 sum rounded to BF16, without residual/norm.
-
-        Both tensors are contiguous CUDA BF16 [M, 6144], with 1 <= M <= 32.
-        This shares IPC slots and per-token epochs with arnq. All TP ranks must
-        issue the same collective sequence with matching M, on the same stream.
-        With prepushed=True the GEMM rs epilogue must already have published all
-        partial slices; partial then supplies shape/device only and is not read.
-        """
-        # Mode 3 never reads the residual, gamma or output-scale placeholders.
-        _module(_pdl()).arnq(
-            partial, partial, partial, out, self.calls, self.calls,
-            self.peers, 0.0, self.rank, 3,
-            0 if self.stamps is None else self.stamps.data_ptr(),
-            1 if prepushed else 0,
-        )
-
     def rs(self):
-        """(peers, calls, rank) for a GEMM epilogue followed by arnq or all_reduce_raw."""
+        """(peers, calls, rank) for skinny_fp8_pt_gemm(rs=...): the GEMM epilogue pushes into the next arnq's slots."""
         return (self.peers, self.calls, self.rank)
 
 

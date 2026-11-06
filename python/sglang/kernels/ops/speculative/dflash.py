@@ -408,7 +408,6 @@ def selector_walk_triton(
     q_out=None,
 ):
     batch, slots, top_k = candidate_ids.shape
-    # tokens_out [batch, slots] int64 / q_out [batch, slots, top_k] fp32, contiguous.
     tokens = (
         tokens_out
         if tokens_out is not None
@@ -447,11 +446,7 @@ def _pack_candidates_kernel(vals_ptr, ids_ptr, out_ptr, id_offset, K: tl.constex
 
 
 def pack_candidates(vals: torch.Tensor, ids: torch.Tensor, id_offset: int) -> torch.Tensor:
-    """[N, K] values and shard-local ids -> [N, 2K] fp32 rows of [values | ids + offset].
-
-    Same bits as torch.cat((vals.float(), (ids.long() + offset).float()), -1);
-    ids stay exact while id + offset < 2**24.
-    """
+    """[N, K] values and shard ids -> [N, 2K] fp32 rows [values | ids + id_offset]."""
     rows, k = vals.shape
     out = torch.empty((rows, 2 * k), dtype=torch.float32, device=vals.device)
     if rows:
@@ -475,11 +470,7 @@ def _unpack_candidate_ids_kernel(
 def unpack_candidate_ids(
     gathered: torch.Tensor, sel: torch.Tensor, out: torch.Tensor = None
 ) -> torch.Tensor:
-    """gathered [N, ranks, 2, K] fp32 rows of [values | ids], sel [N, K] indices into the
-    flattened [ranks * K] values -> ids [N, K] int64 (out, if given, must be contiguous).
-
-    Same values as torch.gather(gathered[..., 1, :].reshape(N, -1).long(), -1, sel).
-    """
+    """gathered [N, ranks, 2, K] rows [values | ids], sel [N, K] into the ranks * K values -> ids [N, K] int64."""
     rows, ranks, _, k = gathered.shape
     if out is None:
         out = torch.empty((rows, k), dtype=torch.int64, device=gathered.device)

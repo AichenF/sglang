@@ -97,7 +97,6 @@ from sglang.srt.speculative.spec_sampling_mask import (
     SpeculativeSamplingMaskCapture,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
-from sglang.kernels.ops.speculative.sample_verify import MAXREQ as MAXREQ_SV
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     SIMULATE_ACC_METHOD,
@@ -413,7 +412,7 @@ class _SelectorDraftSampler:
             tokens_out=tokens_out,
             q_out=q_out,
         )
-        # Paths that do not write the static buffers in place (no TP gather, CPU walk).
+        # paths that do not write the static buffers in place (no TP gather, CPU walk)
         if tokens.data_ptr() != tokens_out.data_ptr():
             tokens_out.copy_(tokens)
         if candidate_ids.data_ptr() != candidate_out.data_ptr():
@@ -735,7 +734,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         elif self.use_compact_draft_cache:
             reason = "compact draft cache"
         elif self.lilicorr is not None or self._is_domino:
-            # The candidate selector only reads the draft output; the draft KV is written from the target hidden as usual.
             reason = "lilicorr/domino draft"
         elif self._fused_kv_helper is None or not self._use_fused_kv_materialize:
             reason = "no fused KV helper"
@@ -2194,8 +2192,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         q_rows: torch.Tensor,
         sampling_info,
         draft_input,
-        uniform_samples: Optional[torch.Tensor] = None,
-        uniform_samples_final: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Scatter the selector's sparse q into a dense one for DSpark's kernel."""
         bs, block = candidates.shape
@@ -2221,8 +2217,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 gamma=gamma,
                 verify_num_draft_tokens=block,
                 cutoff_verify_lens=None,
-                uniform_samples=uniform_samples,
-                uniform_samples_final=uniform_samples_final,
             )
         finally:
             # Here, not before the next write: candidate_ids may be a view of a
@@ -2230,46 +2224,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             # call scatters different ids and reads q across the whole vocabulary.
             draft_probs.scatter_(-1, candidate_ids, 0.0)
         return accept_len.to(torch.int32), bonus.to(torch.int64)
-
-    def _check_selector_sample_verify(self, *, logits, predict, candidates, sampling_info, draft_input, bs: int) -> None:
-        """SGLANG_DFLASH_VP_ARGMAX_CHECK: the reference selector accept on the full logits with the kernel's coins."""
-        sv = self._sample_verify
-        block = int(self.block_size)
-        gamma = block - 1
-        full = self._materialize_full_logits(logits)
-        cand = candidates.view(bs, block)
-        # the reference sees the logits after the same verify adjustments as its own path
-        apply_dflash_verify_logits_adjustments(
-            next_token_logits=full, sampling_info=sampling_info, draft_token_num=block
-        )
-        coins = sv.sel_coins
-        ref_len, ref_bonus = self._selector_sampling_accept(
-            candidates=cand,
-            next_token_logits=full,
-            candidate_ids=self._selector_sample[0],
-            q_rows=self._selector_sample[1],
-            sampling_info=sampling_info,
-            draft_input=draft_input,
-            uniform_samples=coins[: bs * gamma].view(bs, gamma),
-            uniform_samples_final=coins[MAXREQ_SV * gamma : MAXREQ_SV * gamma + bs],
-        )
-        pv = predict.view(bs, block)
-        idx = torch.arange(block, device=pv.device)
-        cand_next = torch.cat([cand[:, 1:], torch.full_like(cand[:, :1], -2)], dim=1)
-        hit = (pv == cand_next) & (idx < gamma)
-        k_len = torch.where(~hit, idx, torch.full_like(idx, gamma)).min(dim=1).values
-        k_bonus = pv.gather(1, k_len.view(-1, 1)).view(-1)
-        bad_len = int((k_len.to(torch.int32) != ref_len.view(-1)).sum().item())
-        bad_bonus = int(((k_bonus != ref_bonus.view(-1)) & (k_len.to(torch.int32) == ref_len.view(-1))).sum().item())
-        self._sv_check_n = getattr(self, "_sv_check_n", 0) + 1
-        self._sv_check_bad = getattr(self, "_sv_check_bad", 0) + bad_len + bad_bonus
-        if bad_len or bad_bonus or self._sv_check_n % 200 == 1:
-            logger.log(
-                logging.ERROR if (bad_len or bad_bonus) else logging.INFO,
-                "DFLASH selector sampling verify check rank%d step %d: accept-length mismatches %d, bonus mismatches %d "
-                "(total %d over %d steps)",
-                get_parallel().tp_rank, self._sv_check_n, bad_len, bad_bonus, self._sv_check_bad, self._sv_check_n,
-            )
 
     def _greedy_sample_from_quantized_head(
         self,
@@ -2983,7 +2937,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
 
         if self.selector is not None:
-            # Candidate rows are fp32 [values | ids], gathered as raw bits.
             self.draft_model.candidate_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
                 max_tokens=min(max_tokens, 2048), enabled=True
             )
@@ -3202,7 +3155,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 sv.stage_all_greedy(bs)
                 return False
             sv.stage_selector(*self._selector_sample)
-            # Same draws as the reference accept; rank 0's coins, as the reference broadcasts rank 0's result.
+            # the reference accept's draws; rank 0's, as the reference broadcasts rank 0's result
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, sv.draw_selector_coins(bs))
         sv.stage(params)
         if self._sv_logged == 0 and get_parallel().tp_rank == 0 and any(p[0] for p in params):
@@ -3281,7 +3234,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         bs: int,
         in_graph_head: bool,
         candidates: Optional[torch.Tensor] = None,
-        draft_input=None,
     ) -> Optional[torch.Tensor]:
         """Returns target_predict [bs, block] from the vocab-parallel argmax, or
         None (after restoring full fp32 logits in logits_output) for the old path.
@@ -3317,17 +3269,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     ids = ids.to(torch.int64).contiguous()
                 predict = self._sv_run(logits, ids)
             if predict is not None:
-                if self._selector_sample is not None:
-                    if envs.SGLANG_DFLASH_VP_ARGMAX_CHECK.get():
-                        self._check_selector_sample_verify(
-                            logits=logits,
-                            predict=predict,
-                            candidates=candidates,
-                            sampling_info=sampling_info,
-                            draft_input=draft_input,
-                            bs=bs,
-                        )
-                    self._selector_sample = None  # consumed by the kernel
+                self._selector_sample = None  # consumed by the kernel
                 return predict.view(bs, block_size)
         fast = (
             self._selector_sample is None
@@ -4140,7 +4082,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             # shard argmax must then run eagerly.
             in_graph_head=bool(verify_decode_graph and can_run_cuda_graph),
             candidates=draft_tokens,
-            draft_input=draft_input,
         )
 
         grammar_mask = None

@@ -158,8 +158,7 @@ def candidate_topk(
         return ids.long(), vals, lse
     id_offset = int(lm_head.shard_indices.org_vocab_start_index)
     if gatherer is not None and lse is None and int(lm_head.org_vocab_size) <= (1 << 24):
-        # Same packed rows and gather layout as below, but the pack and the id
-        # unpack are one kernel each and the gather is a multimem copy of the same bits.
+        # one gather of fp32 [vals | ids] rows (ids < 2^24 are exact in fp32)
         rows = vals.shape[0]
         packed = pack_candidates(vals, ids, id_offset)
         gathered = gatherer(packed.view(torch.bfloat16)).view(torch.float32)
@@ -167,16 +166,8 @@ def candidate_topk(
         top_vals, sel = torch.topk(gathered[:, :, 0, :].reshape(rows, -1), k, dim=-1)
         return unpack_candidate_ids(gathered, sel, out=ids_out), top_vals, None
     global_ids = ids.long() + id_offset
-    if int(lm_head.org_vocab_size) <= (1 << 24):
-        # One all-gather of [vals | ids] instead of two; ids below 2^24 are exact in fp32.
-        lead = vals.shape[:-1]
-        packed = torch.cat((vals.float(), global_ids.float()), dim=-1)
-        gathered = tensor_model_parallel_all_gather(packed, dim=-1).view(*lead, -1, 2, k)
-        gathered_vals = gathered[..., 0, :].reshape(*lead, -1)
-        gathered_ids = gathered[..., 1, :].reshape(*lead, -1).long()
-    else:
-        gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
-        gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
+    gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
+    gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
     top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
     if lse is not None:
         lse = torch.logsumexp(
@@ -1274,8 +1265,7 @@ class CandidateSelector(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Walk one path, with q over the K candidates for the verify. greedy_mask
         rows take the argmax, selected rather than branched, so one captured graph
-        serves greedy and sampling batches alike. The CUDA walk writes into
-        tokens_out / q_out when given."""
+        serves greedy and sampling batches alike."""
         if scores.is_cuda:
             return selector_walk_triton(
                 candidate_ids=candidate_ids,
@@ -1345,8 +1335,7 @@ class DFlash2DraftModel(DFlashDraftModel):
         # The draft has no head of its own; the worker points this at the target's
         # before capture.
         self.lm_head: Optional[nn.Module] = None
-        # Set by the worker before capture: multimem gather of the TP candidate rows.
-        self.candidate_gatherer = None
+        self.candidate_gatherer = None  # set by the worker
 
     def _transform_unary_logits(self, logits: torch.Tensor) -> torch.Tensor:
         logits = logits.float()
