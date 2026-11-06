@@ -309,7 +309,10 @@ class DFlashTPFast:
             d["v_cache"] = a["value_cache"]
             if self.has_conv:
                 for tag, conv in (("a", layer.attention_conv), ("m", layer.mlp_conv)):
-                    w = conv.kernel_projection.weight.detach().to(torch.bfloat16).contiguous()
+                    w = conv.kernel_projection.weight.detach()
+                    n = w.shape[0] // 4 // 8  # rows of this rank's groups in each [side][tap] block
+                    rows = torch.cat([torch.arange(n) + k * (w.shape[0] // 4) + self.state.rank * n for k in range(4)])
+                    w = w[rows.to(w.device)].to(torch.bfloat16).contiguous()
                     base = conv.base_kernel.detach().to(torch.bfloat16).contiguous()
                     keep += [w, base]
                     d["w_c" + tag], d["cb_" + tag] = w, base
