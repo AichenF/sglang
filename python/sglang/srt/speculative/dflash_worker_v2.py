@@ -353,7 +353,7 @@ class _SelectorDraftSampler:
     """
 
     def __init__(
-        self, *, draft_model, block_size, max_bs, device, sampling_enabled: bool
+        self, *, draft_model, block_size, max_bs, device, sampling_enabled: bool, out_bufs=None
     ):
         self.draft_model = draft_model
         self.selector = draft_model.candidate_selector
@@ -366,12 +366,19 @@ class _SelectorDraftSampler:
         self.temperatures = torch.ones((max_bs,), dtype=torch.float32, device=device)
         self.greedy_mask = torch.ones((max_bs,), dtype=torch.bool, device=device)
         self.uniforms = torch.empty((max_bs, gamma), dtype=torch.float32, device=device)
-        self.candidate_out = torch.empty(
-            (max_bs, gamma, top_k), dtype=torch.int64, device=device
-        )
-        self.q_out = torch.empty(
-            (max_bs, gamma, top_k), dtype=torch.float32, device=device
-        )
+        if out_bufs is not None:
+            # the sampling verify's selector staging buffers: its stage_selector then copies nothing
+            ids_buf, q_buf = out_bufs
+            assert tuple(ids_buf.shape[1:]) == (gamma, top_k) and ids_buf.shape[0] >= max_bs
+            assert tuple(q_buf.shape[1:]) == (gamma, top_k) and q_buf.shape[0] >= max_bs
+            self.candidate_out, self.q_out = ids_buf[:max_bs], q_buf[:max_bs]
+        else:
+            self.candidate_out = torch.empty(
+                (max_bs, gamma, top_k), dtype=torch.int64, device=device
+            )
+            self.q_out = torch.empty(
+                (max_bs, gamma, top_k), dtype=torch.float32, device=device
+            )
         self._staged = None  # (bs, id(temperatures), id(top_ks)) of the rows now in the static buffers
         self._staged_refs = None
 
@@ -1403,12 +1410,26 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "(sampling_enabled=%s).",
                     self._selector_sampling_enabled,
                 )
+            max_bs = max(get_exec().graph.cuda_graph_config.decode.bs)
+            out_bufs = None
+            sv = self._sample_verify
+            if (
+                envs.SGLANG_DFLASH2_SHARED_SELECTOR_BUFS.get()
+                and sv is not None
+                and getattr(sv, "sel_ids", None) is not None
+                and int(sv.sel_gamma) == int(self.block_size) - 1
+                and int(self.selector.top_k) == int(sv.sel_ids.shape[-1])
+            ):
+                # never re-allocated here: the target verify graph already baked the staging buffers' addresses
+                if int(sv.sel_ids.shape[0]) >= max_bs:
+                    out_bufs = (sv.sel_ids, sv.sel_q)
             return _SelectorDraftSampler(
                 draft_model=self.draft_model,
                 block_size=self.block_size,
-                max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+                max_bs=max_bs,
                 device=self.device,
                 sampling_enabled=self._selector_sampling_enabled,
+                out_bufs=out_bufs,
             )
         if self.lilicorr is not None:
             if not head_supported:
@@ -3111,7 +3132,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 else:
                     self._sv_stream = torch.cuda.Stream(device=self.device)
                     if self.selector is not None:
-                        self._sample_verify.enable_selector(int(self.block_size) - 1)
+                        rows = 0
+                        if envs.SGLANG_DFLASH2_SHARED_SELECTOR_BUFS.get():
+                            try:  # room for the draft sampler's outputs (every captured draft bs), see the sampler
+                                rows = max(get_exec().graph.cuda_graph_config.decode.bs)
+                            except Exception:  # noqa: BLE001
+                                rows = 0
+                        self._sample_verify.enable_selector(int(self.block_size) - 1, rows=rows)
             except Exception as e:  # pragma: no cover - defensive
                 reason = f"init failed ({e})"
                 self._sample_verify = None

@@ -1531,6 +1531,9 @@ class Envs:
     # DFlash2 selector draft graph: stage the static temperatures / greedy mask only when the batch's sampling tensors
     # changed (they are replaced, never written in place) instead of 3 eager launches every step; 0 restages always.
     SGLANG_DFLASH2_STAGE_ONCE = EnvBool(True)
+    # DFlash2 selector: the draft graph's sampler writes its candidate ids / q rows straight into the sampling verify's
+    # selector staging buffers (no 2 eager copies per sampled step); 0 keeps separate buffers + the copies.
+    SGLANG_DFLASH2_SHARED_SELECTOR_BUFS = EnvBool(True)
     # gather the draft fc (target-hidden projection) output with the
     # multimem symm-mem all-gather instead of the NCCL ring.
     SGLANG_DFLASH_FC_MULTIMEM = EnvBool(True)
