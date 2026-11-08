@@ -1528,6 +1528,9 @@ class Envs:
     # tie_break=SMALL + pack_candidates) reading the head output of all block rows (no gather copy); 0 restores the
     # flashinfer radix top-k + sort + pack path (same tie rule).
     SGLANG_DFLASH2_SELECTOR_TOPK = EnvBool(True)
+    # DFlash2 selector draft graph: stage the static temperatures / greedy mask only when the batch's sampling tensors
+    # changed (they are replaced, never written in place) instead of 3 eager launches every step; 0 restages always.
+    SGLANG_DFLASH2_STAGE_ONCE = EnvBool(True)
     # gather the draft fc (target-hidden projection) output with the
     # multimem symm-mem all-gather instead of the NCCL ring.
     SGLANG_DFLASH_FC_MULTIMEM = EnvBool(True)

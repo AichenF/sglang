@@ -372,14 +372,36 @@ class _SelectorDraftSampler:
         self.q_out = torch.empty(
             (max_bs, gamma, top_k), dtype=torch.float32, device=device
         )
+        self._staged = None  # (bs, id(temperatures), id(top_ks)) of the rows now in the static buffers
+        self._staged_refs = None
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Host-side refresh of the static sampling params; must run before the draft
-        graph replay that consumes them."""
+        graph replay that consumes them.
+
+        Skipped when the batch's temperatures / top_ks are the very tensors staged last time
+        (SGLANG_DFLASH2_STAGE_ONCE): SamplingBatchInfo replaces them on every filter / merge and
+        never writes them in place (the sampler's top-k-all fill keeps top_k > 1), and the static
+        rows [:bs] are written only here. The staged tensors are held, so their ids stay unique."""
         if sampling_info is None or not self.sampling_enabled:
+            key = (bs, None, None)
+            if self._staged == key and envs.SGLANG_DFLASH2_STAGE_ONCE.get():
+                return
             self.temperatures[:bs].fill_(1.0)
             self.greedy_mask[:bs].fill_(True)
+            self._staged, self._staged_refs = key, None
             return
+        temps, top_ks = sampling_info.temperatures, sampling_info.top_ks
+        key = (bs, id(temps), id(top_ks))
+        if (
+            self._staged == key
+            and self._staged_refs is not None
+            and self._staged_refs[0] is temps
+            and self._staged_refs[1] is top_ks
+            and envs.SGLANG_DFLASH2_STAGE_ONCE.get()
+        ):
+            return
+        self._staged, self._staged_refs = key, (temps, top_ks)
         torch.clamp(
             sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
             min=1e-5,
