@@ -2963,8 +2963,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
 
         if self.selector is not None:
+            # No entry barrier: between two candidate gathers every rank passes the draft megakernel's /
+            # fused-TP layers' cross-rank all-reduces of the next step (and the verify step), which a rank can
+            # only enter after its lattice read the previous gather's buffer view (stream order).
             self.draft_model.candidate_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
-                max_tokens=min(max_tokens, 2048), enabled=True
+                max_tokens=min(max_tokens, 2048), enabled=True, skip_entry_sync=True
             )
 
         if envs.SGLANG_DFLASH_FC_MULTIMEM.get():
