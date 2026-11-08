@@ -1523,6 +1523,11 @@ class Envs:
     # processors keep the full-logits path. Needs SGLANG_DFLASH_VP_ARGMAX; 0 restores the full-logits path for every
     # sampled batch.
     SGLANG_DFLASH_SAMPLE_FUSED = EnvBool(True)
+    # DFlash2 candidate selector: the local top-16 of the draft LM-head shard + the packed candidate row as one owned
+    # kernel (kernels/ops/speculative/dflash.py selector_topk_pack; ties by smallest index, = flashinfer top_k with
+    # tie_break=SMALL + pack_candidates) reading the head output of all block rows (no gather copy); 0 restores the
+    # flashinfer radix top-k + sort + pack path (same tie rule).
+    SGLANG_DFLASH2_SELECTOR_TOPK = EnvBool(True)
     # gather the draft fc (target-hidden projection) output with the
     # multimem symm-mem all-gather instead of the NCCL ring.
     SGLANG_DFLASH_FC_MULTIMEM = EnvBool(True)

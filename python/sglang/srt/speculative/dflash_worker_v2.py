@@ -327,8 +327,8 @@ def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
 
 
-def _selector_lattice(draft_model, pred_hidden, anchor_token_ids, ids_out=None):
-    fused = draft_model.compute_lattice(pred_hidden, anchor_token_ids, ids_out)
+def _selector_lattice(draft_model, pred_hidden, anchor_token_ids, ids_out=None, full_hidden=None):
+    fused = draft_model.compute_lattice(pred_hidden, anchor_token_ids, ids_out, full_hidden=full_hidden)
     if fused is not None:
         return fused
     # Flattened to [N, H] and viewed back because the radix top-k kernel is 2D.
@@ -404,6 +404,7 @@ class _SelectorDraftSampler:
             hs,
             block_ids[:, 0],
             ids_out=candidate_out.view(bs * gamma, -1),
+            full_hidden=hidden_states if hidden_states.dim() == 2 else None,
         )
         # In-graph philox draw: each replay advances the generator and redraws.
         tokens, q_rows = self.selector.sample_path(

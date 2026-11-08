@@ -14,6 +14,7 @@ from torch import nn
 from sglang.kernels.ops.speculative.dflash import (
     pack_candidates,
     selector_lattice_triton,
+    selector_topk_pack,
     selector_walk_triton,
     unpack_candidate_ids,
 )
@@ -65,11 +66,15 @@ try:
 except ImportError:
     _flashinfer_top_k = None
 
+# Ties among equal logits are taken (and ordered) by smallest index: flashinfer's TopKTieBreak.SMALL, the rule the
+# owned selector_topk_pack kernel implements bitwise (the default tie_break=NONE order is implementation-defined).
+_TIE_BREAK_SMALL = 1
+
 
 def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
     # The selector's largest single cost: it reads the whole logits tensor.
     if _flashinfer_top_k is not None:
-        return _flashinfer_top_k(scores, k, sorted=True, deterministic=True)
+        return _flashinfer_top_k(scores, k, sorted=True, deterministic=True, tie_break=_TIE_BREAK_SMALL)
     return torch.topk(scores, k, dim=-1)
 
 
@@ -125,6 +130,7 @@ def candidate_topk(
     gatherer=None,
     ids_out: Optional[torch.Tensor] = None,
     rows_only: bool = False,
+    row_map: Optional[Tuple[int, int, int, int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Global top-k candidates from the target head: hidden [N, H] -> ids / vals [N, K].
 
@@ -132,6 +138,8 @@ def candidate_topk(
     the full vocab), then a global top-k -- identical candidates at O(tp*K) instead of
     O(vocab) gather bandwidth. with_partition also returns the full-vocabulary lse [N] fp32.
     rows_only returns the gathered [N, tp, 2, K] rows instead (packed gather only).
+    row_map (rows, group, gstride, goff), packed gather only: `hidden` holds every block row and candidate row r is
+    head row (r // group) * gstride + goff + r % group; the local top-k + pack run as one kernel (selector_topk_pack).
     """
     # The worker screens the head before capture, but the eager fallbacks attach
     # whatever the target has.
@@ -152,6 +160,18 @@ def candidate_topk(
     logits = _project_candidate_logits(
         hidden, lm_head, num_org=num_org, use_quant_head=use_quant_head
     )
+    if row_map is not None:
+        assert gatherer is not None and not with_partition and not tp
+        rows, group, gstride, goff = row_map
+        packed = selector_topk_pack(
+            logits, k, num_org, int(lm_head.shard_indices.org_vocab_start_index), rows, group, gstride, goff
+        )
+        gathered = gatherer(packed.view(torch.bfloat16)).view(torch.float32)
+        gathered = gathered.view(rows, -1, 2, k)
+        if rows_only:
+            return gathered
+        top_vals, sel = torch.topk(gathered[:, :, 0, :].reshape(rows, -1), k, dim=-1)
+        return unpack_candidate_ids(gathered, sel, out=ids_out), top_vals, None
     lse = None
     if with_partition:
         vals, ids, lse = lilicorr_topk_lse(logits, k)
@@ -1366,8 +1386,28 @@ class DFlash2DraftModel(DFlashDraftModel):
         )
         return ids, self._transform_unary_logits(vals)
 
-    def compute_lattice(self, hidden, anchor_token_ids, ids_out=None):
-        """compute_candidates + build_lattice in one kernel after the packed gather, else None."""
+    def _selector_topk_ok(self, full_hidden, bs, slots, k) -> bool:
+        from sglang.srt.environ import envs
+
+        head = self.lm_head
+        return (
+            envs.SGLANG_DFLASH2_SELECTOR_TOPK.get()
+            and k == 16
+            and get_parallel().tp_size > 1
+            and full_hidden.dim() == 2
+            and full_hidden.shape[0] == bs * (slots + 1)
+            and full_hidden.is_contiguous()
+            and is_dense_head_weight(getattr(head, "weight", None))
+            and not should_apply_lm_head_quant_method(head, getattr(head, "quant_method", None))
+            and getattr(head.weight, "dtype", None) == torch.bfloat16
+            and int(head.shard_indices.num_org_elements) <= 4 * 8192
+        )
+
+    def compute_lattice(self, hidden, anchor_token_ids, ids_out=None, full_hidden=None):
+        """compute_candidates + build_lattice in one kernel after the packed gather, else None.
+
+        full_hidden: the [bs * (slots + 1), H] draft output `hidden` ([bs, slots, H]) is a view of (anchor row first):
+        the LM head then reads it directly and the local top-k + pack is one kernel (SGLANG_DFLASH2_SELECTOR_TOPK)."""
         selector = self.candidate_selector
         k = selector.top_k
         if (
@@ -1381,20 +1421,31 @@ class DFlash2DraftModel(DFlashDraftModel):
         ):
             return None
         bs, slots, _ = hidden.shape
-        flat = hidden.reshape(bs * slots, -1)
-        gathered = candidate_topk(
-            flat, self.lm_head, k, gatherer=self.candidate_gatherer, rows_only=True
-        )
+        if full_hidden is not None and self._selector_topk_ok(full_hidden, bs, slots, k):
+            # every block row through the head and the selector projection (row-wise identical to the gathered
+            # rows: same GEMM kernels, measured bitwise), the anchor rows skipped by the consumers -> no gather copy
+            gathered = candidate_topk(
+                full_hidden, self.lm_head, k, gatherer=self.candidate_gatherer, rows_only=True,
+                row_map=(bs * slots, slots, slots + 1, 1),
+            )
+            proj, hoff = selector.hidden_projection(full_hidden).view(bs, slots + 1, -1), 1
+        else:
+            flat = hidden.reshape(bs * slots, -1)
+            gathered = candidate_topk(
+                flat, self.lm_head, k, gatherer=self.candidate_gatherer, rows_only=True
+            )
+            proj, hoff = selector.hidden_projection(flat).view(bs, slots, -1), 0
         if ids_out is None:
             ids_out = torch.empty((bs * slots, k), dtype=torch.int64, device=hidden.device)
         ids = ids_out.view(bs, slots, k)
         scores = selector_lattice_triton(
             gathered,
             anchor_token_ids,
-            selector.hidden_projection(flat).view(bs, slots, -1),
+            proj,
             selector.predecessor_codebook,
             selector.successor_codebook,
             ids,
+            hidden_row_off=hoff,
         )
         return ids, scores
 
