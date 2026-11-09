@@ -1,3 +1,5 @@
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -445,6 +447,40 @@ def _pack_candidates_kernel(vals_ptr, ids_ptr, out_ptr, id_offset, K: tl.constex
     tl.store(out_ptr + row * 2 * K + K + cols, ids.to(tl.float32))
 
 
+@functools.lru_cache(maxsize=None)
+def _selector_topk_module():
+    from sglang.kernels.jit.utils import load_jit
+
+    return load_jit(
+        "selector_topk",
+        cuda_files=["speculative/selector_topk.cuh"],
+        cuda_wrappers=[("topk_pack", "SelectorTopK::topk_pack")],
+    )
+
+
+def selector_topk_pack(
+    logits: torch.Tensor,
+    k: int,
+    n: int,
+    id_offset: int,
+    rows: int,
+    group: int,
+    gstride: int = 0,
+    goff: int = 0,
+    out: torch.Tensor = None,
+) -> torch.Tensor:
+    """Local top-k of shard-logits rows + pack_candidates in one kernel -> [rows, 2k] fp32 [values | ids + id_offset].
+
+    Output row r reads logits row (r // group) * gstride + goff + r % group (all block rows of the head output, the
+    anchor row skipped), its first n columns. Same result as pack_candidates(*flashinfer.top_k(logits_rows[:, :n], k,
+    sorted=True, deterministic=True, tie_break=TopKTieBreak.SMALL), id_offset): value descending, ties by smallest index."""
+    if out is None:
+        out = torch.empty((rows, 2 * k), dtype=torch.float32, device=logits.device)
+    if rows:
+        _selector_topk_module().topk_pack(logits, out, int(n), int(k), int(group), int(gstride), int(goff), int(id_offset))
+    return out
+
+
 def pack_candidates(vals: torch.Tensor, ids: torch.Tensor, id_offset: int) -> torch.Tensor:
     """[N, K] values and shard ids -> [N, 2K] fp32 rows [values | ids + id_offset]."""
     rows, k = vals.shape
@@ -557,6 +593,8 @@ def _selector_lattice_kernel(
     K: tl.constexpr,
     LOG_S: tl.constexpr,
     RANK: tl.constexpr,
+    HROWS: tl.constexpr = 0,
+    HOFF: tl.constexpr = 0,
 ):
     row = tl.program_id(0)
     cols = tl.arange(0, K)
@@ -570,7 +608,11 @@ def _selector_lattice_kernel(
     tl.store(ids_ptr + row * K + cols, ids)
     pred = tl.where(row % SLOTS == 0, tl.load(anchor_ptr + (row // SLOTS) * anchor_stride), pred)
     r = tl.arange(0, RANK)
-    h = tl.load(hidden_ptr + row * RANK + r).to(tl.float32)
+    if HROWS == 0:
+        hrow = row
+    else:
+        hrow = (row // SLOTS) * HROWS + HOFF + row % SLOTS  # projection of every block row: skip the anchor rows
+    h = tl.load(hidden_ptr + hrow * RANK + r).to(tl.float32)
     a = tl.load(pred_ptr + pred[:, None] * RANK + r[None, :]).to(tl.float32)
     b = tl.load(succ_ptr + ids[:, None] * RANK + r[None, :])
     dots = tl.dot((a * h[None, :]).to(tl.bfloat16), tl.trans(b))
@@ -579,11 +621,16 @@ def _selector_lattice_kernel(
 
 
 def selector_lattice_triton(
-    gathered, anchor_ids, hidden, predecessor_table, successor_table, ids_out
+    gathered, anchor_ids, hidden, predecessor_table, successor_table, ids_out, hidden_row_off=0
 ):
-    """torch.topk of the gathered [bs * slots, ranks, 2, K] rows + build_lattice -> ids_out, scores [bs, slots, K, K]."""
+    """torch.topk of the gathered [bs * slots, ranks, 2, K] rows + build_lattice -> ids_out, scores [bs, slots, K, K].
+
+    hidden: the selector projection [bs, slots, r], or [bs, slots + hidden_row_off, r] of every block row with the
+    first hidden_row_off rows of each request skipped (ids_out [bs, slots, K] gives the slots)."""
     rows, ranks, _, k = gathered.shape
-    bs, slots, rank = hidden.shape
+    bs, hrows, rank = hidden.shape
+    slots = int(ids_out.shape[-2]) if hidden_row_off else hrows
+    assert hrows == slots + hidden_row_off and hidden.is_contiguous()
     scores = torch.empty((bs, slots, k, k), dtype=torch.float32, device=hidden.device)
     _selector_lattice_kernel[(rows,)](
         gathered,
@@ -599,6 +646,8 @@ def selector_lattice_triton(
         K=k,
         LOG_S=5,
         RANK=rank,
+        HROWS=hrows if hidden_row_off else 0,
+        HOFF=hidden_row_off,
         num_warps=2,
     )
     return scores

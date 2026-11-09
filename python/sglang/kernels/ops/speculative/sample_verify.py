@@ -157,17 +157,24 @@ class SampleVerifyState:
         self.stage([(0, 1.0, 1.0)] * nb)
 
     # ---- candidate-selector drafts ----
-    def enable_selector(self, gamma: int) -> None:
-        """Candidate ids / q [MAXREQ, gamma, SEL_K]; coins: level [MAXREQ, gamma], then final [MAXREQ]."""
+    def enable_selector(self, gamma: int, rows: int = MAXREQ) -> None:
+        """Candidate ids / q [max(rows, MAXREQ), gamma, SEL_K] (the kernel reads the first MAXREQ rows; more rows let
+        the draft graph's selector sampler write its outputs here directly, see stage_selector); coins: level
+        [MAXREQ, gamma], then final [MAXREQ]."""
         self.sel_gamma = int(gamma)
-        self.sel_ids = torch.zeros((MAXREQ, gamma, SEL_K), dtype=torch.int64, device=self.device)
-        self.sel_q = torch.zeros((MAXREQ, gamma, SEL_K), dtype=torch.float32, device=self.device)
+        n = max(int(rows), MAXREQ)
+        self.sel_ids = torch.zeros((n, gamma, SEL_K), dtype=torch.int64, device=self.device)
+        self.sel_q = torch.zeros((n, gamma, SEL_K), dtype=torch.float32, device=self.device)
         self.sel_coins = torch.zeros(MAXREQ * gamma + MAXREQ, dtype=torch.float32, device=self.device)
 
     def stage_selector(self, candidate_ids: torch.Tensor, q_rows: torch.Tensor) -> None:
+        """No copy when the rows already are the first rows of the staging buffers (the draft graph's sampler writes
+        its candidate / q outputs into them)."""
         bs = int(candidate_ids.shape[0])
-        self.sel_ids[:bs].copy_(candidate_ids)
-        self.sel_q[:bs].copy_(q_rows)
+        if candidate_ids.data_ptr() != self.sel_ids.data_ptr():
+            self.sel_ids[:bs].copy_(candidate_ids)
+        if q_rows.data_ptr() != self.sel_q.data_ptr():
+            self.sel_q[:bs].copy_(q_rows)
 
     def draw_selector_coins(self, bs: int) -> torch.Tensor:
         """The reference accept's draws, in its order: torch.rand((bs, gamma)), torch.rand((bs,))."""
