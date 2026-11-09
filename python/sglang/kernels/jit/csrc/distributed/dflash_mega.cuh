@@ -265,6 +265,14 @@ DEV void tma2d(const CUtensorMap* map, void* dst, uint64_t* bar, int c0, int c1,
       "l"(reinterpret_cast<uint64_t>(map)), "r"(smem_u32(bar)), "r"(c0), "r"(c1), "l"(pol)
       : "memory");
 }
+// 3-D box: gate_up takes the 32 gate rows and the 32 up rows of a tile in one copy
+DEV void tma3d(const CUtensorMap* map, void* dst, uint64_t* bar, int c0, int c1, int c2, uint64_t pol) {
+  asm volatile(
+      "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+      " [%0], [%1, {%3, %4, %5}], [%2], %6;" ::"r"(smem_u32(dst)),
+      "l"(reinterpret_cast<uint64_t>(map)), "r"(smem_u32(bar)), "r"(c0), "r"(c1), "r"(c2), "l"(pol)
+      : "memory");
+}
 DEV void cp_async16(void* dst, const void* src) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem_u32(dst)), "l"(src) : "memory");
 }
@@ -493,6 +501,11 @@ DEV void tma_prefetch_l2(const CUtensorMap* map, int c0, int c1) {
                "r"(c0), "r"(c1)
                : "memory");
 }
+DEV void tma_prefetch_l2_3d(const CUtensorMap* map, int c0, int c1, int c2) {
+  asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" ::"l"(reinterpret_cast<uint64_t>(map)),
+               "r"(c0), "r"(c1), "r"(c2)
+               : "memory");
+}
 DEV bool mbar_test(uint64_t* b, uint32_t parity) {
   uint32_t ok;
   asm volatile(
@@ -515,13 +528,10 @@ DEV void uit_issue(const Params& p, const UIt& it, bool pf, uint8_t* dst, uint64
     const int t = w ? t1 : t0;
     if (t < 0) continue;
     if (it.ph == PH_GU) {
-      if (pf) {
-        tma_prefetch_l2(map, kc, t * 32);
-        tma_prefetch_l2(map, kc, INTER + t * 32);
-      } else {
-        tma2d(map, dst + w * TILEB, bar, kc, t * 32, pol);
-        tma2d(map, dst + w * TILEB + 4096, bar, kc, INTER + t * 32, pol);
-      }
+      // [half (gate, up)][INTER][K] map: one 8-KB box = gate rows t*32.. then up rows t*32.. (the shared-memory layout of
+      // two 4-KB boxes). Every TMA issue costs the producer thread ~0.25 us and it refills the ring at its issue rate.
+      if (pf) tma_prefetch_l2_3d(map, kc, t * 32, 0);
+      else tma3d(map, dst + w * TILEB, bar, kc, t * 32, 0, pol);
     } else {
       const int k = cf ? kc + 64 * w : kc;
       if (pf) tma_prefetch_l2(map, k, t * 64);
@@ -1981,6 +1991,20 @@ __global__ void __launch_bounds__(THREADS, 1) dflash_mega_kernel(const __grid_co
   cluster_sync_all();
 }
 
+inline CUtensorMap make_map_3d(const void* base, uint64_t d0, uint64_t d1, uint64_t d2, uint64_t s1, uint64_t s2,
+                               uint32_t b0, uint32_t b1, uint32_t b2) {
+  CUtensorMap map;
+  uint64_t dim[3] = {d0, d1, d2};
+  uint64_t stride[2] = {s1, s2};
+  uint32_t box[3] = {b0, b1, b2};
+  uint32_t elem_stride[3] = {1, 1, 1};
+  const CUresult rc = cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(base), dim, stride, box,
+                                             elem_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+                                             CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  host::RuntimeCheck(rc == CUDA_SUCCESS, "dflash_mega: cuTensorMapEncodeTiled (3-D) failed");
+  return map;
+}
+
 inline CUtensorMap make_map_2d(const void* base, uint64_t inner, uint64_t outer, uint64_t row_bytes, uint32_t box_inner,
                                uint32_t box_outer, CUtensorMapDataType dtype = CU_TENSOR_MAP_DATA_TYPE_UINT8) {
   CUtensorMap map;
@@ -2018,8 +2042,10 @@ struct DFlashMega {
         const void* w = reinterpret_cast<const void*>(wp[l * NPH + ph]);
         if (ph == PH_CA || ph == PH_CM)  // BF16 [1536][H]: 64-element (128-byte) boxes
           h[l * NPH + ph] = make_map_2d(w, K[ph], N[ph], K[ph] * 2, 64, 64, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16);
+        else if (ph == PH_GU)  // [2 (gate, up)][INTER][K]: 128 x 32 x 2 boxes
+          h[l * NPH + ph] = make_map_3d(w, K[ph], INTER, 2, K[ph], static_cast<uint64_t>(INTER) * K[ph], 128, 32, 2);
         else
-          h[l * NPH + ph] = make_map_2d(w, K[ph], N[ph], K[ph], 128, ph == PH_GU ? 32 : 64);
+          h[l * NPH + ph] = make_map_2d(w, K[ph], N[ph], K[ph], 128, 64);
       }
     for (int b = 0; b < 2; ++b)
       h[NL * NPH + b] = make_map_2d(static_cast<const uint8_t*>(xq.data_ptr()) + static_cast<int64_t>(b) * MT * H, H, MT, H, 128, MT);
