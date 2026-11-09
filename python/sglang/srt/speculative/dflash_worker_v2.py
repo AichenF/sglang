@@ -3215,8 +3215,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 sv.stage_all_greedy(bs)
                 return False
             sv.stage_selector(*self._selector_sample)
-            # the reference accept's draws; rank 0's, as the reference broadcasts rank 0's result
-            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, sv.draw_selector_coins(bs))
+            # The kernel exchanges rank 0's coins with the existing first-round messages.
+            sv.draw_selector_coins(bs)
         sv.stage(params)
         if self._sv_logged == 0 and get_parallel().tp_rank == 0 and any(p[0] for p in params):
             self._sv_logged = 1
