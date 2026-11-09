@@ -287,7 +287,8 @@ DEV unsigned ld_acq(const unsigned* p) {
   asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
   return v;
 }
-// release-add: orders this thread's (and, after a CTA barrier, the CTA's) prior writes before the increment
+// release-add: orders this thread's (and, after a CTA barrier, the CTA's) prior writes before the increment. The fence
+// waits for the SM's in-flight loads (the producer's next-phase weight units): ~0.5-1 us each, so one per handoff.
 DEV void red_release(unsigned* p, unsigned v) {
 #if DM_SC_FENCE
   __threadfence();
@@ -1415,7 +1416,12 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
     bar_sync(1, NCT);
     if (ctid == 0) {
       dstamp(p, l, 121);
+#if DM_SC_FENCE
+      __threadfence();  // one fence orders the CTA's qkv rows (CTA barrier above) before all its tile counters
+      for (int k = 0; k < nt; ++k) atomicAdd(p.cnt + C_QKV + tl[k], 1u);
+#else
       for (int k = 0; k < nt; ++k) red_release(p.cnt + C_QKV + tl[k], 1u);
+#endif
       dstamp(p, l, 122);
       if (DM_QUIET && nt > 0) { volatile int* relc = s.misc + 2; *relc = *relc + 1; }   // -> the producer's held units
     }
@@ -1452,8 +1458,7 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
       __syncwarp();
       if (ctid == 0) {
         dstamp(p, l, 125);
-        __threadfence();  // the warp's amax atomics before the release
-        red_release(p.cnt + C_ACT, 1u);
+        red_release(p.cnt + C_ACT, 1u);  // its fence also orders the warp's amax atomics (__syncwarp above)
         dstamp(p, l, 126);
         if (DM_QUIET) { volatile int* relc = s.misc + 2; *relc = *relc + 1; }
       }
