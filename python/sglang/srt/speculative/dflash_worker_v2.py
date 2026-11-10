@@ -658,13 +658,29 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._g12_init_slope_diag()
         if get_parallel().tp_rank == 0:
             logger.info(
-                "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
+                "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s, attention_window_left=%s",
                 bundle.resolved_attention_backend,
                 self.draft_model.__class__.__name__,
                 self.block_size,
                 self.draft_window_size,
                 self.use_compact_draft_cache,
+                self.draft_model_runner.sliding_window_size,
             )
+            logger.info(
+                "DFLASH_SWA_STARTUP_CONTEXT source=%s layer_count=%s",
+                __file__,
+                len(self.draft_model.layers),
+            )
+            for draft_layer in self.draft_model.layers:
+                radix = draft_layer.self_attn.attn
+                logger.info(
+                    "DFLASH_SWA_STARTUP_LAYER layer_id=%s window_left=%s attn_type=%s is_cross_attention=%s radix_class=%s",
+                    radix.layer_id,
+                    radix.sliding_window_size,
+                    radix.attn_type,
+                    radix.is_cross_attention,
+                    type(radix).__name__,
+                )
             if self._is_domino:
                 logger.info(
                     "DFLASH Domino rollout enabled (BF16, TP=%s, block-shared candidate pool size=%s).",
