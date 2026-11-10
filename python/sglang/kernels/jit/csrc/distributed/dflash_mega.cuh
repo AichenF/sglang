@@ -12,7 +12,8 @@
 // Grid: 15 clusters x 8 CTAs (the most 8-CTA clusters an H200 keeps co-resident at 1 CTA/SM), 320 threads:
 //   warps 0-7 (two warpgroups) = the phase program; warp 8 = weight producer (TMA into a per-CTA ring of 16-KB slabs,
 //   running ahead across phase and layer boundaries); warp 9 = KV gather (attention clusters: cp.async of the window keys
-//   of the next layer as soon as the KV region is free).
+//   of the next layer as soon as the KV region is free, then the block's new k / v rows of the layer: norm + RoPE / value
+//   scale into the KV tile and the cache).
 // Clusters 0-7: attention (request c/2, query heads 8*(c%2)..+7; rank = key split, combine over DSMEM).
 // Clusters 8-11: all-reduce CTAs (one token each). Clusters 12-14: GEMM only. Every CTA takes GEMM tiles (host plan).
 // GEMMs: swap-AB wgmma m64n32k32 (weights = A, 64-row tiles, two tiles per 16-KB ring slab), split-K over the cluster
@@ -265,6 +266,14 @@ DEV void tma2d(const CUtensorMap* map, void* dst, uint64_t* bar, int c0, int c1,
       "l"(reinterpret_cast<uint64_t>(map)), "r"(smem_u32(bar)), "r"(c0), "r"(c1), "l"(pol)
       : "memory");
 }
+// 3-D box: gate_up takes the 32 gate rows and the 32 up rows of a tile in one copy
+DEV void tma3d(const CUtensorMap* map, void* dst, uint64_t* bar, int c0, int c1, int c2, uint64_t pol) {
+  asm volatile(
+      "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+      " [%0], [%1, {%3, %4, %5}], [%2], %6;" ::"r"(smem_u32(dst)),
+      "l"(reinterpret_cast<uint64_t>(map)), "r"(smem_u32(bar)), "r"(c0), "r"(c1), "r"(c2), "l"(pol)
+      : "memory");
+}
 DEV void cp_async16(void* dst, const void* src) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem_u32(dst)), "l"(src) : "memory");
 }
@@ -279,7 +288,8 @@ DEV unsigned ld_acq(const unsigned* p) {
   asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
   return v;
 }
-// release-add: orders this thread's (and, after a CTA barrier, the CTA's) prior writes before the increment
+// release-add: orders this thread's (and, after a CTA barrier, the CTA's) prior writes before the increment. The fence
+// waits for the SM's in-flight loads (the producer's next-phase weight units): ~0.5-1 us each, so one per handoff.
 DEV void red_release(unsigned* p, unsigned v) {
 #if DM_SC_FENCE
   __threadfence();
@@ -421,6 +431,7 @@ struct Smem {
   uint64_t* combok;
   uint64_t* hbar;     // all-reduce token CTAs: the previous block row's reduced slice is ready (output convolution)
   uint64_t* cbar;     // coefficient tile partials of the cluster received (DSMEM)
+  uint64_t* csbar;    // attention clusters: this layer's cos|sin rows and k-norm weights are staged (-> gather warp)
   int* calls0;        // [MT]
   float* sx;          // [MT]
   float* sinv;        // [MT]
@@ -429,7 +440,6 @@ struct Smem {
   int* slot;          // [KV_MAXK]
   int* misc;          // [16]: 0 E, 1 seqlen (attention request), ...
   long long* pos;     // [BLK] positions of the attention request's rows
-  long long* loc;     // [BLK]
   uint8_t* ring;
   uint8_t* greg;
   uint8_t* kv;
@@ -493,6 +503,11 @@ DEV void tma_prefetch_l2(const CUtensorMap* map, int c0, int c1) {
                "r"(c0), "r"(c1)
                : "memory");
 }
+DEV void tma_prefetch_l2_3d(const CUtensorMap* map, int c0, int c1, int c2) {
+  asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" ::"l"(reinterpret_cast<uint64_t>(map)),
+               "r"(c0), "r"(c1), "r"(c2)
+               : "memory");
+}
 DEV bool mbar_test(uint64_t* b, uint32_t parity) {
   uint32_t ok;
   asm volatile(
@@ -515,13 +530,10 @@ DEV void uit_issue(const Params& p, const UIt& it, bool pf, uint8_t* dst, uint64
     const int t = w ? t1 : t0;
     if (t < 0) continue;
     if (it.ph == PH_GU) {
-      if (pf) {
-        tma_prefetch_l2(map, kc, t * 32);
-        tma_prefetch_l2(map, kc, INTER + t * 32);
-      } else {
-        tma2d(map, dst + w * TILEB, bar, kc, t * 32, pol);
-        tma2d(map, dst + w * TILEB + 4096, bar, kc, INTER + t * 32, pol);
-      }
+      // [half (gate, up)][INTER][K] map: one 8-KB box = gate rows t*32.. then up rows t*32.. (the shared-memory layout of
+      // two 4-KB boxes). Every TMA issue costs the producer thread ~0.25 us and it refills the ring at its issue rate.
+      if (pf) tma_prefetch_l2_3d(map, kc, t * 32, 0);
+      else tma3d(map, dst + w * TILEB, bar, kc, t * 32, 0, pol);
     } else {
       const int k = cf ? kc + 64 * w : kc;
       if (pf) tma_prefetch_l2(map, k, t * 64);
@@ -602,6 +614,10 @@ DEV void producer(const Params& p, Smem& s, int c, int rank) {
 }
 
 // ------------------------------------------------------------------ KV gather (warp 9, attention clusters)
+constexpr int CSREG = 50 * 1024;  // inside the GEMM region: cos|sin rows of the request's 8 positions (fp32 [8][64])
+                                  // + q/k norm weights (bf16 [2][128])
+DEV void qk_norm_rope(const uint4* xv, const __nv_bfloat16* w, const float* cs, int qq, float eps, uint32_t* out);
+
 struct Split {
   int seqlen, kbase, nu, ntot, nold;
 };
@@ -619,8 +635,25 @@ DEV Split split_of(int seqlen, int rank) {
   return sp;
 }
 
-DEV void gather(const Params& p, Smem& s, int b, int rank, int lane) {
+DEV void gather(const Params& p, Smem& s, int b, int c, int rank, int lane) {
   const Split sp = split_of(s.misc[1], rank);
+  // the block's new k / v rows (normalized + rotated keys, scaled values) are made here, off the compute warps (where
+  // they doubled the q norm/RoPE time of the CTAs that need them, the last pushers of their cluster): by the CTA that
+  // writes them to the KV cache (head half 0, rank 0) and by the CTA whose key split holds them. Lane = (token, quarter).
+  const bool store = ((c & 1) == 0 && rank == 0);
+  const int first_new = sp.seqlen - BLK - sp.kbase;  // local index of block row 0
+  const bool need = (first_new + BLK > sp.nold) && (first_new < sp.ntot);
+  const bool kvw = need || store;
+  const int tk = lane >> 2, qq = lane & 3;
+  long long kslot = 0;
+  unsigned E = 0;
+  if (kvw) {
+    kslot = p.loc64 ? reinterpret_cast<const long long*>(p.loc)[BLK * b + tk]
+                    : static_cast<long long>(reinterpret_cast<const int*>(p.loc)[BLK * b + tk]);
+    E = ld_acq(p.cnt + C_LAUNCH);
+  }
+  const float* scs = reinterpret_cast<const float*>(s.greg + CSREG);
+  const __nv_bfloat16* skn = reinterpret_cast<const __nv_bfloat16*>(s.greg + CSREG + 2048) + HD;
   for (int i = lane; i < sp.nold; i += 32) s.slot[i] = __ldg(p.page_table + b * p.pt_stride + sp.kbase + i);
   __syncwarp();
   uint8_t* sK = s.kv;
@@ -643,6 +676,54 @@ DEV void gather(const Params& p, Smem& s, int b, int rank, int lane) {
       *reinterpret_cast<uint4*>((kv ? sV : sK) + key * 256 + swz(ch, key) * 16) = make_uint4(0u, 0u, 0u, 0u);
     }
     cp_async_arrive_noinc(s.kvfull);
+    if (kvw) {
+      uint4 xk[4], xv[4];
+      const int64_t roff = static_cast<int64_t>(BLK * b + tk) * QKV_N + NHQ * HD + qq * 32;
+#if DM_LL_QKV
+      const __nv_bfloat16* qbuf = p.qkv + static_cast<int64_t>((E * 5u + static_cast<unsigned>(l)) & 1u) * MT * QKV_N;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        xk[i] = poll_ll_v4(qbuf + roff + i * 8);
+        xv[i] = poll_ll_v4(qbuf + roff + HD + i * 8);
+      }
+#else
+      // the k / v tiles (32 .. 35) of this layer
+      if (lane < 4) wait_ge(p.cnt + C_QKV + 32 + lane, (E * 5u + static_cast<unsigned>(l) + 1u) * 8u);
+      __syncwarp();
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        xk[i] = ldcg_v4(p.qkv + roff + i * 8);
+        xv[i] = ldcg_v4(p.qkv + roff + HD + i * 8);
+      }
+#endif
+      mbar_wait(s.csbar, l & 1);  // cos|sin rows + k-norm weights of this layer staged by the compute warps
+      uint32_t ok[16], ov[16];
+      qk_norm_rope(xk, skn, scs + tk * 64, qq, p.qk_eps, ok);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const uint32_t vw[4] = {xv[i].x, xv[i].y, xv[i].z, xv[i].w};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) ov[4 * i + j] = pack_bf2(bf_lo(vw[j]) * p.v_scale, bf_hi(vw[j]) * p.v_scale);
+      }
+      const int i = first_new + tk;
+      if (i >= 0 && i < sp.ntot) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          *reinterpret_cast<uint4*>(sK + i * 256 + swz(4 * qq + j, i) * 16) = make_uint4(ok[4 * j], ok[4 * j + 1], ok[4 * j + 2], ok[4 * j + 3]);
+          *reinterpret_cast<uint4*>(sV + i * 256 + swz(4 * qq + j, i) * 16) = make_uint4(ov[4 * j], ov[4 * j + 1], ov[4 * j + 2], ov[4 * j + 3]);
+        }
+      }
+      if (store && kslot != 0) {
+        const LayerP& LP = p.L[l];
+        uint4* kd = reinterpret_cast<uint4*>(LP.kc + kslot * p.kv_stride + qq * 32);
+        uint4* vd = reinterpret_cast<uint4*>(LP.vc + kslot * p.kv_stride + qq * 32);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          kd[j] = make_uint4(ok[4 * j], ok[4 * j + 1], ok[4 * j + 2], ok[4 * j + 3]);
+          vd[j] = make_uint4(ov[4 * j], ov[4 * j + 1], ov[4 * j + 2], ov[4 * j + 3]);
+        }
+      }
+    }
     __syncwarp();
     if (lane == 0) mbar_arrive(s.kvfull);
   }
@@ -1405,7 +1486,12 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
     bar_sync(1, NCT);
     if (ctid == 0) {
       dstamp(p, l, 121);
+#if DM_SC_FENCE
+      __threadfence();  // one fence orders the CTA's qkv rows (CTA barrier above) before all its tile counters
+      for (int k = 0; k < nt; ++k) atomicAdd(p.cnt + C_QKV + tl[k], 1u);
+#else
       for (int k = 0; k < nt; ++k) red_release(p.cnt + C_QKV + tl[k], 1u);
+#endif
       dstamp(p, l, 122);
       if (DM_QUIET && nt > 0) { volatile int* relc = s.misc + 2; *relc = *relc + 1; }   // -> the producer's held units
     }
@@ -1442,8 +1528,7 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
       __syncwarp();
       if (ctid == 0) {
         dstamp(p, l, 125);
-        __threadfence();  // the warp's amax atomics before the release
-        red_release(p.cnt + C_ACT, 1u);
+        red_release(p.cnt + C_ACT, 1u);  // its fence also orders the warp's amax atomics (__syncwarp above)
         dstamp(p, l, 126);
         if (DM_QUIET) { volatile int* relc = s.misc + 2; *relc = *relc + 1; }
       }
@@ -1474,8 +1559,6 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
 }
 
 // ------------------------------------------------------------------ attention (clusters 0..7)
-constexpr int CSREG = 50 * 1024;  // inside the GEMM region: cos|sin rows of the request's 8 positions (fp32 [8][64])
-                                  // + q/k norm weights (bf16 [2][128])
 
 // q/k RMSNorm + NeoX RoPE (first 64 dims) of a 32-dim quarter (qq) of a head row. xv: the quarter's raw bf16 values,
 // w: the norm weights (smem, bf16 [128]), cs: cos|sin of the row's position (smem, fp32 [64]). Numerics of
@@ -1556,44 +1639,26 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
     s.red[32 + ctid - 32] = v;
   }
 #if !DM_LL_QKV
-  // wait for this head half's q tiles + the k / v tiles
-  if (ctid >= 64 && ctid < 84) {
-    const int i = ctid - 64;
-    const int tile = i < 16 ? 16 * hg + i : 16 + i;
-    wait_ge(p.cnt + C_QKV + tile, (E * 5u + static_cast<unsigned>(l) + 1u) * 8u);
-  }
+  // wait for this head half's q tiles (the k / v tiles: gather warp)
+  if (ctid >= 64 && ctid < 80) wait_ge(p.cnt + C_QKV + 16 * hg + (ctid - 64), (E * 5u + static_cast<unsigned>(l) + 1u) * 8u);
 #endif
   bar_sync(1, NCT);
+  if (ctid == 0) mbar_arrive(s.csbar);  // cos|sin rows + k-norm weights staged (CTA barrier above) -> gather warp
   if (ctid == 0) dstamp(p, l, 56);
-  // q rows (token-major: row = t * 8 + h) and the block's new k / v rows (warps 0 / 1) -> normalized + rotated
+  // q rows (token-major: row = t * 8 + h) -> normalized + rotated
   {
     const int row = ctid >> 2, qq = ctid & 3;
     const int t = row >> 3, h = row & 7;
-    const bool store = (hg == 0 && rank == 0);  // writes the block rows to the KV cache
-    const int first_new = sp.seqlen - BLK - sp.kbase;  // local index of block row 0
-    const bool need = (first_new + BLK > sp.nold) && (first_new < sp.ntot);
-    const bool kvw = (warp < 2) && (need || store);
-    const int tk = lane >> 2;
-    uint4 xq[4], xk[4];
+    uint4 xq[4];
 #if DM_LL_QKV
     if (ctid == 0) dstamp(p, l, 123);
     const __nv_bfloat16* qbuf = p.qkv + static_cast<int64_t>((E * 5u + static_cast<unsigned>(l)) & 1u) * MT * QKV_N;
 #pragma unroll
     for (int i = 0; i < 4; ++i) xq[i] = poll_ll_v4(qbuf + (BLK * b + t) * QKV_N + (8 * hg + h) * HD + qq * 32 + i * 8);
-    if (kvw) {
-#pragma unroll
-      for (int i = 0; i < 4; ++i)
-        xk[i] = poll_ll_v4(qbuf + (BLK * b + tk) * QKV_N + (warp == 0 ? NHQ : NHQ + 1) * HD + qq * 32 + i * 8);
-    }
 #else
     const __nv_bfloat16* qsrc = p.qkv + (BLK * b + t) * QKV_N + (8 * hg + h) * HD + qq * 32;
 #pragma unroll
     for (int i = 0; i < 4; ++i) xq[i] = ldcg_v4(qsrc + i * 8);
-    if (kvw) {
-      const __nv_bfloat16* ksrc = p.qkv + (BLK * b + tk) * QKV_N + (warp == 0 ? NHQ : NHQ + 1) * HD + qq * 32;
-#pragma unroll
-      for (int i = 0; i < 4; ++i) xk[i] = ldcg_v4(ksrc + i * 8);
-    }
 #endif
     if (ctid == 0) {
       asm volatile("" ::"r"(xq[0].x), "r"(xq[3].w));
@@ -1604,36 +1669,6 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
 #pragma unroll
     for (int i = 0; i < 4; ++i)
       *reinterpret_cast<uint4*>(sQ + row * 256 + swz(4 * qq + i, row) * 16) = make_uint4(o[4 * i], o[4 * i + 1], o[4 * i + 2], o[4 * i + 3]);
-    if (kvw) {
-      uint8_t* sdst;
-      __nv_bfloat16* cdst;
-      if (warp == 0) {
-        qk_norm_rope(xk, skn, scs + tk * 64, qq, p.qk_eps, o);
-        sdst = sK;
-        cdst = LP.kc;
-      } else {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          const uint32_t vw[4] = {xk[i].x, xk[i].y, xk[i].z, xk[i].w};
-#pragma unroll
-          for (int j = 0; j < 4; ++j) o[4 * i + j] = pack_bf2(bf_lo(vw[j]) * p.v_scale, bf_hi(vw[j]) * p.v_scale);
-        }
-        sdst = sV;
-        cdst = LP.vc;
-      }
-      const int i = first_new + tk;
-      if (i >= 0 && i < sp.ntot) {
-#pragma unroll
-        for (int j = 0; j < 4; ++j)
-          *reinterpret_cast<uint4*>(sdst + i * 256 + swz(4 * qq + j, i) * 16) = make_uint4(o[4 * j], o[4 * j + 1], o[4 * j + 2], o[4 * j + 3]);
-      }
-      const long long slot = s.loc[tk];
-      if (store && slot != 0) {
-        uint4* dst = reinterpret_cast<uint4*>(cdst + slot * p.kv_stride + qq * 32);
-#pragma unroll
-        for (int j = 0; j < 4; ++j) dst[j] = make_uint4(o[4 * j], o[4 * j + 1], o[4 * j + 2], o[4 * j + 3]);
-      }
-    }
   }
   if (ctid == 0) dstamp(p, l, 57);
   mbar_wait(s.kvfull, l & 1);
@@ -1874,8 +1909,8 @@ __global__ void __launch_bounds__(THREADS, 1) dflash_mega_kernel(const __grid_co
     s.red = reinterpret_cast<float*>(m + 832);
     s.slot = reinterpret_cast<int*>(m + 1088);
     s.misc = reinterpret_cast<int*>(m + 1664);
+    s.csbar = reinterpret_cast<uint64_t*>(m + 1688);  // misc[6..7]
     s.pos = reinterpret_cast<long long*>(m + 1728);
-    s.loc = reinterpret_cast<long long*>(m + 1792);
     s.nslot = p.plan.nslot[c];
     s.ring = m + MISC_BYTES;
     s.greg = s.ring + s.nslot * SLAB;
@@ -1895,6 +1930,7 @@ __global__ void __launch_bounds__(THREADS, 1) dflash_mega_kernel(const __grid_co
     mbar_init(s.combok, CS);
     mbar_init(s.hbar, 1);
     mbar_init(s.cbar, 1);
+    mbar_init(s.csbar, 1);
     s.misc[2] = 0;   // DM_QUIET release counter
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
@@ -1918,7 +1954,7 @@ __global__ void __launch_bounds__(THREADS, 1) dflash_mega_kernel(const __grid_co
         s.misc[1] = __ldg(p.seqlens + (c >> 1));
       }
       __syncwarp();
-      if (is_att) gather(p, s, c >> 1, rank, lane);
+      if (is_att) gather(p, s, c >> 1, c, rank, lane);
     } else {
       const int ctid = tid;
       if (ctid < MT) s.calls0[ctid] = p.calls[ctid];
@@ -1927,8 +1963,6 @@ __global__ void __launch_bounds__(THREADS, 1) dflash_mega_kernel(const __grid_co
         const int i = ctid - 32, row = BLK * (c >> 1) + i;
         s.pos[i] = p.pos64 ? reinterpret_cast<const long long*>(p.positions)[row]
                            : static_cast<long long>(reinterpret_cast<const int*>(p.positions)[row]);
-        s.loc[i] = p.loc64 ? reinterpret_cast<const long long*>(p.loc)[row]
-                           : static_cast<long long>(reinterpret_cast<const int*>(p.loc)[row]);
       }
       if (is_att && ctid == 64) s.misc[1] = __ldg(p.seqlens + (c >> 1));
       bar_sync(1, NCT);
@@ -1981,6 +2015,20 @@ __global__ void __launch_bounds__(THREADS, 1) dflash_mega_kernel(const __grid_co
   cluster_sync_all();
 }
 
+inline CUtensorMap make_map_3d(const void* base, uint64_t d0, uint64_t d1, uint64_t d2, uint64_t s1, uint64_t s2,
+                               uint32_t b0, uint32_t b1, uint32_t b2) {
+  CUtensorMap map;
+  uint64_t dim[3] = {d0, d1, d2};
+  uint64_t stride[2] = {s1, s2};
+  uint32_t box[3] = {b0, b1, b2};
+  uint32_t elem_stride[3] = {1, 1, 1};
+  const CUresult rc = cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(base), dim, stride, box,
+                                             elem_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+                                             CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  host::RuntimeCheck(rc == CUDA_SUCCESS, "dflash_mega: cuTensorMapEncodeTiled (3-D) failed");
+  return map;
+}
+
 inline CUtensorMap make_map_2d(const void* base, uint64_t inner, uint64_t outer, uint64_t row_bytes, uint32_t box_inner,
                                uint32_t box_outer, CUtensorMapDataType dtype = CU_TENSOR_MAP_DATA_TYPE_UINT8) {
   CUtensorMap map;
@@ -2018,8 +2066,10 @@ struct DFlashMega {
         const void* w = reinterpret_cast<const void*>(wp[l * NPH + ph]);
         if (ph == PH_CA || ph == PH_CM)  // BF16 [1536][H]: 64-element (128-byte) boxes
           h[l * NPH + ph] = make_map_2d(w, K[ph], N[ph], K[ph] * 2, 64, 64, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16);
+        else if (ph == PH_GU)  // [2 (gate, up)][INTER][K]: 128 x 32 x 2 boxes
+          h[l * NPH + ph] = make_map_3d(w, K[ph], INTER, 2, K[ph], static_cast<uint64_t>(INTER) * K[ph], 128, 32, 2);
         else
-          h[l * NPH + ph] = make_map_2d(w, K[ph], N[ph], K[ph], 128, ph == PH_GU ? 32 : 64);
+          h[l * NPH + ph] = make_map_2d(w, K[ph], N[ph], K[ph], 128, 64);
       }
     for (int b = 0; b < 2; ++b)
       h[NL * NPH + b] = make_map_2d(static_cast<const uint8_t*>(xq.data_ptr()) + static_cast<int64_t>(b) * MT * H, H, MT, H, 128, MT);
