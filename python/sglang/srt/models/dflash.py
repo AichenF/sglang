@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Iterable, Optional, Tuple
+from typing import Callable, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -131,6 +131,7 @@ def candidate_topk(
     ids_out: Optional[torch.Tensor] = None,
     rows_only: bool = False,
     row_map: Optional[Tuple[int, int, int, int]] = None,
+    after_logits: Optional[Callable[[], None]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Global top-k candidates from the target head: hidden [N, H] -> ids / vals [N, K].
 
@@ -140,6 +141,9 @@ def candidate_topk(
     rows_only returns the gathered [N, tp, 2, K] rows instead (packed gather only).
     row_map (rows, group, gstride, goff), packed gather only: `hidden` holds every block row and candidate row r is
     head row (r // group) * gstride + goff + r % group; the local top-k + pack run as one kernel (selector_topk_pack).
+
+    :param after_logits: Optional work to enqueue once the head GEMM is enqueued.
+    :type after_logits: Callable[[], None] or None
     """
     # The worker screens the head before capture, but the eager fallbacks attach
     # whatever the target has.
@@ -160,6 +164,8 @@ def candidate_topk(
     logits = _project_candidate_logits(
         hidden, lm_head, num_org=num_org, use_quant_head=use_quant_head
     )
+    if after_logits is not None:
+        after_logits()
     if row_map is not None:
         assert gatherer is not None and not with_partition and not tp
         rows, group, gstride, goff = row_map
@@ -1403,11 +1409,12 @@ class DFlash2DraftModel(DFlashDraftModel):
             and int(head.shard_indices.num_org_elements) <= 4 * 8192
         )
 
-    def compute_lattice(self, hidden, anchor_token_ids, ids_out=None, full_hidden=None):
+    def compute_lattice(self, hidden, anchor_token_ids, ids_out=None, full_hidden=None, side_stream=None):
         """compute_candidates + build_lattice in one kernel after the packed gather, else None.
 
         full_hidden: the [bs * (slots + 1), H] draft output `hidden` ([bs, slots, H]) is a view of (anchor row first):
-        the LM head then reads it directly and the local top-k + pack is one kernel (SGLANG_DFLASH2_SELECTOR_TOPK)."""
+        the LM head then reads it directly and the local top-k + pack is one kernel (SGLANG_DFLASH2_SELECTOR_TOPK).
+        side_stream runs the hidden projection beside the top-k and gather, with the same input rows."""
         selector = self.candidate_selector
         k = selector.top_k
         if (
@@ -1422,19 +1429,33 @@ class DFlash2DraftModel(DFlashDraftModel):
             return None
         bs, slots, _ = hidden.shape
         if full_hidden is not None and self._selector_topk_ok(full_hidden, bs, slots, k):
-            # every block row through the head and the selector projection (row-wise identical to the gathered
-            # rows: same GEMM kernels, measured bitwise), the anchor rows skipped by the consumers -> no gather copy
-            gathered = candidate_topk(
-                full_hidden, self.lm_head, k, gatherer=self.candidate_gatherer, rows_only=True,
-                row_map=(bs * slots, slots, slots + 1, 1),
-            )
-            proj, hoff = selector.hidden_projection(full_hidden).view(bs, slots + 1, -1), 1
+            flat, hoff = full_hidden, 1
+            row_map = (bs * slots, slots, slots + 1, 1)
         else:
-            flat = hidden.reshape(bs * slots, -1)
-            gathered = candidate_topk(
-                flat, self.lm_head, k, gatherer=self.candidate_gatherer, rows_only=True
-            )
-            proj, hoff = selector.hidden_projection(flat).view(bs, slots, -1), 0
+            flat, hoff = hidden.reshape(bs * slots, -1), 0
+            row_map = None
+        projected = []
+
+        def project():
+            """Enqueue the projection after the head on the side stream.
+
+            :return: None after retaining the projection output.
+            :rtype: None
+            """
+            side_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side_stream):
+                projected.append(selector.hidden_projection(flat))
+
+        gathered = candidate_topk(
+            flat, self.lm_head, k, gatherer=self.candidate_gatherer, rows_only=True,
+            row_map=row_map, after_logits=project if side_stream is not None else None,
+        )
+        if projected:
+            torch.cuda.current_stream().wait_stream(side_stream)
+            projected[0].record_stream(torch.cuda.current_stream())
+        else:
+            projected.append(selector.hidden_projection(flat))
+        proj = projected[0].view(bs, slots + hoff, -1)
         if ids_out is None:
             ids_out = torch.empty((bs * slots, k), dtype=torch.int64, device=hidden.device)
         ids = ids_out.view(bs, slots, k)

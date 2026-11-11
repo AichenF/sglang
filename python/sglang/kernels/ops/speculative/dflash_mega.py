@@ -31,7 +31,7 @@ O_TILES = 96
 GU_TILES = 64
 DN_TILES = 96
 NPH = 6  # weight maps per layer: qkv, o, gate_up, down, convolution coefficients (attention, mlp)
-NSLOT_ATT = 6
+NSLOT_ATT = 5  # Reserve 160 K/V rows for 32-key attention tiles.
 NSLOT_FULL = 10
 
 _SRC = os.path.join(

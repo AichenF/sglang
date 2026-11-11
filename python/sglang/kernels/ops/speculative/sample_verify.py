@@ -8,7 +8,7 @@ kernel turns it into accept_len / bonus / commit lengths unchanged. Greedy reque
 
 Candidate-selector drafts (``enable_selector``): the draft tokens come from a sparse q over SEL_K candidates per
 position; the kernel accepts with coin * q(x) < p(x), draws the bonus from max(p - q, 0) and uses the reference path's
-coins (``draw_selector_coins``).
+coins (``draw_selector_coins``); every rank reads rank 0's coins in the first exchange.
 
 ``SampleVerifyState`` owns this rank's receive buffer and the peers' mapped addresses, the per-row call counters and the
 static per-request parameter buffers that a captured graph reads (``stage``). The kernel reads the receive-buffer
@@ -29,7 +29,7 @@ NB = 256
 NKEY = 65536
 SEL_K = 16
 MAXREQ = MAXN // 2
-_R1_SLOT = (3 + NB // 2 + SEL_K // 4) * 16
+_R1_SLOT = (3 + NB // 2 + SEL_K // 4 + 1) * 16
 _R2_SLOT = (NB // 2) * 16
 BUF_BYTES = 2 * MAXN * R * _R1_SLOT + 2 * MAXN * R * _R2_SLOT + 2 * MAXN * 16
 DBG = 32
