@@ -31,7 +31,7 @@ O_TILES = 96
 GU_TILES = 64
 DN_TILES = 96
 NPH = 6  # weight maps per layer: qkv, o, gate_up, down, convolution coefficients (attention, mlp)
-NSLOT_ATT = 6
+NSLOT_ATT = 5  # Reserve 160 K/V rows for 32-key attention tiles.
 NSLOT_FULL = 10
 
 _SRC = os.path.join(
@@ -47,13 +47,25 @@ def _src_hash() -> str:
 
 
 @functools.lru_cache(maxsize=None)
-def _module(use_pdl: bool, extra: str = ""):
+def _module(use_pdl: bool, extra: str = "", *, conv_phase0_only: bool = False):
+    """Load the kernel variant matching the state's convolution layout.
+
+    :param use_pdl: Select programmatic dependent launch.
+    :type use_pdl: bool
+    :param extra: Explicit compiler flags, defaults to the environment flags.
+    :type extra: str, optional
+    :param conv_phase0_only: Compile phase0 for convolution drafts only.
+    :type conv_phase0_only: bool, optional
+    :return: Loaded module with the unchanged exported ABI.
+    :rtype: object
+    """
     from sglang.kernels.jit.utils import cuda_stubs_dir, load_jit, make_cpp_args
 
     args = make_cpp_args(use_pdl)
     flags = ["-O3"] + [f for f in (extra or os.environ.get("DM_NVCC_FLAGS", "")).split() if f]
+    flags.append(f"-DDFLASH_V2_PHASE0_ONLY={int(conv_phase0_only)}")
     return load_jit(
-        "dflash_mega_" + _src_hash(),
+        "dflash_mega_" + _src_hash() + f"_conv{int(conv_phase0_only)}",
         *args,
         cuda_files=["distributed/dflash_mega.cuh"],
         cuda_wrappers=[
@@ -161,16 +173,49 @@ class DFlashMegaState:
         nl: int = NL,
         look: Optional[int] = None,
     ):
+        """Allocate five-layer state and select its matching phase0 variant.
+
+        :param tp_state: Existing tensor-parallel communication state.
+        :type tp_state: object
+        :param layers: Five homogeneous layer dictionaries.
+        :type layers: list
+        :param final_norm: Final normalization weights.
+        :type final_norm: torch.Tensor
+        :param cos_sin_cache: Existing rotary cache.
+        :type cos_sin_cache: torch.Tensor
+        :param eps: Residual normalization epsilon.
+        :type eps: float
+        :param qk_eps: Query/key normalization epsilon.
+        :type qk_eps: float
+        :param v_scale: Model value scaling factor.
+        :type v_scale: float
+        :param sm_scale: Attention score scaling factor.
+        :type sm_scale: float
+        :param plan: Optional existing work assignment.
+        :type plan: dict, optional
+        :param stamps: Enable existing timing stamps, defaults to False.
+        :type stamps: bool, optional
+        :param nl: Existing layer-count configuration, defaults to NL.
+        :type nl: int, optional
+        :param look: Optional existing lookahead setting.
+        :type look: int, optional
+        :raises AssertionError: If layers have incompatible convolution layouts.
+
+        .. code-block:: python
+
+            state = DFlashMegaState(tp_state, layers, final_norm, rope,
+                                    eps, qk_eps, v_scale, sm_scale)
+        """
         assert len(layers) == NL
         self.tp = tp_state
         self.device = final_norm.device
         dev = self.device
-        self.mod = _module(_use_pdl())
+        self.conv = "w_ca" in layers[0]
+        assert all(("w_ca" in L) == self.conv for L in layers)
+        self.mod = _module(_use_pdl(), conv_phase0_only=self.conv)
         self.layers = layers  # keep the tensors alive
         self.final_norm = final_norm
         self.cos_sin_cache = cos_sin_cache
-        self.conv = "w_ca" in layers[0]
-        assert all(("w_ca" in L) == self.conv for L in layers)
         self.maps = torch.zeros((NL * NPH + 2) * 128, dtype=torch.uint8, device=dev)
         self.hn = torch.zeros(2 * NL, MT, H, dtype=torch.bfloat16, device=dev) if self.conv else None
         self.coef = torch.zeros(2 * NL, MT, 1536, dtype=torch.bfloat16, device=dev) if self.conv else None

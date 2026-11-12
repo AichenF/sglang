@@ -66,7 +66,8 @@ constexpr int HIST_V = NB / 2;  // 16-B vectors of a histogram {h, tag, h, tag}
 constexpr int R1_V = HDR_V + HIST_V;
 constexpr int SEL_K = 16;     // selector candidates per position
 constexpr int SEL_V = SEL_K / 4;  // 16-B vectors of the owned candidate logits
-constexpr int64_t R1_SLOT = (R1_V + SEL_V) * 16;
+constexpr int COIN_V = 1;      // selector rows: rank 0's level and final coins
+constexpr int64_t R1_SLOT = (R1_V + SEL_V + COIN_V) * 16;
 constexpr int64_t R2_SLOT = HIST_V * 16;
 constexpr int64_t R3_SLOT = 16;
 constexpr int64_t R1_OFF = 0;
@@ -265,6 +266,7 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
   __shared__ uint32_t s_selmask;             // bit k: candidate k is owned here
   __shared__ int s_seli[SEL_K];              // candidate ids (-1: invalid or repeated)
   __shared__ float s_selq[SEL_K];
+  __shared__ float s_coin[2];                // rank 0's level and final coins (selector rows)
   __shared__ float s_sele[SEL_K];            // kept mass relative to M (0 outside the top-p set)
   __shared__ int s_selown[SEL_K];            // owner rank of a kept candidate, else -1
 
@@ -288,7 +290,8 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
   const int G = p.G;
   const int b = t / G, j = t - b * G;
   const bool samp = p.mode[b] != 0;
-  const bool sel = samp && p.sel_ids != nullptr && j < G - 1;
+  const bool selc = samp && p.sel_ids != nullptr;
+  const bool sel = selc && j < G - 1;
   const float T = p.temp[b];
   const bool t1 = (T == 1.0f);
   const float topp = p.top_p[b];
@@ -459,11 +462,16 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
 
   // ---- 3) round 1: push {argmax, (m, Z), candidate logit, hist} to every rank; collect all 8 ----
   {
-    const int nvec = samp ? (sel ? R1_V + SEL_V : R1_V) : 1;
+    const int nsel = R1_V + (sel ? SEL_V : 0);
+    const int nvec = samp ? nsel + (selc ? COIN_V : 0) : 1;
     for (int idx = tid; idx < R * nvec; idx += THREADS) {
       const int d = idx / nvec, v = idx - d * nvec;
+      const int slot_v = v < nsel ? v : R1_V + SEL_V;
       uint4 val;
-      if (v == 0) val = make_uint4(akey, tag, aidx, tag);
+      if (v >= nsel) {
+        const float lvl = j < G - 1 ? coin(p, call, b, j) : 1.f;
+        val = make_uint4(__float_as_uint(lvl), tag, __float_as_uint(coin(p, call, b, MAXG)), tag);
+      } else if (v == 0) val = make_uint4(akey, tag, aidx, tag);
       else if (v == 1) val = make_uint4(__float_as_uint(m_loc), tag, __float_as_uint(z_loc), tag);
       else if (v == 2) val = make_uint4(xc_info, tag, sel ? s_selmask : 0u, tag);
       else if (v < R1_V)
@@ -472,13 +480,16 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
         const int k = 4 * (v - R1_V);
         val = make_uint4(s_selraw[k] | (s_selraw[k + 1] << 16), tag, s_selraw[k + 2] | (s_selraw[k + 3] << 16), tag);
       }
-      st_v4(s_peer[d] + R1_OFF + ((static_cast<int64_t>(phase) * MAXN + t) * R + p.rank) * R1_SLOT + v * 16, val);
+      st_v4(s_peer[d] + R1_OFF + ((static_cast<int64_t>(phase) * MAXN + t) * R + p.rank) * R1_SLOT + slot_v * 16, val);
     }
     SV_STAMP(3);
     for (int idx = tid; idx < R * nvec; idx += THREADS) {
       const int s = idx / nvec, v = idx - s * nvec;
-      const uint4 d = poll_tag(mybuf + R1_OFF + ((static_cast<int64_t>(phase) * MAXN + t) * R + s) * R1_SLOT + v * 16, tag);
-      if (v == 0) { s_hdr[s][0] = d.x; s_hdr[s][1] = d.z; }
+      const int slot_v = v < nsel ? v : R1_V + SEL_V;
+      const uint4 d = poll_tag(mybuf + R1_OFF + ((static_cast<int64_t>(phase) * MAXN + t) * R + s) * R1_SLOT + slot_v * 16, tag);
+      if (v >= nsel) {
+        if (s == 0) { s_coin[0] = __uint_as_float(d.x); s_coin[1] = __uint_as_float(d.z); }
+      } else if (v == 0) { s_hdr[s][0] = d.x; s_hdr[s][1] = d.z; }
       else if (v == 1) { s_hdr[s][2] = d.x; s_hdr[s][3] = d.z; }
       else if (v == 2) { s_hdr[s][4] = d.x; s_hdr[s][5] = d.z; }
       else if (v < R1_V) { rh[s * NB + 2 * (v - HDR_V)] = __uint_as_float(d.x); rh[s * NB + 2 * (v - HDR_V) + 1] = __uint_as_float(d.z); }
@@ -608,7 +619,7 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
       in_k = key16(raw) >= keystar && e_c > 0.f;
     }
   }
-  const float cj = (j < G - 1) ? coin(p, call, b, j) : 1.f;
+  const float cj = (j < G - 1) ? (selc ? s_coin[0] : coin(p, call, b, j)) : 1.f;
   float tp = in_k ? __fdiv_rn(e_c, SK) : 0.f;
   bool acc = (j < G - 1) && tp > 0.f && cj < tp;
   if (sel) {  // q(x) = 0 outside the candidates: rejected
@@ -669,7 +680,7 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
       s_w[s] = w;
       total += w;
     }
-    const float u = coin(p, call, b, MAXG) * total;
+    const float u = (selc ? s_coin[1] : coin(p, call, b, MAXG)) * total;
     int rs = -1;
     float pre = 0.f, excl = 0.f;
     for (int s = 0; s < R; ++s) {

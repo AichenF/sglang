@@ -94,9 +94,9 @@ constexpr int TILEB = 8192;
 constexpr int XU = 4096;
 constexpr int MAXT_PH = 5;
 constexpr int MAX_SLOT = 16;
-constexpr int KVU = 16;
-constexpr int KV_MAXU = 9;
-constexpr int KV_MAXK = KVU * KV_MAXU;  // 144
+constexpr int KVU = 32;
+constexpr int KV_MAXU = 5;
+constexpr int KV_MAXK = KVU * KV_MAXU;  // 160
 constexpr int SMEM_BYTES = 232448;
 constexpr float FP8_MAX = 448.f;
 enum { PH_QKV = 0, PH_O = 1, PH_GU = 2, PH_DN = 3, PH_CA = 4, PH_CM = 5 };
@@ -106,7 +106,9 @@ __device__ constexpr int PH_ORDER[NPH] = {PH_CA, PH_QKV, PH_O, PH_CM, PH_GU, PH_
 constexpr int CF_N = 1536;  // coefficient rows [input, output][tap][group]
 constexpr int CF_G = H / 16;
 constexpr int CF_TILES = 24;  // CTAs taking a K chunk of one of the rank's 3 coefficient tiles
-constexpr int CF_NU = 6;
+constexpr int CF_K_PARTS = 4;
+constexpr int CF_ROUND_NU = SL / 128;
+constexpr int CF_NU = 2 * CF_ROUND_NU;  // 1536 K columns per active CTA, streamed in two 768-column rounds
 enum { C_LAUNCH = 0, C_X = 1, C_ATT = 2, C_ACT = 3, C_Y = 6, C_QKV = 8, C_N = 64 };
 
 // smem layout (bytes from the 1024-aligned dynamic base)
@@ -114,7 +116,7 @@ constexpr int MISC_BYTES = 2048;
 constexpr int XREG = 24576;                  // X operand (up to 6 units)
 constexpr int GREG_ATT = XREG + 4 * TILEB;   // attention clusters: <= 4 tiles per phase -> 56 KB
 constexpr int GREG_FULL = XREG + 5 * TILEB;  // others: <= 5 tiles -> 64 KB
-constexpr int KV_BYTES = 2 * KV_MAXK * HD * 2;  // 73728
+constexpr int KV_BYTES = 2 * KV_MAXK * HD * 2;  // 81920
 constexpr int COMB_STRIDE = 132;             // floats per (src, head): 128 o + lse + pad
 constexpr int COMB_SRC_BYTES = 8 * (HD * 4 + 4);  // 4128 bytes per source split
 constexpr int QREG = 34 * 1024;              // Q tile inside the GEMM region (after COMB)
@@ -394,6 +396,15 @@ DEV void wgmma_m64n32k16_bf16(float* d, uint64_t da, uint64_t db) {
         "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15])
       : "l"(da), "l"(db));
 }
+DEV void wgmma_m64n16k16_bf16(float* d, uint64_t da, uint64_t db) {
+  asm volatile(
+      "{\n.reg .pred p;\nsetp.ne.b32 p, 1, 0;\n"
+      "wgmma.mma_async.sync.aligned.m64n16k16.f32.bf16.bf16 "
+      "{%0, %1, %2, %3, %4, %5, %6, %7}, %8, %9, p, 1, 1, 0, 0;\n}\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
+      : "l"(da), "l"(db));
+}
+
 DEV uint2 ld_cluster_v2(uint32_t addr) {
   uint2 v;
   asm volatile("ld.shared::cluster.v2.u32 {%0, %1}, [%2];" : "=r"(v.x), "=r"(v.y) : "r"(addr) : "memory");
@@ -468,8 +479,8 @@ DEV bool uit_settle(const Params& p, int c, int rank, UIt& it) {
   while (it.l < p.nl) {
     it.ph = PH_ORDER[it.oi];
     if (it.ph == PH_CA || it.ph == PH_CM) {
-      // all-reduce cluster AR0 + j takes coefficient tile j, its CTA k the K chunk k
-      it.nt = (p.conv && c >= AR0 && c < AR0 + CF_TILES / CS) ? 1 : 0;
+      // Cluster AR0 + j takes coefficient tile j; CTAs 0..3 compute contiguous 1536-column K parts.
+      it.nt = (p.conv && c >= AR0 && c < AR0 + CF_TILES / CS && rank < CF_K_PARTS) ? 1 : 0;
       it.cft = c - AR0;
       it.nu = CF_NU;
       it.ks = rank;
@@ -477,12 +488,23 @@ DEV bool uit_settle(const Params& p, int c, int rank, UIt& it) {
     } else {
       const bool s8 = (it.ph == PH_QKV || it.ph == PH_GU);
       const int g = s8 ? 0 : (rank >> 2);
-      it.nu = s8 ? 6 : 4;
-      it.ks = s8 ? rank : (rank & 3);
-      it.nt = p.plan.n[it.ph][c][g];
+      it.nu = s8 ? 48 : 16;
+      // One output tile per CTA pass; larger plans wrap over the available CTAs.
+      const int owner = s8 ? rank : (rank & 3);
+      const int stride = s8 ? CS : CS / 2;
+      const int total = p.plan.n[it.ph][c][g];
+      it.ks = owner;
+#if defined(DFLASH_V2_PHASE0_ONLY) && DFLASH_V2_PHASE0_ONLY
+      // Keep the original producer code generation in the dense V1 module.
+      // total >= 0 and owner < stride make the dividend nonnegative.
+      it.nt = (total + stride - 1 - owner) >> (s8 ? 3 : 2);
+#else
+      it.nt = (total + stride - 1 - owner) / stride;
+#endif
       it.tl = p.plan.tile[it.ph][c][g];
     }
-    if (2 * it.sl < it.nt) return true;
+    const bool cf = it.ph == PH_CA || it.ph == PH_CM;
+    if ((cf ? 2 * it.sl : it.sl) < it.nt) return true;
     it.sl = 0;
     it.u = 0;
     if (++it.oi == NPH) {
@@ -522,9 +544,10 @@ DEV void uit_issue(const Params& p, const UIt& it, bool pf, uint8_t* dst, uint64
   const CUtensorMap* map = p.maps + it.l * NPH + it.ph;
   const bool cf = (it.ph == PH_CA || it.ph == PH_CM);
   // coefficient units: the two 64-column chunks of a 128-column K step of one tile
-  const int t0 = cf ? it.cft : it.tl[2 * it.sl];
-  const int t1 = cf ? it.cft : (2 * it.sl + 1 < it.nt ? it.tl[2 * it.sl + 1] : -1);
-  const int kc = (it.ks * it.nu + it.u) * 128;  // elements
+  const int stride = it.ph == PH_QKV || it.ph == PH_GU ? CS : CS / 2;
+  const int t0 = cf ? it.cft : it.tl[it.ks + stride * it.sl];
+  const int t1 = cf ? it.cft : -1;
+  const int kc = ((cf ? it.ks * it.nu : 0) + it.u) * 128;  // elements
 #pragma unroll
   for (int w = 0; w < 2; ++w) {
     const int t = w ? t1 : t0;
@@ -596,7 +619,7 @@ DEV void producer(const Params& p, Smem& s, int c, int rank) {
     }
 #endif
     if (ld.sl == 0 && ld.u == 0 && ld.ph != PH_QKV) dstamp(p, ld.l, 60 + ld.ph);
-    const int t1 = (ld.ph == PH_CA || ld.ph == PH_CM || 2 * ld.sl + 1 < ld.nt) ? 1 : 0;
+    const int t1 = (ld.ph == PH_CA || ld.ph == PH_CM) ? 1 : 0;
     mbar_expect_tx(&s.full[slot], (1 + t1) * TILEB);
     uit_issue(p, ld, false, s.ring + slot * SLAB, &s.full[slot], pol);
     vld = uit_next(p, c, rank, ld);
@@ -624,7 +647,8 @@ struct Split {
 DEV Split split_of(int seqlen, int rank) {
   Split sp;
   sp.seqlen = seqlen;
-  const int L0 = max(0, seqlen - (BLK + WIN));
+  // Match the original reference tile origin; the per-query mask rejects the extra prefix.
+  const int L0 = (max(0, seqlen - (BLK + WIN)) / KVU) * KVU;
   const int nk = max(0, seqlen - L0);
   const int U = (nk + KVU - 1) / KVU;
   const int u0 = rank * U / CS, u1 = (rank + 1) * U / CS;
@@ -746,15 +770,18 @@ DEV void cf_load_x(const Params& p, uint8_t* X, int e, int kch, int ctid) {
   }
 }
 
-// After hn[e] is written: this rank's 192 coefficient rows (3 tiles) split-K over the 8 CTAs of all-reduce clusters
-// 0..2, partials summed over DSMEM in rank order with one BF16 rounding; the input-side ones go to every rank, and
+// After hn[e] is written: this rank's 192 coefficient rows (3 tiles) split-K over 4 CTAs in each all-reduce cluster
+// 0..2. Two warpgroups cover disjoint token halves; 4 DSMEM partials are summed before one BF16 rounding. Input coefficients go to every rank, and
 // every token CTA convolves its full row and quantizes it into the x buffer of event e.
 DEV void conv_tail(const Params& p, Smem& s, int t, int e, int ctid, unsigned E, int& cslot, uint32_t& cpar) {
   const int lane = ctid & 31, warp = ctid >> 5, wg = ctid >> 7, ww = (ctid >> 5) & 3;
   const int ai = (static_cast<int>(cluster_id_x()) - AR0) * CS + static_cast<int>(cluster_rank());
   const unsigned ytgt = (E * 10u + static_cast<unsigned>(e) + 1u) * 32u;
-  if (ctid == 0) red_release(p.cnt + C_Y, 1u);
-  float* stage = reinterpret_cast<float*>(s.greg);  // [MT][64] fp32 partial of warpgroup 1 (after the K loop)
+  if (ctid == 0) {
+    // Publish readiness only after arming every receiver, including CTAs that do not multiply.
+    if (ai < CF_TILES) mbar_expect_tx(s.cbar, CF_K_PARTS * 8u * MT * 4u);
+    red_release(p.cnt + C_Y, 1u);
+  }
   if (ctid == 0) wait_ge(p.cnt + C_Y, ytgt);
   bar_sync(1, NCT);
   // full-row convolution inputs: row t, row t - 1 of the block, the base taps
@@ -773,117 +800,82 @@ DEV void conv_tail(const Params& p, Smem& s, int t, int e, int ctid, unsigned E,
     }
   };
   if (ai < CF_TILES) {
-    // warpgroup w multiplies ring units 3w .. 3w + 2; the two fp32 partials are summed
-    uint8_t* X = s.greg;
     const int kch = static_cast<int>(cluster_rank());
-    if (ctid == 0) mbar_expect_tx(s.cbar, 8u * 8u * MT * 4u);  // 8 rows x 32 tokens fp32 from each of the 8 CTAs
-    cf_load_x(p, X, e, kch, ctid);
-    fence_proxy_async_shared();
-    bar_sync(1, NCT);
-    load_conv_inputs();  // in flight during the tile
-    constexpr int UW = CF_NU / 2;
-    const int ns = s.nslot, c0 = cslot;
-    const uint32_t p0 = cpar;
-    auto slot_of = [&](int u, uint32_t& par) {
-      int x = c0 + u;
-      uint32_t pr = p0;
-      while (x >= ns) {
-        x -= ns;
-        pr ^= 1u;
-      }
-      par = pr;
-      return x;
-    };
-    // every ring unit takes one arrival per warp: the other warpgroup's units are released without being read
-    if (wg == 1) {
+    float* recv = reinterpret_cast<float*>(s.greg + 2 * CF_ROUND_NU * XU);  // [4 K parts][8 rows][32 token positions]
+    if (kch < CF_K_PARTS) {
+      uint8_t* X = s.greg;
+      const int ns = s.nslot, c0 = cslot;
+      const uint32_t p0 = cpar;
+      auto slot_of = [&](int u, uint32_t& par) {
+        int x = c0 + u;
+        uint32_t pr = p0;
+        while (x >= ns) {
+          x -= ns;
+          pr ^= 1u;
+        }
+        par = pr;
+        return x;
+      };
+      float acc[8];
+#pragma unroll
+      for (int r = 0; r < 8; ++r) acc[r] = 0.f;
 #pragma unroll 1
-      for (int u = 0; u < UW; ++u) {
-        uint32_t pr;
-        const int sl = slot_of(u, pr);
-        __syncwarp();
-        if (lane == 0) mbar_arrive(&s.empty[sl]);
-      }
-    }
-    float acc[16];
-#pragma unroll
-    for (int r = 0; r < 16; ++r) acc[r] = 0.f;
-    int prev = -1;
+      for (int round = 0; round < 2; ++round) {
+        cf_load_x(p, X, e, 2 * kch + round, ctid);
+        fence_proxy_async_shared();
+        bar_sync(1, NCT);
+        if (round == 0) load_conv_inputs();
+        int prev = -1;
 #pragma unroll 1
-    for (int i = 0; i < UW; ++i) {
-      const int u = UW * wg + i;
-      uint32_t par;
-      const int slot = slot_of(u, par);
-      mbar_wait(&s.full[slot], par);
-      wgmma_fence();
+        for (int i = 0; i < CF_ROUND_NU; ++i) {
+          const int u = round * CF_ROUND_NU + i;
+          uint32_t par;
+          const int slot = slot_of(u, par);
+          mbar_wait(&s.full[slot], par);
+          wgmma_fence();
 #pragma unroll
-      for (int h = 0; h < 2; ++h) {
-        const uint64_t da = make_desc(s.ring + slot * SLAB + h * TILEB);
-        const uint64_t db = make_desc(X + (2 * u + h) * XU);
+          for (int h = 0; h < 2; ++h) {
+            const uint64_t da = make_desc(s.ring + slot * SLAB + h * TILEB);
+            const uint64_t db = make_desc(X + (2 * i + h) * XU + wg * 16 * 128);
 #pragma unroll
-        for (int kk = 0; kk < 4; ++kk) wgmma_m64n32k16_bf16(acc, da + 2 * kk, db + 2 * kk);
-      }
-      wgmma_commit();
-      if (prev >= 0) {
-        wgmma_wait<1>();
+            for (int kk = 0; kk < 4; ++kk) wgmma_m64n16k16_bf16(acc, da + 2 * kk, db + 2 * kk);
+          }
+          wgmma_commit();
+          if (prev >= 0) {
+            wgmma_wait<1>();
+            __syncwarp();
+            if (lane == 0) mbar_arrive(&s.empty[prev]);
+          }
+          prev = slot;
+        }
+        wgmma_wait<0>();
         __syncwarp();
         if (lane == 0) mbar_arrive(&s.empty[prev]);
+        bar_sync(1, NCT);  // both token halves finish reading before the next round overwrites X
       }
-      prev = slot;
-    }
-    wgmma_wait<0>();
-    __syncwarp();
-    if (lane == 0) mbar_arrive(&s.empty[prev]);
-    if (wg == 0) {
-#pragma unroll 1
-      for (int u = UW; u < CF_NU; ++u) {
-        uint32_t pr;
-        const int sl = slot_of(u, pr);
-        __syncwarp();
-        if (lane == 0) mbar_arrive(&s.empty[sl]);
-      }
-    }
-    {
       uint32_t pr;
       cslot = slot_of(CF_NU, pr);
       cpar = pr;
-    }
-    bar_sync(1, NCT);  // both warpgroups' wgmma reads of X are done: X becomes the staging / receive area
-    if (wg == 1) {
-#pragma unroll
-      for (int r = 0; r < 16; ++r) {
-        const int rho = 16 * ww + (lane >> 2) + 8 * ((r >> 1) & 1);
-        const int tok = 8 * (r >> 2) + 2 * (lane & 3) + (r & 1);
-        stage[tok * 64 + rho] = acc[r];
-      }
-    }
-    bar_sync(1, NCT);
-    float* recv = reinterpret_cast<float*>(s.greg + 2 * CF_NU * XU);  // [8 K chunks][8 rows][32 token positions]
-    if (wg == 0) {
       const uint32_t rbase = smem_u32(recv), rbar = smem_u32(s.cbar);
-#pragma unroll
-      for (int r = 0; r < 16; ++r) {
-        const int rho = 16 * ww + (lane >> 2) + 8 * ((r >> 1) & 1);
-        const int tok = 8 * (r >> 2) + 2 * (lane & 3) + (r & 1);
-        acc[r] += stage[tok * 64 + rho];
-      }
 #pragma unroll
       for (int hf = 0; hf < 2; ++hf) {
         const int rho = 16 * ww + (lane >> 2) + 8 * hf;
         const int owner = rho >> 3, lrow = rho & 7;
-        const uint32_t off = static_cast<uint32_t>(((kch * 8 + lrow) * 32 + (lane & 3) * 8) * 4);
+        const uint32_t off = static_cast<uint32_t>(((kch * 8 + lrow) * 32 + (lane & 3) * 8 + wg * 4) * 4);
         const uint32_t dst = mapa(rbase + off, owner), bar = mapa(rbar, owner);
         const int r0 = 2 * hf;
         st_async_v4(dst, acc[r0], acc[r0 + 1], acc[r0 + 4], acc[r0 + 5], bar);
-        st_async_v4(dst + 16, acc[r0 + 8], acc[r0 + 9], acc[r0 + 12], acc[r0 + 13], bar);
       }
+    } else {
+      load_conv_inputs();
     }
     mbar_wait_cluster(s.cbar, static_cast<uint32_t>(e & 1));
     {
-      // rows 8 kch .. 8 kch + 7 of tile (ai / 8): rank-ordered sum of the 8 K chunks, one BF16 rounding
+      // Rows 8 kch .. 8 kch + 7 of tile (ai / 8): ordered sum of 4 contiguous K parts, one BF16 rounding
       const int tok = ctid >> 3, rr = ctid & 7;
       float v = 0.f;
 #pragma unroll
-      for (int q = 0; q < CS; ++q) v += recv[(q * 8 + rr) * 32 + tpos(tok)];
+      for (int q = 0; q < CF_K_PARTS; ++q) v += recv[(q * 8 + rr) * 32 + tpos(tok)];
       const int li0 = (ai >> 3) * 64 + kch * 8, li = li0 + rr;  // row of W_r: [side][tap][group]
       const int side = li / (CS_N / 2), tap = (li % (CS_N / 2)) / (CF_G / R), gl = li % (CF_G / R);
       const __nv_bfloat16 bv = __float2bfloat16_rn(v);
@@ -1181,7 +1173,7 @@ DEV void allreduce(const Params& p, Smem& s, int t, int kar, int ctid, unsigned 
     float am = 0.f;
 #pragma unroll
     for (int w = 0; w < NCT / 32; ++w) am = fmaxf(am, s.red[8 + w]);
-    const float scale = fmaxf(am, 1e-10f) / FP8_MAX;
+    const float scale = __fdividef(fmaxf(am, 1e-10f), FP8_MAX);
     const float inv = rcp_scale(scale);
     const int buf = (kar + 1) & 1;  // x event kar + 1
     uint8_t* xrow = p.xq + (static_cast<int64_t>(buf) * MT + t) * H;
@@ -1226,7 +1218,6 @@ DEV void phase0(const Params& p, Smem& s, int t, int ctid, unsigned E, int& cslo
   const __nv_bfloat16* row = p.hidden + static_cast<int64_t>(t) * H;
   const __nv_bfloat16* gamma = p.L[0].ln_in;
   float v[PER], gm[PER];
-  float ssq = 0.f;
 #pragma unroll
   for (int cc = 0; cc < PER; cc += 8) {
     const int e = (cc / 8) * NCT * 8 + ctid * 8;
@@ -1242,20 +1233,50 @@ DEV void phase0(const Params& p, Smem& s, int t, int ctid, unsigned E, int& cslo
       gm[cc + 2 * j + 1] = bf_hi(gw[j]);
     }
   }
+  // Match the reference RMSNorm's 64-thread row and serial vec8 reduction.
+  if (ctid < 64) {
+    float ssq = 0.f;
 #pragma unroll
-  for (int i = 0; i < PER; ++i) ssq += v[i] * v[i];
+    for (int block = 0; block < H / (64 * 8); ++block) {
+      const uint4 x = *reinterpret_cast<const uint4*>(row + block * 512 + ctid * 8);
+      const uint32_t words[4] = {x.x, x.y, x.z, x.w};
 #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) ssq += __shfl_xor_sync(0xffffffffu, ssq, o);
-  if (lane == 0) s.red[warp] = ssq;
+      for (int j = 0; j < 4; ++j) {
+        const float lo = bf_lo(words[j]), hi = bf_hi(words[j]);
+        ssq = __fmaf_rn(lo, lo, ssq);
+        ssq = __fmaf_rn(hi, hi, ssq);
+      }
+    }
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1)
+      ssq = __fadd_rn(ssq, __shfl_xor_sync(0xffffffffu, ssq, off));
+    if (lane == 0) s.red[warp] = ssq;
+  }
   bar_sync(1, NCT);
-  float tot = 0.f;
+  const float tot = __fadd_rn(s.red[0], s.red[1]);
+  const float rstd = rsqrtf(__fadd_rn(__fdiv_rn(tot, static_cast<float>(H)), p.eps));
+#if defined(DFLASH_V2_PHASE0_ONLY) && DFLASH_V2_PHASE0_ONLY
+  // conv_tail consumes normalized BF16 and publishes its own FP8 input.
+  // Preserve the reference RMSNorm arithmetic; the pre-convolution quant is dead.
 #pragma unroll
-  for (int w = 0; w < NCT / 32; ++w) tot += s.red[w];
-  const float rstd = rsqrtf(tot / static_cast<float>(H) + p.eps);
+  for (int i = 0; i < PER; ++i)
+    v[i] = bf16r(__fmul_rn(__fmul_rn(v[i], rstd), __fadd_rn(gm[i], 0.f)));
+#pragma unroll
+  for (int cc = 0; cc < PER; cc += 8) {
+    const int e = (cc / 8) * NCT * 8 + ctid * 8;
+    uint32_t hb[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) hb[j] = pack_bf2(v[cc + 2 * j], v[cc + 2 * j + 1]);
+    *reinterpret_cast<uint4*>(p.hn + static_cast<int64_t>(t) * H + e) = make_uint4(hb[0], hb[1], hb[2], hb[3]);
+  }
+  bar_sync(1, NCT);
+  conv_tail(p, s, t, 0, ctid, E, cslot, cpar);
+  return;
+#else
   float amx = 0.f;
 #pragma unroll
   for (int i = 0; i < PER; ++i) {
-    v[i] = bf16r(v[i] * rstd * gm[i]);
+    v[i] = bf16r(__fmul_rn(__fmul_rn(v[i], rstd), __fadd_rn(gm[i], 0.f)));
     amx = fmaxf(amx, fabsf(v[i]));
   }
 #pragma unroll
@@ -1265,7 +1286,7 @@ DEV void phase0(const Params& p, Smem& s, int t, int ctid, unsigned E, int& cslo
   float m = 0.f;
 #pragma unroll
   for (int w = 0; w < NCT / 32; ++w) m = fmaxf(m, s.red[8 + w]);
-  const float sc = fmaxf(m, 1e-10f) / FP8_MAX;
+  const float sc = __fdividef(fmaxf(m, 1e-10f), FP8_MAX);
   const float inv = rcp_scale(sc);
   uint8_t* xrow = p.xq + static_cast<int64_t>(t) * H;  // buffer 0
 #pragma unroll
@@ -1292,6 +1313,7 @@ DEV void phase0(const Params& p, Smem& s, int t, int ctid, unsigned E, int& cslo
     return;
   }
   if (ctid == 0) red_release(p.cnt + C_X, 1u);
+#endif
 }
 
 // ------------------------------------------------------------------ GEMM phase
@@ -1299,7 +1321,7 @@ template <int PH>
 DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsigned E, int& cslot, uint32_t& cpar, int& gph,
                int& xph) {
   constexpr bool S8 = (PH == PH_QKV || PH == PH_GU);
-  constexpr int NU = S8 ? 6 : 4;
+  constexpr int NU = S8 ? 48 : 16;
   constexpr int NS = S8 ? 8 : 4;
   constexpr int ROWS = S8 ? 8 : 16;
   const int g = S8 ? 0 : (rank >> 2);
@@ -1326,28 +1348,15 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
     }
     s.red[k * 16 + j] = v;
   }
-  // ---- X operand ----
+  // Full-K prototype: retain original readiness and per-token quantization scales.
   if constexpr (S8) {
     const int e = 2 * l + (PH == PH_GU ? 1 : 0);
     const unsigned tgt = (E * 11u + static_cast<unsigned>(e) + 1u) * 32u;
     if (ctid < 32) {
       if (ctid == 0) wait_ge(p.cnt + C_X, tgt);
       __syncwarp();
-      if (ctid == 0) {
-        uint64_t pol;
-        asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(pol));
-        fence_proxy_async_global();
-        fence_proxy_async_shared();
-        mbar_expect_tx(s.xbar, NU * XU);
-        const CUtensorMap* xm = p.maps + NL * NPH + (e & 1);
-#pragma unroll 1
-        for (int u = 0; u < NU; ++u) tma2d(xm, X + u * XU, s.xbar, (src * NU + u) * 128, 0, pol);
-      }
       s.sx[ctid] = __uint_as_float(ld_acq(reinterpret_cast<const unsigned*>(p.xs + (e & 1) * MT + ctid)));
     }
-    mbar_wait(s.xbar, xph & 1);
-    ++xph;
-    if (ctid == 0) dstamp(p, l, 40 + PH * 4);
   } else {
     const unsigned tgt = (E * 5u + static_cast<unsigned>(l) + 1u) * (PH == PH_O ? 64u : static_cast<unsigned>(GRID));
     if (ctid < 32) {
@@ -1355,74 +1364,97 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
       __syncwarp();
       const unsigned* am = p.amax + ((((E & 1u) * 2u + (PH == PH_DN ? 1u : 0u)) * NL + l) * MT);
       const float a = __uint_as_float(ld_acq(am + ctid));
-      const float sc = (PH == PH_O) ? a / FP8_MAX : fmaxf(a, 1e-10f) / FP8_MAX;
+      // Match the SM90 reference quantizer's fast division, including FP8 rounding ties.
+      const float sc = (PH == PH_O) ? __fdividef(a, FP8_MAX) : __fdividef(fmaxf(a, 1e-10f), FP8_MAX);
       s.sx[ctid] = sc;
       s.sinv[ctid] = sc == 0.f ? 0.f : rcp_scale(sc);
     }
-    bar_sync(1, NCT);
-    const __nv_bfloat16* sp = (PH == PH_O ? p.att : p.act) + src * 512;
-#pragma unroll 2
-    for (int i = ctid; i < MT * 32; i += NCT) {
-      const int t = i >> 5, ch = i & 31, u = ch >> 3, cc = ch & 7;
-      const float inv = s.sinv[t];
-      const uint4 a0 = ldcg_v4(sp + t * 2048 + ch * 16);
-      const uint4 a1 = ldcg_v4(sp + t * 2048 + ch * 16 + 8);
-      const uint32_t w[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
-      uint32_t q[4];
-#pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        const uint16_t lo = pack_e4m3x2(fminf(fmaxf(bf_lo(w[2 * j]) * inv, -FP8_MAX), FP8_MAX),
-                                        fminf(fmaxf(bf_hi(w[2 * j]) * inv, -FP8_MAX), FP8_MAX));
-        const uint16_t hi = pack_e4m3x2(fminf(fmaxf(bf_lo(w[2 * j + 1]) * inv, -FP8_MAX), FP8_MAX),
-                                        fminf(fmaxf(bf_hi(w[2 * j + 1]) * inv, -FP8_MAX), FP8_MAX));
-        q[j] = static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16);
-      }
-      *reinterpret_cast<uint4*>(X + u * XU + t * 128 + ((cc ^ (t & 7)) * 16)) = make_uint4(q[0], q[1], q[2], q[3]);
-    }
-    fence_proxy_async_shared();
-    bar_sync(1, NCT);
-    if (ctid == 0) dstamp(p, l, 40 + PH * 4);
   }
-  // ---- K loop over the slabs (two 64-row tiles per 16-KB ring slab, one per warpgroup) ----
-  const int nslab = (nt + 1) >> 1;
+  bar_sync(1, NCT);
+  if (ctid == 0) dstamp(p, l, 40 + PH * 4);
+  // Inactive contributors can finish early. All eight receivers must first arm recvbar.
+  uint64_t* fullk_ready = reinterpret_cast<uint64_t*>(s.misc + 4);
+  if (ctid == 0) {
+    const uint32_t address = smem_u32(fullk_ready);
+#pragma unroll
+    for (int q = 0; q < CS; ++q) mbar_arrive_remote(mapa(address, q));
+  }
+  mbar_wait_cluster(fullk_ready, gph & 1);
+  bar_sync(1, NCT);
+  // One 64-row output tile per pass. WG0 retains the original MMA shape and K order.
+  const int nslab = nt;
+  static_assert(2 * XU <= XREG, "GEMM input stages must precede the receive region");
 #pragma unroll 1
   for (int sl = 0; sl < nslab; ++sl) {
-    const int k = 2 * sl + wg;
-    const bool have = k < nt;
+    // Other CTAs publish the same zero partials; the receiver and reduction
+    // order remain unchanged. Only this slab's owner consumes its weight ring.
+    const bool full_owner = src == sl % NS;
+    const int k = sl;
+    const bool have = wg == 0;
     float acc[16];
 #pragma unroll
     for (int r = 0; r < 16; ++r) acc[r] = 0.f;
-    int prev = -1;
+    int previous_slot = -1;
 #pragma unroll 1
-    for (int u = 0; u < NU; ++u) {
-      // ring position kept incrementally (a runtime modulo here sits on the wgmma issue path: +140 cycles/unit)
+    for (int u = 0; u < (full_owner ? NU : 0); ++u) {
       const int slot = cslot;
       const uint32_t par = cpar;
-      if (++cslot == s.nslot) {
-        cslot = 0;
-        cpar ^= 1u;
-      }
+      if (++cslot == s.nslot) { cslot = 0; cpar ^= 1u; }
       mbar_wait(&s.full[slot], par);
-      // issued by both warpgroups even when this slab has no tile for this one (it then multiplies the unused half
-      // of the slab and the result is dropped): a predicated wgmma makes ptxas serialize every wgmma (C7518)
-      {
-        const uint64_t da = make_desc(s.ring + slot * SLAB + wg * TILEB);
-        const uint64_t db = make_desc(X + u * XU);
+      // The preceding MMA group may still read the other 4-KiB input stage.
+      uint8_t* Xu = X + (u & 1) * XU;
+      for (int i = ctid; i < MT * 8; i += NCT) {
+        const int t = i >> 3, cc = i & 7;
+        uint4 packed;
+        if constexpr (S8) {
+          const int e = 2 * l + (PH == PH_GU ? 1 : 0);
+          const uint8_t* row = p.xq + (static_cast<int64_t>(e & 1) * MT + t) * H;
+          packed = ldcg_v4(row + u * 128 + cc * 16);
+        } else {
+          const __nv_bfloat16* sp = PH == PH_O ? p.att : p.act;
+          const float inv = s.sinv[t];
+          const uint4 a0 = ldcg_v4(sp + t * 2048 + u * 128 + cc * 16);
+          const uint4 a1 = ldcg_v4(sp + t * 2048 + u * 128 + cc * 16 + 8);
+          const uint32_t w[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+          uint32_t q[4];
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            const uint16_t lo = pack_e4m3x2(fminf(fmaxf(bf_lo(w[2 * j]) * inv, -FP8_MAX), FP8_MAX),
+                                          fminf(fmaxf(bf_hi(w[2 * j]) * inv, -FP8_MAX), FP8_MAX));
+            const uint16_t hi = pack_e4m3x2(fminf(fmaxf(bf_lo(w[2 * j + 1]) * inv, -FP8_MAX), FP8_MAX),
+                                          fminf(fmaxf(bf_hi(w[2 * j + 1]) * inv, -FP8_MAX), FP8_MAX));
+            q[j] = static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16);
+          }
+          packed = make_uint4(q[0], q[1], q[2], q[3]);
+        }
+        *reinterpret_cast<uint4*>(Xu + t * 128 + ((cc ^ (t & 7)) * 16)) = packed;
+      }
+      fence_proxy_async_shared();
+      bar_sync(1, NCT);
+      if (wg == 0) {
+        // Warpgroup-uniform: the second warpgroup still participates in CTA barriers.
+        const uint64_t da = make_desc(s.ring + slot * SLAB);
+        const uint64_t db = make_desc(Xu);
         wgmma_fence();
 #pragma unroll
         for (int kk = 0; kk < 4; ++kk) wgmma_m64n32k32_e4m3(acc, da + 2 * kk, db + 2 * kk);
         wgmma_commit();
-      }
-      if (prev >= 0) {
+        // Preserve every accumulator's K order while overlapping the next
+        // input load with this group. The previous group's two operands are
+        // safe to reuse only after this wait and the following CTA barrier.
         wgmma_wait<1>();
-        __syncwarp();
-        if (lane == 0) mbar_arrive(&s.empty[prev]);
       }
-      prev = slot;
+      bar_sync(1, NCT);
+      if (previous_slot >= 0 && lane == 0) mbar_arrive(&s.empty[previous_slot]);
+      previous_slot = slot;
     }
+    // Every compute warpgroup drains before accumulator consumption.
+    // This also closes empty paths, so the compiler can preserve the pipeline.
     wgmma_wait<0>();
-    __syncwarp();
-    if (lane == 0) mbar_arrive(&s.empty[prev]);
+    if (full_owner) {
+      bar_sync(1, NCT);
+      if (lane == 0) mbar_arrive(&s.empty[previous_slot]);
+    }
     if (have) {
       const uint32_t rbase = smem_u32(recv);
       const uint32_t rbar = smem_u32(s.recvbar);
@@ -1470,7 +1502,7 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
       uint32_t w[4];
 #pragma unroll
       for (int j = 0; j < 4; ++j)
-        w[j] = pack_bf2(v[2 * j] * s.red[k * 16 + 2 * j] * sxv, v[2 * j + 1] * s.red[k * 16 + 2 * j + 1] * sxv);
+        w[j] = pack_bf2(__fmul_rn(__fmul_rn(v[2 * j], sxv), s.red[k * 16 + 2 * j]), __fmul_rn(__fmul_rn(v[2 * j + 1], sxv), s.red[k * 16 + 2 * j + 1]));
 #if DM_LL_QKV
       // data = flag: Lamport-marked words into this layer's parity buffer; the other parity (read by the previous layer,
       // written by the next one -- by this same thread) is cleared now
@@ -1512,8 +1544,8 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
       float amx = 0.f;
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
-        const float gg = bf16r(v[j] * s.red[k * 16 + j] * sxv);
-        const float uu = bf16r(v[4 + j] * s.red[k * 16 + 4 + j] * sxv);
+        const float gg = bf16r(__fmul_rn(__fmul_rn(v[j], sxv), s.red[k * 16 + j]));
+        const float uu = bf16r(__fmul_rn(__fmul_rn(v[4 + j], sxv), s.red[k * 16 + 4 + j]));
         a[j] = bf16r(gg / (1.f + __expf(-gg)) * uu);
         amx = fmaxf(amx, fabsf(a[j]));
       }
@@ -1549,13 +1581,15 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
       uint32_t w[4];
 #pragma unroll
       for (int j = 0; j < 4; ++j)
-        w[j] = nz(pack_bf2(v[2 * j] * s.red[k * 16 + 8 * h + 2 * j] * sxv, v[2 * j + 1] * s.red[k * 16 + 8 * h + 2 * j + 1] * sxv));
+        w[j] = nz(pack_bf2(__fmul_rn(__fmul_rn(v[2 * j], sxv), s.red[k * 16 + 8 * h + 2 * j]), __fmul_rn(__fmul_rn(v[2 * j + 1], sxv), s.red[k * 16 + 8 * h + 2 * j + 1])));
       const int q = n0 / SL;
       const int phase = (s.calls0[t] + kar) & 1;
       st_v4(p.peer[q] + RS_OFF + ((static_cast<int64_t>(phase) * MT + t) * R + p.rank) * RS_SLOT + (n0 - q * SL) * 2,
             make_uint4(w[0], w[1], w[2], w[3]));
     }
   }
+  // Finish all consumers before the next phase reuses s.red, s.sx or s.greg.
+  bar_sync(1, NCT);
 }
 
 // ------------------------------------------------------------------ attention (clusters 0..7)
@@ -1574,12 +1608,20 @@ DEV void qk_norm_rope(const uint4* xv, const __nv_bfloat16* w, const float* cs, 
       x[i * 8 + 2 * j + 1] = bf_hi(vw[j]);
     }
   }
-  float ss = 0.f;
+  float lane_sum[8] = {};
 #pragma unroll
-  for (int d = 0; d < 32; ++d) ss += x[d] * x[d];
-  ss += __shfl_xor_sync(0xffffffffu, ss, 1);
-  ss += __shfl_xor_sync(0xffffffffu, ss, 2);
-  const float inv = 1.f / sqrtf(ss / static_cast<float>(HD) + eps);
+  for (int i = 0; i < 8; ++i) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) lane_sum[i] += x[4 * i + j] * x[4 * i + j];
+  }
+#pragma unroll
+  for (int i = 0; i < 8; ++i) lane_sum[i] += __shfl_xor_sync(0xffffffffu, lane_sum[i], 2);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) lane_sum[i] += __shfl_xor_sync(0xffffffffu, lane_sum[i], 1);
+  const float a0 = lane_sum[0] + lane_sum[4], a1 = lane_sum[1] + lane_sum[5];
+  const float a2 = lane_sum[2] + lane_sum[6], a3 = lane_sum[3] + lane_sum[7];
+  const float ss = (a0 + a2) + (a1 + a3);
+  const float inv = rsqrtf(ss / static_cast<float>(HD) + eps);
   float xn[32];
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
@@ -1599,11 +1641,18 @@ DEV void qk_norm_rope(const uint4* xv, const __nv_bfloat16* w, const float* cs, 
     for (int d = 0; d < 32; ++d) {
       const float c = cs[d], sn = cs[32 + d];
       // quarter 0 holds x1 (dims d), quarter 1 holds x2 (dims 32 + d)
-      xn[d] = (qq == 0) ? bf16r(xn[d] * c - oth[d] * sn) : bf16r(xn[d] * c + oth[d] * sn);
+      xn[d] = (qq == 0) ? bf16r(__fmaf_rn(xn[d], c, -__fmul_rn(oth[d], sn))) : bf16r(__fmaf_rn(xn[d], c, __fmul_rn(oth[d], sn)));
     }
   }
 #pragma unroll
   for (int j = 0; j < 16; ++j) out[j] = pack_bf2(xn[2 * j], xn[2 * j + 1]);
+}
+
+// Preserve the division instruction used by the original attention reference.
+DEV float attention_div(float numerator, float denominator) {
+  float output;
+  asm("div.full.f32 %0, %1, %2;" : "=f"(output) : "f"(numerator), "f"(denominator));
+  return output;
 }
 
 DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsigned E) {
@@ -1674,12 +1723,12 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
   mbar_wait(s.kvfull, l & 1);
   bar_sync(1, NCT);
   if (ctid == 0) dstamp(p, l, 58);
-  // ---- online softmax over 16-key units: warp w -> 16 query rows (tokens 2(w&3), 2(w&3)+1 x 8 heads); the two
+  // ---- online softmax over 32-key units: warp w -> 16 query rows (tokens 2(w&3), 2(w&3)+1 x 8 heads); the two
   // warpgroups split the split's key units (WG1 takes the last half, merged into WG0 through the freed KV tile) ----
   {
     const int rt = warp & 3, half = warp >> 2;
     const int hsplit = (sp.nu + 1) >> 1;
-    const bool ksplit = (sp.nu - hsplit) >= 4;  // the merge buffer is the KV tile of WG1's units (>= 4 x 4 KB each)
+    const bool ksplit = (sp.nu - hsplit) >= 2;  // WG1 contributes >= 2 x 8 KB: enough for each 16 KB merge buffer
     const int ub = half == 0 ? 0 : hsplit;
     const int ue = half == 0 ? (ksplit ? hsplit : sp.nu) : (ksplit ? sp.nu : hsplit);
     const uint32_t qb = smem_u32(sQ), kb = smem_u32(sK), vb = smem_u32(sV);
@@ -1698,26 +1747,28 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
     const float scale = p.sm_scale;
 #pragma unroll 1
     for (int u = ub; u < ue; ++u) {
-      float sc[2][4];
+      // Both 16-key MMA fragments share one 32-key max before BF16 probability rounding.
+      float sc[4][4];
 #pragma unroll
-      for (int jt = 0; jt < 2; ++jt) sc[jt][0] = sc[jt][1] = sc[jt][2] = sc[jt][3] = 0.f;
-      {
-        const int key = 16 * u + (lane & 7) + 8 * (lane >> 4);
+      for (int jt = 0; jt < 4; ++jt) sc[jt][0] = sc[jt][1] = sc[jt][2] = sc[jt][3] = 0.f;
+#pragma unroll
+      for (int kt = 0; kt < 2; ++kt) {
+        const int key = KVU * u + 16 * kt + (lane & 7) + 8 * (lane >> 4);
 #pragma unroll
         for (int kk = 0; kk < 8; ++kk) {
           const int ch = 2 * kk + ((lane >> 3) & 1);
           uint32_t bb[4];
           ldsm_x4(kb + key * 256 + swz(ch, key) * 16, bb);
-          mma_bf16(sc[0], aq[kk], bb[0], bb[1]);
-          mma_bf16(sc[1], aq[kk], bb[2], bb[3]);
+          mma_bf16(sc[2 * kt], aq[kk], bb[0], bb[1]);
+          mma_bf16(sc[2 * kt + 1], aq[kk], bb[2], bb[3]);
         }
       }
       float mu0 = m0, mu1 = m1;
 #pragma unroll
-      for (int jt = 0; jt < 2; ++jt) {
+      for (int jt = 0; jt < 4; ++jt) {
 #pragma unroll
         for (int e = 0; e < 4; ++e) {
-          const int key = sp.kbase + 16 * u + 8 * jt + (lane & 3) * 2 + (e & 1);
+          const int key = sp.kbase + KVU * u + 8 * jt + (lane & 3) * 2 + (e & 1);
           const bool ok = (key < sp.seqlen) && (key >= lo0 + (e >> 1));
           const float v = ok ? sc[jt][e] * scale : -INFINITY;
           sc[jt][e] = v;
@@ -1731,28 +1782,39 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
       const float a0 = __expf(m0 - mu0), a1 = __expf(m1 - mu1);
       m0 = mu0;
       m1 = mu1;
-      l0 *= a0;
-      l1 *= a1;
 #pragma unroll
       for (int j = 0; j < 16; ++j) {
         O[j][0] *= a0; O[j][1] *= a0; O[j][2] *= a1; O[j][3] *= a1;
       }
 #pragma unroll
-      for (int jt = 0; jt < 2; ++jt) {
+      for (int jt = 0; jt < 4; ++jt) {
         sc[jt][0] = __expf(sc[jt][0] - m0);
         sc[jt][1] = __expf(sc[jt][1] - m0);
         sc[jt][2] = __expf(sc[jt][2] - m1);
         sc[jt][3] = __expf(sc[jt][3] - m1);
-        l0 += sc[jt][0] + sc[jt][1];
-        l1 += sc[jt][2] + sc[jt][3];
       }
-      uint32_t a[4];
-      a[0] = pack_bf2(sc[0][0], sc[0][1]);
-      a[1] = pack_bf2(sc[0][2], sc[0][3]);
-      a[2] = pack_bf2(sc[1][0], sc[1][1]);
-      a[3] = pack_bf2(sc[1][2], sc[1][3]);
-      {
-        const int key = 16 * u + (lane & 7) + 8 * ((lane >> 3) & 1);
+      static_assert(KVU == 32);
+      // Observed reference PTX: pairwise register tree, XOR 2 then 1, then one FMA per tile.
+      float sum0=__fadd_rn(
+          __fadd_rn(__fadd_rn(sc[0][0],sc[0][1]),__fadd_rn(sc[1][0],sc[1][1])),
+          __fadd_rn(__fadd_rn(sc[2][0],sc[2][1]),__fadd_rn(sc[3][0],sc[3][1])));
+      float sum1=__fadd_rn(
+          __fadd_rn(__fadd_rn(sc[0][2],sc[0][3]),__fadd_rn(sc[1][2],sc[1][3])),
+          __fadd_rn(__fadd_rn(sc[2][2],sc[2][3]),__fadd_rn(sc[3][2],sc[3][3])));
+      sum0=__fadd_rn(sum0,__shfl_xor_sync(0xffffffffu,sum0,2));
+      sum0=__fadd_rn(sum0,__shfl_xor_sync(0xffffffffu,sum0,1));
+      sum1=__fadd_rn(sum1,__shfl_xor_sync(0xffffffffu,sum1,2));
+      sum1=__fadd_rn(sum1,__shfl_xor_sync(0xffffffffu,sum1,1));
+      l0=__fmaf_rn(l0,a0,sum0);
+      l1=__fmaf_rn(l1,a1,sum1);
+#pragma unroll
+      for (int kt = 0; kt < 2; ++kt) {
+        uint32_t a[4];
+        a[0] = pack_bf2(sc[2 * kt][0], sc[2 * kt][1]);
+        a[1] = pack_bf2(sc[2 * kt][2], sc[2 * kt][3]);
+        a[2] = pack_bf2(sc[2 * kt + 1][0], sc[2 * kt + 1][1]);
+        a[3] = pack_bf2(sc[2 * kt + 1][2], sc[2 * kt + 1][3]);
+        const int key = KVU * u + 16 * kt + (lane & 7) + 8 * ((lane >> 3) & 1);
 #pragma unroll
         for (int dd = 0; dd < 8; ++dd) {
           const int ch = 2 * dd + (lane >> 4);
@@ -1797,14 +1859,9 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
         }
       }
     }
-    l0 += __shfl_xor_sync(0xffffffffu, l0, 1);
-    l0 += __shfl_xor_sync(0xffffffffu, l0, 2);
-    l1 += __shfl_xor_sync(0xffffffffu, l1, 1);
-    l1 += __shfl_xor_sync(0xffffffffu, l1, 2);
     // normalized partial + lse -> the combine buffers of the two token ranks (2rt, 2rt+1)
-    const float r0 = l0 > 0.f ? 1.f / l0 : 0.f, r1 = l1 > 0.f ? 1.f / l1 : 0.f;
-    const float lse0 = l0 > 0.f ? m0 + __logf(l0) : -INFINITY;
-    const float lse1 = l1 > 0.f ? m1 + __logf(l1) : -INFINITY;
+    const float lse0 = l0 > 0.f ? m0 + logf(l0) : -INFINITY;
+    const float lse1 = l1 > 0.f ? m1 + logf(l1) : -INFINITY;
     const int g = lane >> 2;
     if (ctid == 0) dstamp(p, l, 59);
     if (half == 0) {
@@ -1815,11 +1872,12 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
       const int dst = 2 * rt + hf;
       const uint32_t rb = mapa(cbase, dst) + ((rank * 8 + g) * COMB_STRIDE) * 4;
       const uint32_t rbar = mapa(cbar, dst);
-      const float rr = hf ? r1 : r0;
+      const float partial_l = hf ? l1 : l0;
+      const float denominator = partial_l > 0.f ? partial_l : 1.f;
 #pragma unroll
       for (int j = 0; j < 16; ++j) {
         const int d = 8 * j + (lane & 3) * 2;
-        st_async_v2(rb + d * 4, O[j][2 * hf] * rr, O[j][2 * hf + 1] * rr, rbar);
+        st_async_v2(rb + d * 4, attention_div(O[j][2 * hf], denominator), attention_div(O[j][2 * hf + 1], denominator), rbar);
       }
       if ((lane & 3) == 0) st_async_b32(rb + HD * 4, hf ? lse1 : lse0, rbar);
     }
@@ -1852,11 +1910,14 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
       const float w = __expf(lse[q] - mx);
       den += w;
       const float4 v = *reinterpret_cast<const float4*>(comb + (q * 8 + h) * COMB_STRIDE + 4 * d4);
-      o[0] += v.x * w; o[1] += v.y * w; o[2] += v.z * w; o[3] += v.w * w;
+      // Round products before the split sum, matching the original reference reduction.
+      o[0] = __fadd_rn(o[0], __fmul_rn(v.x, w)); o[1] = __fadd_rn(o[1], __fmul_rn(v.y, w));
+      o[2] = __fadd_rn(o[2], __fmul_rn(v.z, w)); o[3] = __fadd_rn(o[3], __fmul_rn(v.w, w));
     }
     if (has_sink && !empty) den += __expf(sink - mx);
-    const float rden = 1.f / (den > 0.f ? den : 1.f);
-    const uint32_t w0 = pack_bf2(o[0] * rden, o[1] * rden), w1 = pack_bf2(o[2] * rden, o[3] * rden);
+    const float denominator = den > 0.f ? den : 1.f;
+    const uint32_t w0 = pack_bf2(attention_div(o[0], denominator), attention_div(o[1], denominator));
+    const uint32_t w1 = pack_bf2(attention_div(o[2], denominator), attention_div(o[3], denominator));
     const int row = BLK * b + rank;
     *reinterpret_cast<uint2*>(p.att + row * 2048 + hg * 1024 + h * HD + 4 * d4) = make_uint2(w0, w1);
     float amx = fmaxf(fmaxf(fabsf(bf_lo(w0)), fabsf(bf_hi(w0))), fmaxf(fabsf(bf_lo(w1)), fabsf(bf_hi(w1))));
@@ -1908,9 +1969,9 @@ __global__ void __launch_bounds__(THREADS, 1) dflash_mega_kernel(const __grid_co
     s.amax = reinterpret_cast<unsigned*>(m + 704);
     s.red = reinterpret_cast<float*>(m + 832);
     s.slot = reinterpret_cast<int*>(m + 1088);
-    s.misc = reinterpret_cast<int*>(m + 1664);
-    s.csbar = reinterpret_cast<uint64_t*>(m + 1688);  // misc[6..7]
-    s.pos = reinterpret_cast<long long*>(m + 1728);
+    s.misc = reinterpret_cast<int*>(m + 1728);
+    s.csbar = reinterpret_cast<uint64_t*>(m + 1752);  // misc[6..7]
+    s.pos = reinterpret_cast<long long*>(m + 1792);
     s.nslot = p.plan.nslot[c];
     s.ring = m + MISC_BYTES;
     s.greg = s.ring + s.nslot * SLAB;
@@ -1931,6 +1992,7 @@ __global__ void __launch_bounds__(THREADS, 1) dflash_mega_kernel(const __grid_co
     mbar_init(s.hbar, 1);
     mbar_init(s.cbar, 1);
     mbar_init(s.csbar, 1);
+    mbar_init(reinterpret_cast<uint64_t*>(s.misc + 4), CS);  // full-K readiness: bytes1744..1751
     s.misc[2] = 0;   // DM_QUIET release counter
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
