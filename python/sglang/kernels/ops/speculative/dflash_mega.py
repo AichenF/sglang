@@ -36,7 +36,10 @@ NSLOT_FULL = 10
 
 _SRC = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "jit", "csrc", "distributed", "dflash_mega.cuh",
+    "jit",
+    "csrc",
+    "distributed",
+    "dflash_mega.cuh",
 )
 
 
@@ -62,7 +65,9 @@ def _module(use_pdl: bool, extra: str = "", *, conv_phase0_only: bool = False):
     from sglang.kernels.jit.utils import cuda_stubs_dir, load_jit, make_cpp_args
 
     args = make_cpp_args(use_pdl)
-    flags = ["-O3"] + [f for f in (extra or os.environ.get("DM_NVCC_FLAGS", "")).split() if f]
+    flags = ["-O3"] + [
+        f for f in (extra or os.environ.get("DM_NVCC_FLAGS", "")).split() if f
+    ]
     flags.append(f"-DDFLASH_V2_PHASE0_ONLY={int(conv_phase0_only)}")
     return load_jit(
         "dflash_mega_" + _src_hash() + f"_conv{int(conv_phase0_only)}",
@@ -84,7 +89,9 @@ def _use_pdl() -> bool:
     return os.environ.get("SGLANG_DFLASH_MEGA_PDL", "0") == "1"
 
 
-def _assign(n_tiles: int, caps: List[int], order: Optional[List[int]] = None) -> List[List[int]]:
+def _assign(
+    n_tiles: int, caps: List[int], order: Optional[List[int]] = None
+) -> List[List[int]]:
     """Distribute tile ids (in `order`) over buckets with capacities `caps` (round-robin over buckets with room)."""
     order = list(range(n_tiles)) if order is None else order
     assert sum(caps) >= n_tiles, (caps, n_tiles)
@@ -112,7 +119,9 @@ def default_plan() -> Dict[str, object]:
     plan["qkv"] = [[q, []] for q in qkv]
     # o_proj / down: 2 k-groups per cluster
     # <= 4 tiles (2 slabs) per k-group everywhere: the phase lasts as long as its slowest group (slab boundaries ~1 us)
-    gcaps = [int(x) for x in os.environ.get("SGLANG_DFLASH_MEGA_OCAPS", "").split(",") if x] or ([4] * (2 * NCL))
+    gcaps = [
+        int(x) for x in os.environ.get("SGLANG_DFLASH_MEGA_OCAPS", "").split(",") if x
+    ] or ([4] * (2 * NCL))
     for name, n in (("o", O_TILES), ("dn", DN_TILES)):
         groups = _assign(n, gcaps)
         plan[name] = [[groups[2 * c], groups[2 * c + 1]] for c in range(NCL)]
@@ -217,8 +226,16 @@ class DFlashMegaState:
         self.final_norm = final_norm
         self.cos_sin_cache = cos_sin_cache
         self.maps = torch.zeros((NL * NPH + 2) * 128, dtype=torch.uint8, device=dev)
-        self.hn = torch.zeros(2 * NL, MT, H, dtype=torch.bfloat16, device=dev) if self.conv else None
-        self.coef = torch.zeros(2 * NL, MT, 1536, dtype=torch.bfloat16, device=dev) if self.conv else None
+        self.hn = (
+            torch.zeros(2 * NL, MT, H, dtype=torch.bfloat16, device=dev)
+            if self.conv
+            else None
+        )
+        self.coef = (
+            torch.zeros(2 * NL, MT, 1536, dtype=torch.bfloat16, device=dev)
+            if self.conv
+            else None
+        )
         self.xq = torch.zeros(2 * MT * H, dtype=torch.uint8, device=dev)
         self.xs = torch.zeros(2 * MT, dtype=torch.float32, device=dev)
         self.qkv = torch.zeros(2, MT, 2304, dtype=torch.bfloat16, device=dev)
@@ -226,7 +243,9 @@ class DFlashMegaState:
         self.act = torch.zeros(MT, 2048, dtype=torch.bfloat16, device=dev)
         self.amax = torch.zeros(2 * 2 * NL * MT, dtype=torch.int32, device=dev)
         self.cnt = torch.zeros(64, dtype=torch.int32, device=dev)
-        self.stamps = torch.zeros(120 * 128, dtype=torch.int64, device=dev) if stamps else None
+        self.stamps = (
+            torch.zeros(120 * 128, dtype=torch.int64, device=dev) if stamps else None
+        )
         wptr = []
         for L in layers:
             for k in ("w_qkv", "w_o", "w_gu", "w_dn", "w_ca", "w_cm"):
@@ -237,18 +256,37 @@ class DFlashMegaState:
                 dtype = torch.bfloat16 if k in ("w_ca", "w_cm") else torch.float8_e4m3fn
                 assert w.dtype == dtype and w.is_contiguous(), k
                 wptr.append(w.data_ptr())
-        exp = {"w_qkv": (2304, H), "w_o": (H, 2048), "w_gu": (4096, H), "w_dn": (H, 2048)}
+        exp = {
+            "w_qkv": (2304, H),
+            "w_o": (H, 2048),
+            "w_gu": (4096, H),
+            "w_dn": (H, 2048),
+        }
         if self.conv:
-            exp.update({"w_ca": (192, H), "w_cm": (192, H), "cb_a": (2, 2, H), "cb_m": (2, 2, H)})
+            exp.update(
+                {
+                    "w_ca": (192, H),
+                    "w_cm": (192, H),
+                    "cb_a": (2, 2, H),
+                    "cb_m": (2, 2, H),
+                }
+            )
         for L in layers:
             for k, shp in exp.items():
                 assert tuple(L[k].shape) == shp, (k, tuple(L[k].shape))
             kc, vc = L["k_cache"], L["v_cache"]
             assert kc.dtype == torch.bfloat16 and vc.dtype == torch.bfloat16
-            assert kc.stride(0) == vc.stride(0) and kc.stride(-1) == 1 and vc.stride(-1) == 1
+            assert (
+                kc.stride(0) == vc.stride(0)
+                and kc.stride(-1) == 1
+                and vc.stride(-1) == 1
+            )
         self.kv_stride = int(layers[0]["k_cache"].stride(0))
         for L in layers:
-            assert int(L["k_cache"].stride(0)) == self.kv_stride and int(L["v_cache"].stride(0)) == self.kv_stride
+            assert (
+                int(L["k_cache"].stride(0)) == self.kv_stride
+                and int(L["v_cache"].stride(0)) == self.kv_stride
+            )
             assert L["k_cache"][0].numel() == 128 and L["v_cache"][0].numel() == 128
         self.mod.build_maps(self.maps, torch.tensor(wptr, dtype=torch.int64), self.xq)
         ptrs = []
@@ -269,26 +307,54 @@ class DFlashMegaState:
                 ptrs += [0, 0] if cb is None else [cb[0].data_ptr(), cb[1].data_ptr()]
         peers = tp_state.peers.tolist()
         ptrs += [
-            self.maps.data_ptr(), final_norm.data_ptr(), cos_sin_cache.data_ptr(), self.xq.data_ptr(),
-            self.xs.data_ptr(), self.qkv.data_ptr(), self.att.data_ptr(), self.act.data_ptr(),
-            self.amax.data_ptr(), self.cnt.data_ptr(), tp_state.calls.data_ptr(),
+            self.maps.data_ptr(),
+            final_norm.data_ptr(),
+            cos_sin_cache.data_ptr(),
+            self.xq.data_ptr(),
+            self.xs.data_ptr(),
+            self.qkv.data_ptr(),
+            self.att.data_ptr(),
+            self.act.data_ptr(),
+            self.amax.data_ptr(),
+            self.cnt.data_ptr(),
+            tp_state.calls.data_ptr(),
             0 if self.stamps is None else self.stamps.data_ptr(),
             0 if self.hn is None else self.hn.data_ptr(),
             0 if self.coef is None else self.coef.data_ptr(),
         ] + peers
         sinks = [L.get("sinks") for L in layers]
         sink_f32 = int(sinks[0] is not None and sinks[0].dtype == torch.float32)
-        assert cos_sin_cache.dim() == 2 and cos_sin_cache.shape[1] == 64 and cos_sin_cache.stride(1) == 1
+        assert (
+            cos_sin_cache.dim() == 2
+            and cos_sin_cache.shape[1] == 64
+            and cos_sin_cache.stride(1) == 1
+        )
         assert cos_sin_cache.dtype in (torch.float32, torch.bfloat16)
         ivals = torch.tensor(
-            [tp_state.rank, cos_sin_cache.stride(0), int(cos_sin_cache.dtype == torch.float32), sink_f32, self.kv_stride, nl,
-             int(os.environ.get("SGLANG_DFLASH_MEGA_LOOK", "0")) if look is None else int(look), int(self.conv)],
+            [
+                tp_state.rank,
+                cos_sin_cache.stride(0),
+                int(cos_sin_cache.dtype == torch.float32),
+                sink_f32,
+                self.kv_stride,
+                nl,
+                int(os.environ.get("SGLANG_DFLASH_MEGA_LOOK", "0"))
+                if look is None
+                else int(look),
+                int(self.conv),
+            ],
             dtype=torch.int64,
         )
         fvals = torch.tensor([eps, qk_eps, v_scale, sm_scale], dtype=torch.float32)
         self.plan = plan or default_plan()
         self.blob = torch.zeros(int(self.mod.params_bytes()), dtype=torch.uint8)
-        self.mod.fill(self.blob, torch.tensor(ptrs, dtype=torch.int64), ivals, fvals, plan_tensor(self.plan))
+        self.mod.fill(
+            self.blob,
+            torch.tensor(ptrs, dtype=torch.int64),
+            ivals,
+            fvals,
+            plan_tensor(self.plan),
+        )
         torch.cuda.synchronize(dev)
 
     def max_clusters(self) -> int:

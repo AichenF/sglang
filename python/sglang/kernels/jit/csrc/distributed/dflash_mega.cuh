@@ -2,8 +2,8 @@
 // (4 requests x 8 block tokens) in ONE persistent kernel, plus the layer-0 input RMSNorm/quant and the final norm.
 //
 // Per layer (per rank): x (fp8, per-token scale) -> qkv GEMM (2304 x 6144 fp8, per-channel scale) -> q/k RMSNorm + RoPE
-// (64 of 128 dims, NeoX) + value scale + KV-cache store -> bidirectional window-1024 attention with per-head sinks (16 q
-// heads, 1 kv head) -> per-token fp8 quant -> o_proj (6144 x 2048) -> TP8 all-reduce + residual + RMSNorm + per-token
+// (64 of 128 dims, NeoX) + value scale + KV-cache store -> bidirectional window-1024 attention with per-head sinks (16
+// q heads, 1 kv head) -> per-token fp8 quant -> o_proj (6144 x 2048) -> TP8 all-reduce + residual + RMSNorm + per-token
 // fp8 quant (dense's tp_arnq protocol, same IPC buffers / call counters) -> gate_up (4096 x 6144) -> silu*up + quant ->
 // down (6144 x 2048) -> all-reduce + residual + RMSNorm + quant. The numerics (quant formulas, rounding points, the
 // all-reduce rank order, flashinfer's norm order) are those of the unfused fused-TP path (models/dflash_tp_fast.py);
@@ -11,17 +11,20 @@
 //
 // Grid: 15 clusters x 8 CTAs (the most 8-CTA clusters an H200 keeps co-resident at 1 CTA/SM), 320 threads:
 //   warps 0-7 (two warpgroups) = the phase program; warp 8 = weight producer (TMA into a per-CTA ring of 16-KB slabs,
-//   running ahead across phase and layer boundaries); warp 9 = KV gather (attention clusters: cp.async of the window keys
-//   of the next layer as soon as the KV region is free, then the block's new k / v rows of the layer: norm + RoPE / value
-//   scale into the KV tile and the cache).
+//   running ahead across phase and layer boundaries); warp 9 = KV gather (attention clusters: cp.async of the window
+//   keys of the next layer as soon as the KV region is free, then the block's new k / v rows of the layer: norm + RoPE
+//   / value scale into the KV tile and the cache).
 // Clusters 0-7: attention (request c/2, query heads 8*(c%2)..+7; rank = key split, combine over DSMEM).
 // Clusters 8-11: all-reduce CTAs (one token each). Clusters 12-14: GEMM only. Every CTA takes GEMM tiles (host plan).
 // GEMMs: swap-AB wgmma m64n32k32 (weights = A, 64-row tiles, two tiles per 16-KB ring slab), split-K over the cluster
-//   (8-way for K = 6144, 2 x 4-way for K = 2048), partials reduce-scattered over DSMEM (st.async), summed in rank order.
+//   (8-way for K = 6144, 2 x 4-way for K = 2048), partials reduce-scattered over DSMEM (st.async), summed in rank
+//   order.
 // Cross-CTA ordering: monotonic uint32 counters in global memory (targets derived from a per-launch epoch), acquire
 //   polls; cross-rank: Lamport-marked IPC pushes (tp_arnq).
 #pragma once
 
+// Preserve the include initialization order used by the TP8 validation.
+// clang-format off
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -35,6 +38,7 @@
 
 #include <cstdint>
 #include <cstring>
+// clang-format on
 
 #ifndef DM_PACE
 #define DM_PACE 0
@@ -61,10 +65,13 @@
 #define DM_NO_ATT 0
 #endif
 #ifndef DM_QUIET
-#define DM_QUIET 0  // 1 (goal12): the weight producer does not TMA-issue units of the phases after a release point (qkv rows, gate_up act) of
-#endif              // its CTA until that release retired -- it L2-prefetches them meanwhile. The release fence (MEMBAR) waits for the SM's
-                    // in-flight HBM loads (~+0.3 us per 12 KB, ub/handoff.cu); the next phase's units were issued 2-4 us before these
-                    // releases (lab stamps: qkv-rows release med 1.79 / max 2.82 us, gate_up release med 1.28 / max 2.82 us)
+#define DM_QUIET \
+  0  // 1 (goal12): the weight producer does not TMA-issue units of the phases after a release point (qkv rows, gate_up
+     // act) of
+#endif  // its CTA until that release retired -- it L2-prefetches them meanwhile. The release fence (MEMBAR) waits for
+        // the SM's in-flight HBM loads (~+0.3 us per 12 KB, ub/handoff.cu); the next phase's units were issued 2-4 us
+        // before these releases (lab stamps: qkv-rows release med 1.79 / max 2.82 us, gate_up release med 1.28 /
+        // max 2.82 us)
 
 namespace sglang {
 namespace dflash_mega {
@@ -86,9 +93,10 @@ constexpr int CS = 8;
 constexpr int NCL = 15;
 constexpr int GRID = NCL * CS;  // 120
 constexpr int NCT = 256;        // compute threads (warps 0-7)
-constexpr int THREADS = DM_THREADS;  // 384: warpgroup 2 = producer + gather (+ 2 idle warps), registers moved by setmaxnreg
-constexpr int NATT = 8;   // clusters 0..7: attention
-constexpr int AR0 = 8;    // clusters 8..11: all-reduce token CTAs
+constexpr int THREADS =
+    DM_THREADS;          // 384: warpgroup 2 = producer + gather (+ 2 idle warps), registers moved by setmaxnreg
+constexpr int NATT = 8;  // clusters 0..7: attention
+constexpr int AR0 = 8;   // clusters 8..11: all-reduce token CTAs
 constexpr int SLAB = 16384;
 constexpr int TILEB = 8192;
 constexpr int XU = 4096;
@@ -113,13 +121,13 @@ enum { C_LAUNCH = 0, C_X = 1, C_ATT = 2, C_ACT = 3, C_Y = 6, C_QKV = 8, C_N = 64
 
 // smem layout (bytes from the 1024-aligned dynamic base)
 constexpr int MISC_BYTES = 2048;
-constexpr int XREG = 24576;                  // X operand (up to 6 units)
-constexpr int GREG_ATT = XREG + 4 * TILEB;   // attention clusters: <= 4 tiles per phase -> 56 KB
-constexpr int GREG_FULL = XREG + 5 * TILEB;  // others: <= 5 tiles -> 64 KB
-constexpr int KV_BYTES = 2 * KV_MAXK * HD * 2;  // 81920
-constexpr int COMB_STRIDE = 132;             // floats per (src, head): 128 o + lse + pad
+constexpr int XREG = 24576;                       // X operand (up to 6 units)
+constexpr int GREG_ATT = XREG + 4 * TILEB;        // attention clusters: <= 4 tiles per phase -> 56 KB
+constexpr int GREG_FULL = XREG + 5 * TILEB;       // others: <= 5 tiles -> 64 KB
+constexpr int KV_BYTES = 2 * KV_MAXK * HD * 2;    // 81920
+constexpr int COMB_STRIDE = 132;                  // floats per (src, head): 128 o + lse + pad
 constexpr int COMB_SRC_BYTES = 8 * (HD * 4 + 4);  // 4128 bytes per source split
-constexpr int QREG = 34 * 1024;              // Q tile inside the GEMM region (after COMB)
+constexpr int QREG = 34 * 1024;                   // Q tile inside the GEMM region (after COMB)
 
 // IPC receive-buffer layout of csrc/distributed/dflash_tp_fused.cuh (keep in sync)
 constexpr int64_t RS_SLOT = SL * 2;
@@ -136,14 +144,14 @@ constexpr int CS_N = 4 * (CF_G / R);
 constexpr int64_t CX_OFF = AG_OFF + AG_BYTES + AX_BYTES + EM_BYTES;
 
 struct LayerP {
-  const float* sw[4];             // per-channel weight scales: qkv [2304], o [6144], gate_up [4096], down [6144]
+  const float* sw[4];                // per-channel weight scales: qkv [2304], o [6144], gate_up [4096], down [6144]
   const __nv_bfloat16* cbase[2][2];  // convolution base kernels [attention, mlp][input, output] -> [2 taps][H]
-  const __nv_bfloat16* ln_in;     // input_layernorm [H]
-  const __nv_bfloat16* ln_post;   // post_attention_layernorm [H]
-  const __nv_bfloat16* qn;        // q_norm [128]
-  const __nv_bfloat16* kn;        // k_norm [128]
-  const void* sinks;              // [16] bf16 / fp32 (nullptr: none)
-  __nv_bfloat16* kc;              // k cache [slots][1][128]
+  const __nv_bfloat16* ln_in;        // input_layernorm [H]
+  const __nv_bfloat16* ln_post;      // post_attention_layernorm [H]
+  const __nv_bfloat16* qn;           // q_norm [128]
+  const __nv_bfloat16* kn;           // k_norm [128]
+  const void* sinks;                 // [16] bf16 / fp32 (nullptr: none)
+  __nv_bfloat16* kc;                 // k cache [slots][1][128]
   __nv_bfloat16* vc;
 };
 
@@ -157,33 +165,33 @@ struct Params {
   LayerP L[NL];
   const CUtensorMap* maps;  // global memory: [l * NPH + phase] weight maps, then [NL * NPH + {0, 1}] x maps
   const __nv_bfloat16* final_norm;
-  __nv_bfloat16* hidden;    // [MT][H] residual stream (in place)
-  __nv_bfloat16* out;       // [MT][H] final normalized hidden
-  const void* positions;    // [MT]
-  const int* seqlens;       // [NREQ]
-  const int* page_table;    // [NREQ][pt_stride]
-  const void* loc;          // [MT] cache slots of the block rows
-  const void* cos_sin;      // [max_pos][64] (cos | sin)
+  __nv_bfloat16* hidden;  // [MT][H] residual stream (in place)
+  __nv_bfloat16* out;     // [MT][H] final normalized hidden
+  const void* positions;  // [MT]
+  const int* seqlens;     // [NREQ]
+  const int* page_table;  // [NREQ][pt_stride]
+  const void* loc;        // [MT] cache slots of the block rows
+  const void* cos_sin;    // [max_pos][64] (cos | sin)
   int64_t pt_stride;
   int64_t cs_stride;
-  int64_t kv_stride;        // elements between consecutive cache slots
+  int64_t kv_stride;  // elements between consecutive cache slots
   int pos64, loc64, cs_f32, sink_f32;
   float eps, qk_eps, v_scale, sm_scale;
-  uint8_t* xq;              // [2][MT][H] e4m3
-  float* xs;                // [2][MT]
-  __nv_bfloat16* qkv;       // [2][MT][QKV_N] (layer-parity double buffer; DM_LL_QKV: Lamport-marked words)
-  __nv_bfloat16* att;       // [MT][2048]
-  __nv_bfloat16* act;       // [MT][INTER]
-  unsigned* amax;           // [2 parity][2 kind][NL][MT]
-  unsigned* cnt;            // [C_N]
-  int* calls;               // [MT] tp_arnq per-token call counters
+  uint8_t* xq;         // [2][MT][H] e4m3
+  float* xs;           // [2][MT]
+  __nv_bfloat16* qkv;  // [2][MT][QKV_N] (layer-parity double buffer; DM_LL_QKV: Lamport-marked words)
+  __nv_bfloat16* att;  // [MT][2048]
+  __nv_bfloat16* act;  // [MT][INTER]
+  unsigned* amax;      // [2 parity][2 kind][NL][MT]
+  unsigned* cnt;       // [C_N]
+  int* calls;          // [MT] tp_arnq per-token call counters
   uint8_t* peer[R];
-  __nv_bfloat16* hn;        // [2 * NL][MT][H] normalized sublayer inputs (convolution)
-  __nv_bfloat16* coef;      // [2 * NL][MT][CF_N] convolution coefficients
+  __nv_bfloat16* hn;    // [2 * NL][MT][H] normalized sublayer inputs (convolution)
+  __nv_bfloat16* coef;  // [2 * NL][MT][CF_N] convolution coefficients
   int conv;
   int rank;
-  int nl;                   // layers run (5; fewer only in tests -- the epoch counters are padded at the end)
-  int look;                 // weight units L2-prefetched ahead of the ring
+  int nl;                      // layers run (5; fewer only in tests -- the epoch counters are padded at the end)
+  int look;                    // weight units L2-prefetched ahead of the ring
   unsigned long long* stamps;  // optional [GRID][64]
   Plan plan;
 };
@@ -191,7 +199,9 @@ struct Params {
 #define DEV __device__ __forceinline__
 
 // ------------------------------------------------------------------ PTX helpers
-DEV uint32_t smem_u32(const void* p) { return static_cast<uint32_t>(__cvta_generic_to_shared(p)); }
+DEV uint32_t smem_u32(const void* p) {
+  return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
 DEV unsigned long long gtime() {
   unsigned long long v;
   asm volatile("mov.u64 %0, %globaltimer;" : "=l"(v));
@@ -245,27 +255,40 @@ DEV void cluster_sync_all() {
 }
 DEV void st_async_v2(uint32_t addr, float a, float b, uint32_t bar) {
   asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v2.f32 [%0], {%1, %2}, [%3];" ::"r"(addr),
-               "f"(a), "f"(b), "r"(bar)
+               "f"(a),
+               "f"(b),
+               "r"(bar)
                : "memory");
 }
 DEV void st_async_v4(uint32_t addr, float a, float b, float c, float d, uint32_t bar) {
   asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.f32 [%0], {%1, %2, %3, %4}, [%5];" ::"r"(addr),
-               "f"(a), "f"(b), "f"(c), "f"(d), "r"(bar)
+               "f"(a),
+               "f"(b),
+               "f"(c),
+               "f"(d),
+               "r"(bar)
                : "memory");
 }
 // position of token t inside a 32-float row of the reduce-scatter receive buffers: the 8 tokens a wgmma fragment thread
 // holds for one row ((t & 7) >> 1 == lane & 3) are contiguous -> two 16-byte st.async per row and thread
-DEV int tpos(int t) { return ((t & 7) >> 1) * 8 + (t >> 3) * 2 + (t & 1); }
+DEV int tpos(int t) {
+  return ((t & 7) >> 1) * 8 + (t >> 3) * 2 + (t & 1);
+}
 DEV void st_async_b32(uint32_t addr, float a, uint32_t bar) {
   asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];" ::"r"(addr),
-               "r"(__float_as_uint(a)), "r"(bar)
+               "r"(__float_as_uint(a)),
+               "r"(bar)
                : "memory");
 }
 DEV void tma2d(const CUtensorMap* map, void* dst, uint64_t* bar, int c0, int c1, uint64_t pol) {
   asm volatile(
       "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
       " [%0], [%1, {%3, %4}], [%2], %5;" ::"r"(smem_u32(dst)),
-      "l"(reinterpret_cast<uint64_t>(map)), "r"(smem_u32(bar)), "r"(c0), "r"(c1), "l"(pol)
+      "l"(reinterpret_cast<uint64_t>(map)),
+      "r"(smem_u32(bar)),
+      "r"(c0),
+      "r"(c1),
+      "l"(pol)
       : "memory");
 }
 // 3-D box: gate_up takes the 32 gate rows and the 32 up rows of a tile in one copy
@@ -273,7 +296,12 @@ DEV void tma3d(const CUtensorMap* map, void* dst, uint64_t* bar, int c0, int c1,
   asm volatile(
       "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
       " [%0], [%1, {%3, %4, %5}], [%2], %6;" ::"r"(smem_u32(dst)),
-      "l"(reinterpret_cast<uint64_t>(map)), "r"(smem_u32(bar)), "r"(c0), "r"(c1), "r"(c2), "l"(pol)
+      "l"(reinterpret_cast<uint64_t>(map)),
+      "r"(smem_u32(bar)),
+      "r"(c0),
+      "r"(c1),
+      "r"(c2),
+      "l"(pol)
       : "memory");
 }
 DEV void cp_async16(void* dst, const void* src) {
@@ -282,9 +310,15 @@ DEV void cp_async16(void* dst, const void* src) {
 DEV void cp_async_arrive_noinc(uint64_t* bar) {
   asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" ::"r"(smem_u32(bar)) : "memory");
 }
-DEV void fence_proxy_async_shared() { asm volatile("fence.proxy.async.shared::cta;" ::: "memory"); }
-DEV void fence_proxy_async_global() { asm volatile("fence.proxy.async.global;" ::: "memory"); }
-DEV void bar_sync(int id, int n) { asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(n) : "memory"); }
+DEV void fence_proxy_async_shared() {
+  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+}
+DEV void fence_proxy_async_global() {
+  asm volatile("fence.proxy.async.global;" ::: "memory");
+}
+DEV void bar_sync(int id, int n) {
+  asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(n) : "memory");
+}
 DEV unsigned ld_acq(const unsigned* p) {
   unsigned v;
   asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
@@ -325,7 +359,10 @@ DEV void st_v2(void* p, uint2 v) {
 }
 DEV uint4 ld_vol_v4(const void* p) {
   uint4 v;
-  asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p) : "memory");
+  asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+               : "l"(p)
+               : "memory");
   return v;
 }
 DEV uint2 ld_vol_v2(const void* p) {
@@ -333,8 +370,12 @@ DEV uint2 ld_vol_v2(const void* p) {
   asm volatile("ld.volatile.global.v2.u32 {%0, %1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(p) : "memory");
   return v;
 }
-DEV uint32_t nz(uint32_t w) { return w == 0u ? 0x80000000u : w; }  // +0.0 -> -0.0 (Lamport arrival marker)
-DEV uint32_t unz(uint32_t w) { return w == 0x80000000u ? 0u : w; }
+DEV uint32_t nz(uint32_t w) {
+  return w == 0u ? 0x80000000u : w;
+}  // +0.0 -> -0.0 (Lamport arrival marker)
+DEV uint32_t unz(uint32_t w) {
+  return w == 0x80000000u ? 0u : w;
+}
 // poll a Lamport-marked 16-byte vector until every word has arrived, then drop the markers
 DEV uint4 poll_ll_v4(const void* p) {
   uint4 v;
@@ -343,13 +384,19 @@ DEV uint4 poll_ll_v4(const void* p) {
   } while (v.x == 0u || v.y == 0u || v.z == 0u || v.w == 0u);
   return make_uint4(unz(v.x), unz(v.y), unz(v.z), unz(v.w));
 }
-DEV float bf_lo(uint32_t w) { return __uint_as_float(w << 16); }
-DEV float bf_hi(uint32_t w) { return __uint_as_float(w & 0xFFFF0000u); }
+DEV float bf_lo(uint32_t w) {
+  return __uint_as_float(w << 16);
+}
+DEV float bf_hi(uint32_t w) {
+  return __uint_as_float(w & 0xFFFF0000u);
+}
 DEV uint32_t pack_bf2(float lo, float hi) {
   const __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
   return *reinterpret_cast<const uint32_t*>(&v);
 }
-DEV float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
+DEV float bf16r(float x) {
+  return __bfloat162float(__float2bfloat16_rn(x));
+}
 // the reference per-token quant multiplies by rcp.approx.ftz(scale)
 DEV float rcp_scale(float sc) {
   float r;
@@ -366,8 +413,12 @@ DEV uint64_t make_desc(const void* p) {
   const uint64_t a = smem_u32(p);
   return ((a & 0x3FFFFull) >> 4) | (1ull << 16) | (64ull << 32) | (1ull << 62);
 }
-DEV void wgmma_fence() { asm volatile("wgmma.fence.sync.aligned;" ::: "memory"); }
-DEV void wgmma_commit() { asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory"); }
+DEV void wgmma_fence() {
+  asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
+}
+DEV void wgmma_commit() {
+  asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
+}
 template <int N>
 DEV void wgmma_wait() {
   asm volatile("wgmma.wait_group.sync.aligned %0;" ::"n"(N) : "memory");
@@ -380,8 +431,22 @@ DEV void wgmma_m64n32k32_e4m3(float* d, uint64_t da, uint64_t db) {
       "wgmma.mma_async.sync.aligned.m64n32k32.f32.e4m3.e4m3 "
       "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, p, 1, 1;\n"
       "}\n"
-      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
-        "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15])
+      : "+f"(d[0]),
+        "+f"(d[1]),
+        "+f"(d[2]),
+        "+f"(d[3]),
+        "+f"(d[4]),
+        "+f"(d[5]),
+        "+f"(d[6]),
+        "+f"(d[7]),
+        "+f"(d[8]),
+        "+f"(d[9]),
+        "+f"(d[10]),
+        "+f"(d[11]),
+        "+f"(d[12]),
+        "+f"(d[13]),
+        "+f"(d[14]),
+        "+f"(d[15])
       : "l"(da), "l"(db));
 }
 DEV void wgmma_m64n32k16_bf16(float* d, uint64_t da, uint64_t db) {
@@ -392,8 +457,22 @@ DEV void wgmma_m64n32k16_bf16(float* d, uint64_t da, uint64_t db) {
       "wgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 "
       "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, p, 1, 1, 0, 0;\n"
       "}\n"
-      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
-        "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15])
+      : "+f"(d[0]),
+        "+f"(d[1]),
+        "+f"(d[2]),
+        "+f"(d[3]),
+        "+f"(d[4]),
+        "+f"(d[5]),
+        "+f"(d[6]),
+        "+f"(d[7]),
+        "+f"(d[8]),
+        "+f"(d[9]),
+        "+f"(d[10]),
+        "+f"(d[11]),
+        "+f"(d[12]),
+        "+f"(d[13]),
+        "+f"(d[14]),
+        "+f"(d[15])
       : "l"(da), "l"(db));
 }
 DEV void wgmma_m64n16k16_bf16(float* d, uint64_t da, uint64_t db) {
@@ -428,29 +507,31 @@ DEV void mma_bf16(float* d, const uint32_t* a, uint32_t b0, uint32_t b1) {
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 // 16-byte chunk swizzle of a 256-byte row (128-B halves, XOR with the row's low 3 bits)
-DEV int swz(int ch, int row) { return (ch & 8) | ((ch ^ row) & 7); }
+DEV int swz(int ch, int row) {
+  return (ch & 8) | ((ch ^ row) & 7);
+}
 
 // ------------------------------------------------------------------ shared state
 struct Smem {
-  uint64_t* full;     // [MAX_SLOT]
-  uint64_t* empty;    // [MAX_SLOT]
+  uint64_t* full;   // [MAX_SLOT]
+  uint64_t* empty;  // [MAX_SLOT]
   uint64_t* xbar;
   uint64_t* recvbar;
   uint64_t* kvfull;
   uint64_t* kvempty;
   uint64_t* combbar;
   uint64_t* combok;
-  uint64_t* hbar;     // all-reduce token CTAs: the previous block row's reduced slice is ready (output convolution)
-  uint64_t* cbar;     // coefficient tile partials of the cluster received (DSMEM)
-  uint64_t* csbar;    // attention clusters: this layer's cos|sin rows and k-norm weights are staged (-> gather warp)
-  int* calls0;        // [MT]
-  float* sx;          // [MT]
-  float* sinv;        // [MT]
-  unsigned* amax;     // [MT]
-  float* red;         // [64]
-  int* slot;          // [KV_MAXK]
-  int* misc;          // [16]: 0 E, 1 seqlen (attention request), ...
-  long long* pos;     // [BLK] positions of the attention request's rows
+  uint64_t* hbar;   // all-reduce token CTAs: the previous block row's reduced slice is ready (output convolution)
+  uint64_t* cbar;   // coefficient tile partials of the cluster received (DSMEM)
+  uint64_t* csbar;  // attention clusters: this layer's cos|sin rows and k-norm weights are staged (-> gather warp)
+  int* calls0;      // [MT]
+  float* sx;        // [MT]
+  float* sinv;      // [MT]
+  unsigned* amax;   // [MT]
+  float* red;       // [64]
+  int* slot;        // [KV_MAXK]
+  int* misc;        // [16]: 0 E, 1 seqlen (attention request), ...
+  long long* pos;   // [BLK] positions of the attention request's rows
   uint8_t* ring;
   uint8_t* greg;
   uint8_t* kv;
@@ -522,21 +603,24 @@ DEV bool uit_next(const Params& p, int c, int rank, UIt& it) {
 }
 DEV void tma_prefetch_l2(const CUtensorMap* map, int c0, int c1) {
   asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" ::"l"(reinterpret_cast<uint64_t>(map)),
-               "r"(c0), "r"(c1)
+               "r"(c0),
+               "r"(c1)
                : "memory");
 }
 DEV void tma_prefetch_l2_3d(const CUtensorMap* map, int c0, int c1, int c2) {
-  asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" ::"l"(reinterpret_cast<uint64_t>(map)),
-               "r"(c0), "r"(c1), "r"(c2)
-               : "memory");
+  asm volatile(
+      "cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" ::"l"(reinterpret_cast<uint64_t>(map)),
+      "r"(c0),
+      "r"(c1),
+      "r"(c2)
+      : "memory");
 }
 DEV bool mbar_test(uint64_t* b, uint32_t parity) {
   uint32_t ok;
-  asm volatile(
-      "{\n.reg .pred P1;\nmbarrier.test_wait.parity.shared::cta.b64 P1, [%1], %2;\nselp.u32 %0, 1, 0, P1;\n}\n"
-      : "=r"(ok)
-      : "r"(smem_u32(b)), "r"(parity)
-      : "memory");
+  asm volatile("{\n.reg .pred P1;\nmbarrier.test_wait.parity.shared::cta.b64 P1, [%1], %2;\nselp.u32 %0, 1, 0, P1;\n}\n"
+               : "=r"(ok)
+               : "r"(smem_u32(b)), "r"(parity)
+               : "memory");
   return ok != 0;
 }
 // pf: L2 prefetch only; else TMA into dst (ring slot) completing on bar
@@ -553,14 +637,19 @@ DEV void uit_issue(const Params& p, const UIt& it, bool pf, uint8_t* dst, uint64
     const int t = w ? t1 : t0;
     if (t < 0) continue;
     if (it.ph == PH_GU) {
-      // [half (gate, up)][INTER][K] map: one 8-KB box = gate rows t*32.. then up rows t*32.. (the shared-memory layout of
-      // two 4-KB boxes). Every TMA issue costs the producer thread ~0.25 us and it refills the ring at its issue rate.
-      if (pf) tma_prefetch_l2_3d(map, kc, t * 32, 0);
-      else tma3d(map, dst + w * TILEB, bar, kc, t * 32, 0, pol);
+      // [half (gate, up)][INTER][K] map: one 8-KB box = gate rows t*32.. then up rows t*32.. (the shared-memory layout
+      // of two 4-KB boxes). Every TMA issue costs the producer thread ~0.25 us and it refills the ring at its issue
+      // rate.
+      if (pf)
+        tma_prefetch_l2_3d(map, kc, t * 32, 0);
+      else
+        tma3d(map, dst + w * TILEB, bar, kc, t * 32, 0, pol);
     } else {
       const int k = cf ? kc + 64 * w : kc;
-      if (pf) tma_prefetch_l2(map, k, t * 64);
-      else tma2d(map, dst + w * TILEB, bar, k, t * 64, pol);
+      if (pf)
+        tma_prefetch_l2(map, k, t * 64);
+      else
+        tma2d(map, dst + w * TILEB, bar, k, t * 64, pol);
     }
   }
 }
@@ -600,9 +689,10 @@ DEV void producer(const Params& p, Smem& s, int c, int rank) {
     }
 #if DM_QUIET
     {
-      // releases of this CTA before unit (l, ph): qkv rows (if it has qkv tiles) after phase QKV, gate_up act after phase GU, per layer
-      // DM_QUIET 2: attention CTAs do not hold their o_proj units (they must be in flight BEFORE the attention phase: issued at the qkv
-      // release they queued the attention's Q / combine loads, lab +1 us per layer); the down units are held on every CTA
+      // releases of this CTA before unit (l, ph): qkv rows (if it has qkv tiles) after phase QKV, gate_up act after
+      // phase GU, per layer DM_QUIET 2: attention CTAs do not hold their o_proj units (they must be in flight BEFORE
+      // the attention phase: issued at the qkv release they queued the attention's Q / combine loads, lab +1 us per
+      // layer); the down units are held on every CTA
       const int hq = p.plan.n[PH_QKV][c][0] > 0 ? 1 : 0;
       const bool hold_o = !(DM_QUIET >= 2 && c < NATT);
       const int need = ld.l * (hq + 1) + (ld.ph >= PH_DN ? hq + 1 : (ld.ph >= PH_O && hold_o ? hq : 0));
@@ -610,11 +700,13 @@ DEV void producer(const Params& p, Smem& s, int c, int rank) {
       if (*relc < need) {
         UIt q = ld;
         bool vq = true;
-        for (uint32_t i = 0; i < nslot && vq; ++i) {   // the held units into L2 (prefetches are not waited for by the release fence)
+        for (uint32_t i = 0; i < nslot && vq;
+             ++i) {  // the held units into L2 (prefetches are not waited for by the release fence)
           uit_issue(p, q, true, nullptr, nullptr, 0);
           vq = uit_next(p, c, rank, q);
         }
-        while (*relc < need) __nanosleep(64);
+        while (*relc < need)
+          __nanosleep(64);
       }
     }
 #endif
@@ -663,7 +755,8 @@ DEV void gather(const Params& p, Smem& s, int b, int c, int rank, int lane) {
   const Split sp = split_of(s.misc[1], rank);
   // the block's new k / v rows (normalized + rotated keys, scaled values) are made here, off the compute warps (where
   // they doubled the q norm/RoPE time of the CTAs that need them, the last pushers of their cluster): by the CTA that
-  // writes them to the KV cache (head half 0, rank 0) and by the CTA whose key split holds them. Lane = (token, quarter).
+  // writes them to the KV cache (head half 0, rank 0) and by the CTA whose key split holds them. Lane = (token,
+  // quarter).
   const bool store = ((c & 1) == 0 && rank == 0);
   const int first_new = sp.seqlen - BLK - sp.kbase;  // local index of block row 0
   const bool need = (first_new + BLK > sp.nold) && (first_new < sp.ntot);
@@ -678,7 +771,8 @@ DEV void gather(const Params& p, Smem& s, int b, int c, int rank, int lane) {
   }
   const float* scs = reinterpret_cast<const float*>(s.greg + CSREG);
   const __nv_bfloat16* skn = reinterpret_cast<const __nv_bfloat16*>(s.greg + CSREG + 2048) + HD;
-  for (int i = lane; i < sp.nold; i += 32) s.slot[i] = __ldg(p.page_table + b * p.pt_stride + sp.kbase + i);
+  for (int i = lane; i < sp.nold; i += 32)
+    s.slot[i] = __ldg(p.page_table + b * p.pt_stride + sp.kbase + i);
   __syncwarp();
   uint8_t* sK = s.kv;
   uint8_t* sV = s.kv + KV_MAXK * HD * 2;
@@ -727,14 +821,17 @@ DEV void gather(const Params& p, Smem& s, int b, int c, int rank, int lane) {
       for (int i = 0; i < 4; ++i) {
         const uint32_t vw[4] = {xv[i].x, xv[i].y, xv[i].z, xv[i].w};
 #pragma unroll
-        for (int j = 0; j < 4; ++j) ov[4 * i + j] = pack_bf2(bf_lo(vw[j]) * p.v_scale, bf_hi(vw[j]) * p.v_scale);
+        for (int j = 0; j < 4; ++j)
+          ov[4 * i + j] = pack_bf2(bf_lo(vw[j]) * p.v_scale, bf_hi(vw[j]) * p.v_scale);
       }
       const int i = first_new + tk;
       if (i >= 0 && i < sp.ntot) {
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-          *reinterpret_cast<uint4*>(sK + i * 256 + swz(4 * qq + j, i) * 16) = make_uint4(ok[4 * j], ok[4 * j + 1], ok[4 * j + 2], ok[4 * j + 3]);
-          *reinterpret_cast<uint4*>(sV + i * 256 + swz(4 * qq + j, i) * 16) = make_uint4(ov[4 * j], ov[4 * j + 1], ov[4 * j + 2], ov[4 * j + 3]);
+          *reinterpret_cast<uint4*>(sK + i * 256 + swz(4 * qq + j, i) * 16) =
+              make_uint4(ok[4 * j], ok[4 * j + 1], ok[4 * j + 2], ok[4 * j + 3]);
+          *reinterpret_cast<uint4*>(sV + i * 256 + swz(4 * qq + j, i) * 16) =
+              make_uint4(ov[4 * j], ov[4 * j + 1], ov[4 * j + 2], ov[4 * j + 3]);
         }
       }
       if (store && kslot != 0) {
@@ -771,8 +868,9 @@ DEV void cf_load_x(const Params& p, uint8_t* X, int e, int kch, int ctid) {
 }
 
 // After hn[e] is written: this rank's 192 coefficient rows (3 tiles) split-K over 4 CTAs in each all-reduce cluster
-// 0..2. Two warpgroups cover disjoint token halves; 4 DSMEM partials are summed before one BF16 rounding. Input coefficients go to every rank, and
-// every token CTA convolves its full row and quantizes it into the x buffer of event e.
+// 0..2. Two warpgroups cover disjoint token halves; 4 DSMEM partials are summed before one BF16 rounding. Input
+// coefficients go to every rank, and every token CTA convolves its full row and quantizes it into the x buffer of event
+// e.
 DEV void conv_tail(const Params& p, Smem& s, int t, int e, int ctid, unsigned E, int& cslot, uint32_t& cpar) {
   const int lane = ctid & 31, warp = ctid >> 5, wg = ctid >> 7, ww = (ctid >> 5) & 3;
   const int ai = (static_cast<int>(cluster_id_x()) - AR0) * CS + static_cast<int>(cluster_rank());
@@ -818,7 +916,8 @@ DEV void conv_tail(const Params& p, Smem& s, int t, int e, int ctid, unsigned E,
       };
       float acc[8];
 #pragma unroll
-      for (int r = 0; r < 8; ++r) acc[r] = 0.f;
+      for (int r = 0; r < 8; ++r)
+        acc[r] = 0.f;
 #pragma unroll 1
       for (int round = 0; round < 2; ++round) {
         cf_load_x(p, X, e, 2 * kch + round, ctid);
@@ -838,7 +937,8 @@ DEV void conv_tail(const Params& p, Smem& s, int t, int e, int ctid, unsigned E,
             const uint64_t da = make_desc(s.ring + slot * SLAB + h * TILEB);
             const uint64_t db = make_desc(X + (2 * i + h) * XU + wg * 16 * 128);
 #pragma unroll
-            for (int kk = 0; kk < 4; ++kk) wgmma_m64n16k16_bf16(acc, da + 2 * kk, db + 2 * kk);
+            for (int kk = 0; kk < 4; ++kk)
+              wgmma_m64n16k16_bf16(acc, da + 2 * kk, db + 2 * kk);
           }
           wgmma_commit();
           if (prev >= 0) {
@@ -875,13 +975,16 @@ DEV void conv_tail(const Params& p, Smem& s, int t, int e, int ctid, unsigned E,
       const int tok = ctid >> 3, rr = ctid & 7;
       float v = 0.f;
 #pragma unroll
-      for (int q = 0; q < CF_K_PARTS; ++q) v += recv[(q * 8 + rr) * 32 + tpos(tok)];
+      for (int q = 0; q < CF_K_PARTS; ++q)
+        v += recv[(q * 8 + rr) * 32 + tpos(tok)];
       const int li0 = (ai >> 3) * 64 + kch * 8, li = li0 + rr;  // row of W_r: [side][tap][group]
       const int side = li / (CS_N / 2), tap = (li % (CS_N / 2)) / (CF_G / R), gl = li % (CF_G / R);
       const __nv_bfloat16 bv = __float2bfloat16_rn(v);
-      p.coef[(static_cast<int64_t>(e) * MT + tok) * CF_N + side * (CF_N / 2) + tap * CF_G + p.rank * (CF_G / R) + gl] = bv;
+      p.coef[(static_cast<int64_t>(e) * MT + tok) * CF_N + side * (CF_N / 2) + tap * CF_G + p.rank * (CF_G / R) + gl] =
+          bv;
       if (li0 < CS_N / 2) {
-        // input side: the 8 rows of this token (lanes 8 j .. 8 j + 7) as one 16-byte piece, lane rr pushes it to rank rr
+        // input side: the 8 rows of this token (lanes 8 j .. 8 j + 7) as one 16-byte piece, lane rr pushes it to rank
+        // rr
         const uint32_t bits = static_cast<uint32_t>(__bfloat16_as_ushort(bv));
         uint32_t w[4];
 #pragma unroll
@@ -891,8 +994,9 @@ DEV void conv_tail(const Params& p, Smem& s, int t, int e, int ctid, unsigned E,
           w[k] = lo | (hi << 16);
         }
         const int php = (s.calls0[tok] + e) & 1;
-        st_v4(p.peer[rr] + CX_OFF + ((static_cast<int64_t>(php) * MT + tok) * R + p.rank) * CS_N + li0 * 2,
-              make_uint4(nz(w[0]), nz(w[1]), nz(w[2]), nz(w[3])));
+        st_v4(
+            p.peer[rr] + CX_OFF + ((static_cast<int64_t>(php) * MT + tok) * R + p.rank) * CS_N + li0 * 2,
+            make_uint4(nz(w[0]), nz(w[1]), nz(w[2]), nz(w[3])));
       }
     }
   } else {
@@ -936,12 +1040,14 @@ DEV void conv_tail(const Params& p, Smem& s, int t, int e, int ctid, unsigned E,
     }
   }
 #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) amx = fmaxf(amx, __shfl_xor_sync(0xffffffffu, amx, o));
+  for (int o = 16; o > 0; o >>= 1)
+    amx = fmaxf(amx, __shfl_xor_sync(0xffffffffu, amx, o));
   if (lane == 0) s.red[8 + warp] = amx;
   bar_sync(1, NCT);
   float am = 0.f;
 #pragma unroll
-  for (int w = 0; w < NCT / 32; ++w) am = fmaxf(am, s.red[8 + w]);
+  for (int w = 0; w < NCT / 32; ++w)
+    am = fmaxf(am, s.red[8 + w]);
   const float scale = am * (1.f / FP8_MAX);
   const float inv = scale != 0.f ? rcp_scale(scale) : 0.f;
   uint8_t* qrow = p.xq + (static_cast<int64_t>(e & 1) * MT + t) * H;
@@ -951,10 +1057,12 @@ DEV void conv_tail(const Params& p, Smem& s, int t, int e, int ctid, unsigned E,
     uint32_t q[2];
 #pragma unroll
     for (int i = 0; i < 2; ++i)
-      q[i] = static_cast<uint32_t>(pack_e4m3x2(fminf(fmaxf(bf_lo(xb[cc][2 * i]) * inv, -FP8_MAX), FP8_MAX),
-                                               fminf(fmaxf(bf_hi(xb[cc][2 * i]) * inv, -FP8_MAX), FP8_MAX))) |
-             (static_cast<uint32_t>(pack_e4m3x2(fminf(fmaxf(bf_lo(xb[cc][2 * i + 1]) * inv, -FP8_MAX), FP8_MAX),
-                                                fminf(fmaxf(bf_hi(xb[cc][2 * i + 1]) * inv, -FP8_MAX), FP8_MAX)))
+      q[i] = static_cast<uint32_t>(pack_e4m3x2(
+                 fminf(fmaxf(bf_lo(xb[cc][2 * i]) * inv, -FP8_MAX), FP8_MAX),
+                 fminf(fmaxf(bf_hi(xb[cc][2 * i]) * inv, -FP8_MAX), FP8_MAX))) |
+             (static_cast<uint32_t>(pack_e4m3x2(
+                  fminf(fmaxf(bf_lo(xb[cc][2 * i + 1]) * inv, -FP8_MAX), FP8_MAX),
+                  fminf(fmaxf(bf_hi(xb[cc][2 * i + 1]) * inv, -FP8_MAX), FP8_MAX)))
               << 16);
     *reinterpret_cast<uint2*>(qrow + c0) = make_uint2(q[0], q[1]);
   }
@@ -986,7 +1094,8 @@ DEV void allreduce(const Params& p, Smem& s, int t, int kar, int ctid, unsigned 
     uint2 w[R];
     uint8_t* slot0 = mine + RS_OFF + (static_cast<int64_t>(phase) * MT + t) * R * RS_SLOT + col * 2;
 #pragma unroll
-    for (int q = 0; q < R; ++q) w[q] = ld_vol_v2(slot0 + q * RS_SLOT);
+    for (int q = 0; q < R; ++q)
+      w[q] = ld_vol_v2(slot0 + q * RS_SLOT);
     bool done;
     do {
       done = true;
@@ -999,11 +1108,15 @@ DEV void allreduce(const Params& p, Smem& s, int t, int kar, int ctid, unsigned 
       }
     } while (!done);
 #pragma unroll
-    for (int q = 0; q < R; ++q) st_v2(slot0 + q * RS_SLOT, make_uint2(0u, 0u));
+    for (int q = 0; q < R; ++q)
+      st_v2(slot0 + q * RS_SLOT, make_uint2(0u, 0u));
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
     for (int q = 0; q < R; ++q) {
-      acc[0] += bf_lo(w[q].x); acc[1] += bf_hi(w[q].x); acc[2] += bf_lo(w[q].y); acc[3] += bf_hi(w[q].y);
+      acc[0] += bf_lo(w[q].x);
+      acc[1] += bf_hi(w[q].x);
+      acc[2] += bf_lo(w[q].y);
+      acc[3] += bf_hi(w[q].y);
     }
     hb = make_uint2(pack_bf2(acc[0], acc[1]), pack_bf2(acc[2], acc[3]));
     *reinterpret_cast<uint2*>(s_h + rank * SL + col) = hb;
@@ -1132,11 +1245,18 @@ DEV void allreduce(const Params& p, Smem& s, int t, int kar, int ctid, unsigned 
     for (int v = 0; v < 12; ++v) {
       const float4* vp = reinterpret_cast<const float4*>(s_v + 512 * v + 8 * ctid);
       const float4 a = vp[0], b = vp[1];
-      acc = fmaf(a.x, a.x, acc); acc = fmaf(a.y, a.y, acc); acc = fmaf(a.z, a.z, acc); acc = fmaf(a.w, a.w, acc);
-      acc = fmaf(b.x, b.x, acc); acc = fmaf(b.y, b.y, acc); acc = fmaf(b.z, b.z, acc); acc = fmaf(b.w, b.w, acc);
+      acc = fmaf(a.x, a.x, acc);
+      acc = fmaf(a.y, a.y, acc);
+      acc = fmaf(a.z, a.z, acc);
+      acc = fmaf(a.w, a.w, acc);
+      acc = fmaf(b.x, b.x, acc);
+      acc = fmaf(b.y, b.y, acc);
+      acc = fmaf(b.z, b.z, acc);
+      acc = fmaf(b.w, b.w, acc);
     }
 #pragma unroll
-    for (int off = 1; off < 32; off <<= 1) acc = __fadd_rn(acc, __shfl_xor_sync(0xffffffffu, acc, off));
+    for (int off = 1; off < 32; off <<= 1)
+      acc = __fadd_rn(acc, __shfl_xor_sync(0xffffffffu, acc, off));
     if (lane == 0) s.red[warp] = acc;
   }
   bar_sync(1, NCT);
@@ -1163,16 +1283,19 @@ DEV void allreduce(const Params& p, Smem& s, int t, int kar, int ctid, unsigned 
 #pragma unroll
     for (int cc = 0; cc < 3; ++cc) {
       const int e = cc * NCT * 8 + ctid * 8;
-      *reinterpret_cast<uint4*>(p.out + static_cast<int64_t>(t) * H + e) = make_uint4(yb[cc][0], yb[cc][1], yb[cc][2], yb[cc][3]);
+      *reinterpret_cast<uint4*>(p.out + static_cast<int64_t>(t) * H + e) =
+          make_uint4(yb[cc][0], yb[cc][1], yb[cc][2], yb[cc][3]);
     }
   } else if (!p.conv) {
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, o));
+    for (int o = 16; o > 0; o >>= 1)
+      tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, o));
     if (lane == 0) s.red[8 + warp] = tmax;
     bar_sync(1, NCT);
     float am = 0.f;
 #pragma unroll
-    for (int w = 0; w < NCT / 32; ++w) am = fmaxf(am, s.red[8 + w]);
+    for (int w = 0; w < NCT / 32; ++w)
+      am = fmaxf(am, s.red[8 + w]);
     const float scale = __fdividef(fmaxf(am, 1e-10f), FP8_MAX);
     const float inv = rcp_scale(scale);
     const int buf = (kar + 1) & 1;  // x event kar + 1
@@ -1183,10 +1306,12 @@ DEV void allreduce(const Params& p, Smem& s, int t, int kar, int ctid, unsigned 
       uint32_t q[2];
 #pragma unroll
       for (int i = 0; i < 2; ++i)
-        q[i] = static_cast<uint32_t>(pack_e4m3x2(fminf(fmaxf(bf_lo(yb[cc][2 * i]) * inv, -FP8_MAX), FP8_MAX),
-                                                 fminf(fmaxf(bf_hi(yb[cc][2 * i]) * inv, -FP8_MAX), FP8_MAX))) |
-               (static_cast<uint32_t>(pack_e4m3x2(fminf(fmaxf(bf_lo(yb[cc][2 * i + 1]) * inv, -FP8_MAX), FP8_MAX),
-                                                  fminf(fmaxf(bf_hi(yb[cc][2 * i + 1]) * inv, -FP8_MAX), FP8_MAX)))
+        q[i] = static_cast<uint32_t>(pack_e4m3x2(
+                   fminf(fmaxf(bf_lo(yb[cc][2 * i]) * inv, -FP8_MAX), FP8_MAX),
+                   fminf(fmaxf(bf_hi(yb[cc][2 * i]) * inv, -FP8_MAX), FP8_MAX))) |
+               (static_cast<uint32_t>(pack_e4m3x2(
+                    fminf(fmaxf(bf_lo(yb[cc][2 * i + 1]) * inv, -FP8_MAX), FP8_MAX),
+                    fminf(fmaxf(bf_hi(yb[cc][2 * i + 1]) * inv, -FP8_MAX), FP8_MAX)))
                 << 16);
       *reinterpret_cast<uint2*>(xrow + e) = make_uint2(q[0], q[1]);
     }
@@ -1266,7 +1391,8 @@ DEV void phase0(const Params& p, Smem& s, int t, int ctid, unsigned E, int& cslo
     const int e = (cc / 8) * NCT * 8 + ctid * 8;
     uint32_t hb[4];
 #pragma unroll
-    for (int j = 0; j < 4; ++j) hb[j] = pack_bf2(v[cc + 2 * j], v[cc + 2 * j + 1]);
+    for (int j = 0; j < 4; ++j)
+      hb[j] = pack_bf2(v[cc + 2 * j], v[cc + 2 * j + 1]);
     *reinterpret_cast<uint4*>(p.hn + static_cast<int64_t>(t) * H + e) = make_uint4(hb[0], hb[1], hb[2], hb[3]);
   }
   bar_sync(1, NCT);
@@ -1280,12 +1406,14 @@ DEV void phase0(const Params& p, Smem& s, int t, int ctid, unsigned E, int& cslo
     amx = fmaxf(amx, fabsf(v[i]));
   }
 #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) amx = fmaxf(amx, __shfl_xor_sync(0xffffffffu, amx, o));
+  for (int o = 16; o > 0; o >>= 1)
+    amx = fmaxf(amx, __shfl_xor_sync(0xffffffffu, amx, o));
   if (lane == 0) s.red[8 + warp] = amx;
   bar_sync(1, NCT);
   float m = 0.f;
 #pragma unroll
-  for (int w = 0; w < NCT / 32; ++w) m = fmaxf(m, s.red[8 + w]);
+  for (int w = 0; w < NCT / 32; ++w)
+    m = fmaxf(m, s.red[8 + w]);
   const float sc = __fdividef(fmaxf(m, 1e-10f), FP8_MAX);
   const float inv = rcp_scale(sc);
   uint8_t* xrow = p.xq + static_cast<int64_t>(t) * H;  // buffer 0
@@ -1302,7 +1430,8 @@ DEV void phase0(const Params& p, Smem& s, int t, int ctid, unsigned E, int& cslo
     if (p.conv) {
       uint32_t hb[4];
 #pragma unroll
-      for (int j = 0; j < 4; ++j) hb[j] = pack_bf2(v[cc + 2 * j], v[cc + 2 * j + 1]);
+      for (int j = 0; j < 4; ++j)
+        hb[j] = pack_bf2(v[cc + 2 * j], v[cc + 2 * j + 1]);
       *reinterpret_cast<uint4*>(p.hn + static_cast<int64_t>(t) * H + e) = make_uint4(hb[0], hb[1], hb[2], hb[3]);
     }
   }
@@ -1318,8 +1447,18 @@ DEV void phase0(const Params& p, Smem& s, int t, int ctid, unsigned E, int& cslo
 
 // ------------------------------------------------------------------ GEMM phase
 template <int PH>
-DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsigned E, int& cslot, uint32_t& cpar, int& gph,
-               int& xph) {
+DEV void gemm(
+    const Params& p,
+    Smem& s,
+    int l,
+    int c,
+    int rank,
+    int ctid,
+    unsigned E,
+    int& cslot,
+    uint32_t& cpar,
+    int& gph,
+    int& xph) {
   constexpr bool S8 = (PH == PH_QKV || PH == PH_GU);
   constexpr int NU = S8 ? 48 : 16;
   constexpr int NS = S8 ? 8 : 4;
@@ -1377,7 +1516,8 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
   if (ctid == 0) {
     const uint32_t address = smem_u32(fullk_ready);
 #pragma unroll
-    for (int q = 0; q < CS; ++q) mbar_arrive_remote(mapa(address, q));
+    for (int q = 0; q < CS; ++q)
+      mbar_arrive_remote(mapa(address, q));
   }
   mbar_wait_cluster(fullk_ready, gph & 1);
   bar_sync(1, NCT);
@@ -1393,13 +1533,17 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
     const bool have = wg == 0;
     float acc[16];
 #pragma unroll
-    for (int r = 0; r < 16; ++r) acc[r] = 0.f;
+    for (int r = 0; r < 16; ++r)
+      acc[r] = 0.f;
     int previous_slot = -1;
 #pragma unroll 1
     for (int u = 0; u < (full_owner ? NU : 0); ++u) {
       const int slot = cslot;
       const uint32_t par = cpar;
-      if (++cslot == s.nslot) { cslot = 0; cpar ^= 1u; }
+      if (++cslot == s.nslot) {
+        cslot = 0;
+        cpar ^= 1u;
+      }
       mbar_wait(&s.full[slot], par);
       // The preceding MMA group may still read the other 4-KiB input stage.
       uint8_t* Xu = X + (u & 1) * XU;
@@ -1419,10 +1563,12 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
           uint32_t q[4];
 #pragma unroll
           for (int j = 0; j < 4; ++j) {
-            const uint16_t lo = pack_e4m3x2(fminf(fmaxf(bf_lo(w[2 * j]) * inv, -FP8_MAX), FP8_MAX),
-                                          fminf(fmaxf(bf_hi(w[2 * j]) * inv, -FP8_MAX), FP8_MAX));
-            const uint16_t hi = pack_e4m3x2(fminf(fmaxf(bf_lo(w[2 * j + 1]) * inv, -FP8_MAX), FP8_MAX),
-                                          fminf(fmaxf(bf_hi(w[2 * j + 1]) * inv, -FP8_MAX), FP8_MAX));
+            const uint16_t lo = pack_e4m3x2(
+                fminf(fmaxf(bf_lo(w[2 * j]) * inv, -FP8_MAX), FP8_MAX),
+                fminf(fmaxf(bf_hi(w[2 * j]) * inv, -FP8_MAX), FP8_MAX));
+            const uint16_t hi = pack_e4m3x2(
+                fminf(fmaxf(bf_lo(w[2 * j + 1]) * inv, -FP8_MAX), FP8_MAX),
+                fminf(fmaxf(bf_hi(w[2 * j + 1]) * inv, -FP8_MAX), FP8_MAX));
             q[j] = static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16);
           }
           packed = make_uint4(q[0], q[1], q[2], q[3]);
@@ -1437,7 +1583,8 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
         const uint64_t db = make_desc(Xu);
         wgmma_fence();
 #pragma unroll
-        for (int kk = 0; kk < 4; ++kk) wgmma_m64n32k32_e4m3(acc, da + 2 * kk, db + 2 * kk);
+        for (int kk = 0; kk < 4; ++kk)
+          wgmma_m64n32k32_e4m3(acc, da + 2 * kk, db + 2 * kk);
         wgmma_commit();
         // Preserve every accumulator's K order while overlapping the next
         // input load with this group. The previous group's two operands are
@@ -1472,7 +1619,8 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
           owner = (g << 2) | (rho >> 4);
           lrow = rho & 15;
         }
-        // registers {0,1,4,5,8,9,12,13} (+2 for the second row half) = tokens 2q, 2q+1, 2q+8, .. -> positions q*8 + 0..7
+        // registers {0,1,4,5,8,9,12,13} (+2 for the second row half) = tokens 2q, 2q+1, 2q+8, .. -> positions q*8 +
+        // 0..7
         const uint32_t off = static_cast<uint32_t>((((k * NS + src) * ROWS + lrow) * 32 + (lane & 3) * 8) * 4);
         const uint32_t dst = mapa(rbase + off, owner), bar = mapa(rbar, owner);
         const int r0 = 2 * hf;
@@ -1492,22 +1640,28 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
       const int k = i >> 5, t = i & 31;
       float v[8];
 #pragma unroll
-      for (int rr = 0; rr < 8; ++rr) v[rr] = 0.f;
+      for (int rr = 0; rr < 8; ++rr)
+        v[rr] = 0.f;
 #pragma unroll
       for (int q = 0; q < 8; ++q)
 #pragma unroll
-        for (int rr = 0; rr < 8; ++rr) v[rr] += recv[((k * 8 + q) * 8 + rr) * 32 + tpos(t)];
+        for (int rr = 0; rr < 8; ++rr)
+          v[rr] += recv[((k * 8 + q) * 8 + rr) * 32 + tpos(t)];
       const int n0 = tl[k] * 64 + rank * 8;
       const float sxv = s.sx[t];
       uint32_t w[4];
 #pragma unroll
       for (int j = 0; j < 4; ++j)
-        w[j] = pack_bf2(__fmul_rn(__fmul_rn(v[2 * j], sxv), s.red[k * 16 + 2 * j]), __fmul_rn(__fmul_rn(v[2 * j + 1], sxv), s.red[k * 16 + 2 * j + 1]));
+        w[j] = pack_bf2(
+            __fmul_rn(__fmul_rn(v[2 * j], sxv), s.red[k * 16 + 2 * j]),
+            __fmul_rn(__fmul_rn(v[2 * j + 1], sxv), s.red[k * 16 + 2 * j + 1]));
 #if DM_LL_QKV
-      // data = flag: Lamport-marked words into this layer's parity buffer; the other parity (read by the previous layer,
-      // written by the next one -- by this same thread) is cleared now
+      // data = flag: Lamport-marked words into this layer's parity buffer; the other parity (read by the previous
+      // layer, written by the next one -- by this same thread) is cleared now
       const unsigned gl = E * 5u + static_cast<unsigned>(l);
-      st_v4(p.qkv + (static_cast<int64_t>(gl & 1u) * MT + t) * QKV_N + n0, make_uint4(nz(w[0]), nz(w[1]), nz(w[2]), nz(w[3])));
+      st_v4(
+          p.qkv + (static_cast<int64_t>(gl & 1u) * MT + t) * QKV_N + n0,
+          make_uint4(nz(w[0]), nz(w[1]), nz(w[2]), nz(w[3])));
       st_v4(p.qkv + (static_cast<int64_t>((gl + 1u) & 1u) * MT + t) * QKV_N + n0, make_uint4(0u, 0u, 0u, 0u));
 #else
       *reinterpret_cast<uint4*>(p.qkv + t * QKV_N + n0) = make_uint4(w[0], w[1], w[2], w[3]);
@@ -1520,12 +1674,17 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
       dstamp(p, l, 121);
 #if DM_SC_FENCE
       __threadfence();  // one fence orders the CTA's qkv rows (CTA barrier above) before all its tile counters
-      for (int k = 0; k < nt; ++k) atomicAdd(p.cnt + C_QKV + tl[k], 1u);
+      for (int k = 0; k < nt; ++k)
+        atomicAdd(p.cnt + C_QKV + tl[k], 1u);
 #else
-      for (int k = 0; k < nt; ++k) red_release(p.cnt + C_QKV + tl[k], 1u);
+      for (int k = 0; k < nt; ++k)
+        red_release(p.cnt + C_QKV + tl[k], 1u);
 #endif
       dstamp(p, l, 122);
-      if (DM_QUIET && nt > 0) { volatile int* relc = s.misc + 2; *relc = *relc + 1; }   // -> the producer's held units
+      if (DM_QUIET && nt > 0) {
+        volatile int* relc = s.misc + 2;
+        *relc = *relc + 1;
+      }  // -> the producer's held units
     }
 #endif
   } else if constexpr (PH == PH_GU) {
@@ -1533,11 +1692,13 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
       const int k = i >> 5, t = i & 31;
       float v[8];
 #pragma unroll
-      for (int rr = 0; rr < 8; ++rr) v[rr] = 0.f;
+      for (int rr = 0; rr < 8; ++rr)
+        v[rr] = 0.f;
 #pragma unroll
       for (int q = 0; q < 8; ++q)
 #pragma unroll
-        for (int rr = 0; rr < 8; ++rr) v[rr] += recv[((k * 8 + q) * 8 + rr) * 32 + tpos(t)];
+        for (int rr = 0; rr < 8; ++rr)
+          v[rr] += recv[((k * 8 + q) * 8 + rr) * 32 + tpos(t)];
       const int cg = tl[k] * 32 + rank * 4;
       const float sxv = s.sx[t];
       float a[4];
@@ -1562,7 +1723,10 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
         dstamp(p, l, 125);
         red_release(p.cnt + C_ACT, 1u);  // its fence also orders the warp's amax atomics (__syncwarp above)
         dstamp(p, l, 126);
-        if (DM_QUIET) { volatile int* relc = s.misc + 2; *relc = *relc + 1; }
+        if (DM_QUIET) {
+          volatile int* relc = s.misc + 2;
+          *relc = *relc + 1;
+        }
       }
     }
   } else {
@@ -1571,21 +1735,26 @@ DEV void gemm(const Params& p, Smem& s, int l, int c, int rank, int ctid, unsign
       const int k = i >> 6, t = (i >> 1) & 31, h = i & 1;
       float v[8];
 #pragma unroll
-      for (int rr = 0; rr < 8; ++rr) v[rr] = 0.f;
+      for (int rr = 0; rr < 8; ++rr)
+        v[rr] = 0.f;
 #pragma unroll
       for (int q = 0; q < 4; ++q)
 #pragma unroll
-        for (int rr = 0; rr < 8; ++rr) v[rr] += recv[((k * 4 + q) * 16 + 8 * h + rr) * 32 + tpos(t)];
+        for (int rr = 0; rr < 8; ++rr)
+          v[rr] += recv[((k * 4 + q) * 16 + 8 * h + rr) * 32 + tpos(t)];
       const int n0 = tl[k] * 64 + (rank & 3) * 16 + 8 * h;
       const float sxv = s.sx[t];
       uint32_t w[4];
 #pragma unroll
       for (int j = 0; j < 4; ++j)
-        w[j] = nz(pack_bf2(__fmul_rn(__fmul_rn(v[2 * j], sxv), s.red[k * 16 + 8 * h + 2 * j]), __fmul_rn(__fmul_rn(v[2 * j + 1], sxv), s.red[k * 16 + 8 * h + 2 * j + 1])));
+        w[j] = nz(pack_bf2(
+            __fmul_rn(__fmul_rn(v[2 * j], sxv), s.red[k * 16 + 8 * h + 2 * j]),
+            __fmul_rn(__fmul_rn(v[2 * j + 1], sxv), s.red[k * 16 + 8 * h + 2 * j + 1])));
       const int q = n0 / SL;
       const int phase = (s.calls0[t] + kar) & 1;
-      st_v4(p.peer[q] + RS_OFF + ((static_cast<int64_t>(phase) * MT + t) * R + p.rank) * RS_SLOT + (n0 - q * SL) * 2,
-            make_uint4(w[0], w[1], w[2], w[3]));
+      st_v4(
+          p.peer[q] + RS_OFF + ((static_cast<int64_t>(phase) * MT + t) * R + p.rank) * RS_SLOT + (n0 - q * SL) * 2,
+          make_uint4(w[0], w[1], w[2], w[3]));
     }
   }
   // Finish all consumers before the next phase reuses s.red, s.sx or s.greg.
@@ -1612,12 +1781,15 @@ DEV void qk_norm_rope(const uint4* xv, const __nv_bfloat16* w, const float* cs, 
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
 #pragma unroll
-    for (int j = 0; j < 4; ++j) lane_sum[i] += x[4 * i + j] * x[4 * i + j];
+    for (int j = 0; j < 4; ++j)
+      lane_sum[i] += x[4 * i + j] * x[4 * i + j];
   }
 #pragma unroll
-  for (int i = 0; i < 8; ++i) lane_sum[i] += __shfl_xor_sync(0xffffffffu, lane_sum[i], 2);
+  for (int i = 0; i < 8; ++i)
+    lane_sum[i] += __shfl_xor_sync(0xffffffffu, lane_sum[i], 2);
 #pragma unroll
-  for (int i = 0; i < 8; ++i) lane_sum[i] += __shfl_xor_sync(0xffffffffu, lane_sum[i], 1);
+  for (int i = 0; i < 8; ++i)
+    lane_sum[i] += __shfl_xor_sync(0xffffffffu, lane_sum[i], 1);
   const float a0 = lane_sum[0] + lane_sum[4], a1 = lane_sum[1] + lane_sum[5];
   const float a2 = lane_sum[2] + lane_sum[6], a3 = lane_sum[3] + lane_sum[7];
   const float ss = (a0 + a2) + (a1 + a3);
@@ -1635,17 +1807,20 @@ DEV void qk_norm_rope(const uint4* xv, const __nv_bfloat16* w, const float* cs, 
   }
   float oth[32];
 #pragma unroll
-  for (int d = 0; d < 32; ++d) oth[d] = __shfl_xor_sync(0xffffffffu, xn[d], 1);
+  for (int d = 0; d < 32; ++d)
+    oth[d] = __shfl_xor_sync(0xffffffffu, xn[d], 1);
   if (qq < 2) {
 #pragma unroll
     for (int d = 0; d < 32; ++d) {
       const float c = cs[d], sn = cs[32 + d];
       // quarter 0 holds x1 (dims d), quarter 1 holds x2 (dims 32 + d)
-      xn[d] = (qq == 0) ? bf16r(__fmaf_rn(xn[d], c, -__fmul_rn(oth[d], sn))) : bf16r(__fmaf_rn(xn[d], c, __fmul_rn(oth[d], sn)));
+      xn[d] = (qq == 0) ? bf16r(__fmaf_rn(xn[d], c, -__fmul_rn(oth[d], sn)))
+                        : bf16r(__fmaf_rn(xn[d], c, __fmul_rn(oth[d], sn)));
     }
   }
 #pragma unroll
-  for (int j = 0; j < 16; ++j) out[j] = pack_bf2(xn[2 * j], xn[2 * j + 1]);
+  for (int j = 0; j < 16; ++j)
+    out[j] = pack_bf2(xn[2 * j], xn[2 * j + 1]);
 }
 
 // Preserve the division instruction used by the original attention reference.
@@ -1673,8 +1848,9 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
   // stage what does not depend on this layer's qkv while the tiles are produced
   for (int i = ctid; i < BLK * 64; i += NCT) {
     const long long pos = s.pos[i >> 6];
-    scs[i] = p.cs_f32 ? __ldg(reinterpret_cast<const float*>(p.cos_sin) + pos * p.cs_stride + (i & 63))
-                      : __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(p.cos_sin)[pos * p.cs_stride + (i & 63)]);
+    scs[i] = p.cs_f32
+                 ? __ldg(reinterpret_cast<const float*>(p.cos_sin) + pos * p.cs_stride + (i & 63))
+                 : __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(p.cos_sin)[pos * p.cs_stride + (i & 63)]);
   }
   if (ctid < 16) {
     reinterpret_cast<uint4*>(sqn)[ctid] = __ldg(reinterpret_cast<const uint4*>(LP.qn) + ctid);
@@ -1683,13 +1859,15 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
   } else if (ctid < 40) {
     const int h = 8 * hg + ctid - 32;
     float v = -INFINITY;
-    if (LP.sinks) v = p.sink_f32 ? __ldg(reinterpret_cast<const float*>(LP.sinks) + h)
-                                 : __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(LP.sinks)[h]);
+    if (LP.sinks)
+      v = p.sink_f32 ? __ldg(reinterpret_cast<const float*>(LP.sinks) + h)
+                     : __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(LP.sinks)[h]);
     s.red[32 + ctid - 32] = v;
   }
 #if !DM_LL_QKV
   // wait for this head half's q tiles (the k / v tiles: gather warp)
-  if (ctid >= 64 && ctid < 80) wait_ge(p.cnt + C_QKV + 16 * hg + (ctid - 64), (E * 5u + static_cast<unsigned>(l) + 1u) * 8u);
+  if (ctid >= 64 && ctid < 80)
+    wait_ge(p.cnt + C_QKV + 16 * hg + (ctid - 64), (E * 5u + static_cast<unsigned>(l) + 1u) * 8u);
 #endif
   bar_sync(1, NCT);
   if (ctid == 0) mbar_arrive(s.csbar);  // cos|sin rows + k-norm weights staged (CTA barrier above) -> gather warp
@@ -1703,11 +1881,13 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
     if (ctid == 0) dstamp(p, l, 123);
     const __nv_bfloat16* qbuf = p.qkv + static_cast<int64_t>((E * 5u + static_cast<unsigned>(l)) & 1u) * MT * QKV_N;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) xq[i] = poll_ll_v4(qbuf + (BLK * b + t) * QKV_N + (8 * hg + h) * HD + qq * 32 + i * 8);
+    for (int i = 0; i < 4; ++i)
+      xq[i] = poll_ll_v4(qbuf + (BLK * b + t) * QKV_N + (8 * hg + h) * HD + qq * 32 + i * 8);
 #else
     const __nv_bfloat16* qsrc = p.qkv + (BLK * b + t) * QKV_N + (8 * hg + h) * HD + qq * 32;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) xq[i] = ldcg_v4(qsrc + i * 8);
+    for (int i = 0; i < 4; ++i)
+      xq[i] = ldcg_v4(qsrc + i * 8);
 #endif
     if (ctid == 0) {
       asm volatile("" ::"r"(xq[0].x), "r"(xq[3].w));
@@ -1717,7 +1897,8 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
     qk_norm_rope(xq, sqn, scs + t * 64, qq, p.qk_eps, o);
 #pragma unroll
     for (int i = 0; i < 4; ++i)
-      *reinterpret_cast<uint4*>(sQ + row * 256 + swz(4 * qq + i, row) * 16) = make_uint4(o[4 * i], o[4 * i + 1], o[4 * i + 2], o[4 * i + 3]);
+      *reinterpret_cast<uint4*>(sQ + row * 256 + swz(4 * qq + i, row) * 16) =
+          make_uint4(o[4 * i], o[4 * i + 1], o[4 * i + 2], o[4 * i + 3]);
   }
   if (ctid == 0) dstamp(p, l, 57);
   mbar_wait(s.kvfull, l & 1);
@@ -1730,7 +1911,7 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
     const int hsplit = (sp.nu + 1) >> 1;
     const bool ksplit = (sp.nu - hsplit) >= 2;  // WG1 contributes >= 2 x 8 KB: enough for each 16 KB merge buffer
     const int ub = half == 0 ? 0 : hsplit;
-    const int ue = half == 0 ? (ksplit ? hsplit : sp.nu) : (ksplit ? sp.nu : hsplit);
+    const int ue = half == 0 ? (ksplit ? hsplit : sp.nu) : (ksplit ? sp.nu : hsplit);  // codespell:ignore ue
     const uint32_t qb = smem_u32(sQ), kb = smem_u32(sK), vb = smem_u32(sV);
     uint32_t aq[8][4];
 #pragma unroll
@@ -1741,16 +1922,18 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
     }
     float O[16][4];
 #pragma unroll
-    for (int j = 0; j < 16; ++j) O[j][0] = O[j][1] = O[j][2] = O[j][3] = 0.f;
+    for (int j = 0; j < 16; ++j)
+      O[j][0] = O[j][1] = O[j][2] = O[j][3] = 0.f;
     float m0 = -1e30f, m1 = -1e30f, l0 = 0.f, l1 = 0.f;
     const int lo0 = sp.seqlen - (BLK + WIN) + 2 * rt;
     const float scale = p.sm_scale;
 #pragma unroll 1
-    for (int u = ub; u < ue; ++u) {
+    for (int u = ub; u < ue; ++u) {  // codespell:ignore ue
       // Both 16-key MMA fragments share one 32-key max before BF16 probability rounding.
       float sc[4][4];
 #pragma unroll
-      for (int jt = 0; jt < 4; ++jt) sc[jt][0] = sc[jt][1] = sc[jt][2] = sc[jt][3] = 0.f;
+      for (int jt = 0; jt < 4; ++jt)
+        sc[jt][0] = sc[jt][1] = sc[jt][2] = sc[jt][3] = 0.f;
 #pragma unroll
       for (int kt = 0; kt < 2; ++kt) {
         const int key = KVU * u + 16 * kt + (lane & 7) + 8 * (lane >> 4);
@@ -1772,7 +1955,10 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
           const bool ok = (key < sp.seqlen) && (key >= lo0 + (e >> 1));
           const float v = ok ? sc[jt][e] * scale : -INFINITY;
           sc[jt][e] = v;
-          if (e < 2) mu0 = fmaxf(mu0, v); else mu1 = fmaxf(mu1, v);
+          if (e < 2)
+            mu0 = fmaxf(mu0, v);
+          else
+            mu1 = fmaxf(mu1, v);
         }
       }
       mu0 = fmaxf(mu0, __shfl_xor_sync(0xffffffffu, mu0, 1));
@@ -1784,7 +1970,10 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
       m1 = mu1;
 #pragma unroll
       for (int j = 0; j < 16; ++j) {
-        O[j][0] *= a0; O[j][1] *= a0; O[j][2] *= a1; O[j][3] *= a1;
+        O[j][0] *= a0;
+        O[j][1] *= a0;
+        O[j][2] *= a1;
+        O[j][3] *= a1;
       }
 #pragma unroll
       for (int jt = 0; jt < 4; ++jt) {
@@ -1795,18 +1984,18 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
       }
       static_assert(KVU == 32);
       // Observed reference PTX: pairwise register tree, XOR 2 then 1, then one FMA per tile.
-      float sum0=__fadd_rn(
-          __fadd_rn(__fadd_rn(sc[0][0],sc[0][1]),__fadd_rn(sc[1][0],sc[1][1])),
-          __fadd_rn(__fadd_rn(sc[2][0],sc[2][1]),__fadd_rn(sc[3][0],sc[3][1])));
-      float sum1=__fadd_rn(
-          __fadd_rn(__fadd_rn(sc[0][2],sc[0][3]),__fadd_rn(sc[1][2],sc[1][3])),
-          __fadd_rn(__fadd_rn(sc[2][2],sc[2][3]),__fadd_rn(sc[3][2],sc[3][3])));
-      sum0=__fadd_rn(sum0,__shfl_xor_sync(0xffffffffu,sum0,2));
-      sum0=__fadd_rn(sum0,__shfl_xor_sync(0xffffffffu,sum0,1));
-      sum1=__fadd_rn(sum1,__shfl_xor_sync(0xffffffffu,sum1,2));
-      sum1=__fadd_rn(sum1,__shfl_xor_sync(0xffffffffu,sum1,1));
-      l0=__fmaf_rn(l0,a0,sum0);
-      l1=__fmaf_rn(l1,a1,sum1);
+      float sum0 = __fadd_rn(
+          __fadd_rn(__fadd_rn(sc[0][0], sc[0][1]), __fadd_rn(sc[1][0], sc[1][1])),
+          __fadd_rn(__fadd_rn(sc[2][0], sc[2][1]), __fadd_rn(sc[3][0], sc[3][1])));
+      float sum1 = __fadd_rn(
+          __fadd_rn(__fadd_rn(sc[0][2], sc[0][3]), __fadd_rn(sc[1][2], sc[1][3])),
+          __fadd_rn(__fadd_rn(sc[2][2], sc[2][3]), __fadd_rn(sc[3][2], sc[3][3])));
+      sum0 = __fadd_rn(sum0, __shfl_xor_sync(0xffffffffu, sum0, 2));
+      sum0 = __fadd_rn(sum0, __shfl_xor_sync(0xffffffffu, sum0, 1));
+      sum1 = __fadd_rn(sum1, __shfl_xor_sync(0xffffffffu, sum1, 2));
+      sum1 = __fadd_rn(sum1, __shfl_xor_sync(0xffffffffu, sum1, 1));
+      l0 = __fmaf_rn(l0, a0, sum0);
+      l1 = __fmaf_rn(l1, a1, sum1);
 #pragma unroll
       for (int kt = 0; kt < 2; ++kt) {
         uint32_t a[4];
@@ -1852,10 +2041,14 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
           const float4 k4 = oK[i * 128 + tw], v4 = oV[i * 128 + tw];
-          O[i][0] = O[i][0] * a0 + k4.x * b0; O[i][1] = O[i][1] * a0 + k4.y * b0;
-          O[i][2] = O[i][2] * a1 + k4.z * b1; O[i][3] = O[i][3] * a1 + k4.w * b1;
-          O[8 + i][0] = O[8 + i][0] * a0 + v4.x * b0; O[8 + i][1] = O[8 + i][1] * a0 + v4.y * b0;
-          O[8 + i][2] = O[8 + i][2] * a1 + v4.z * b1; O[8 + i][3] = O[8 + i][3] * a1 + v4.w * b1;
+          O[i][0] = O[i][0] * a0 + k4.x * b0;
+          O[i][1] = O[i][1] * a0 + k4.y * b0;
+          O[i][2] = O[i][2] * a1 + k4.z * b1;
+          O[i][3] = O[i][3] * a1 + k4.w * b1;
+          O[8 + i][0] = O[8 + i][0] * a0 + v4.x * b0;
+          O[8 + i][1] = O[8 + i][1] * a0 + v4.y * b0;
+          O[8 + i][2] = O[8 + i][2] * a1 + v4.z * b1;
+          O[8 + i][3] = O[8 + i][3] * a1 + v4.w * b1;
         }
       }
     }
@@ -1865,22 +2058,23 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
     const int g = lane >> 2;
     if (ctid == 0) dstamp(p, l, 59);
     if (half == 0) {
-    mbar_wait_cluster(s.combok, l & 1);
-    const uint32_t cbase = smem_u32(comb), cbar = smem_u32(s.combbar);
+      mbar_wait_cluster(s.combok, l & 1);
+      const uint32_t cbase = smem_u32(comb), cbar = smem_u32(s.combbar);
 #pragma unroll
-    for (int hf = 0; hf < 2; ++hf) {
-      const int dst = 2 * rt + hf;
-      const uint32_t rb = mapa(cbase, dst) + ((rank * 8 + g) * COMB_STRIDE) * 4;
-      const uint32_t rbar = mapa(cbar, dst);
-      const float partial_l = hf ? l1 : l0;
-      const float denominator = partial_l > 0.f ? partial_l : 1.f;
+      for (int hf = 0; hf < 2; ++hf) {
+        const int dst = 2 * rt + hf;
+        const uint32_t rb = mapa(cbase, dst) + ((rank * 8 + g) * COMB_STRIDE) * 4;
+        const uint32_t rbar = mapa(cbar, dst);
+        const float partial_l = hf ? l1 : l0;
+        const float denominator = partial_l > 0.f ? partial_l : 1.f;
 #pragma unroll
-      for (int j = 0; j < 16; ++j) {
-        const int d = 8 * j + (lane & 3) * 2;
-        st_async_v2(rb + d * 4, attention_div(O[j][2 * hf], denominator), attention_div(O[j][2 * hf + 1], denominator), rbar);
+        for (int j = 0; j < 16; ++j) {
+          const int d = 8 * j + (lane & 3) * 2;
+          st_async_v2(
+              rb + d * 4, attention_div(O[j][2 * hf], denominator), attention_div(O[j][2 * hf + 1], denominator), rbar);
+        }
+        if ((lane & 3) == 0) st_async_b32(rb + HD * 4, hf ? lse1 : lse0, rbar);
       }
-      if ((lane & 3) == 0) st_async_b32(rb + HD * 4, hf ? lse1 : lse0, rbar);
-    }
     }
   }
   // KV region no longer read: the gather warp may fetch the next layer's keys
@@ -1911,8 +2105,10 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
       den += w;
       const float4 v = *reinterpret_cast<const float4*>(comb + (q * 8 + h) * COMB_STRIDE + 4 * d4);
       // Round products before the split sum, matching the original reference reduction.
-      o[0] = __fadd_rn(o[0], __fmul_rn(v.x, w)); o[1] = __fadd_rn(o[1], __fmul_rn(v.y, w));
-      o[2] = __fadd_rn(o[2], __fmul_rn(v.z, w)); o[3] = __fadd_rn(o[3], __fmul_rn(v.w, w));
+      o[0] = __fadd_rn(o[0], __fmul_rn(v.x, w));
+      o[1] = __fadd_rn(o[1], __fmul_rn(v.y, w));
+      o[2] = __fadd_rn(o[2], __fmul_rn(v.z, w));
+      o[3] = __fadd_rn(o[3], __fmul_rn(v.w, w));
     }
     if (has_sink && !empty) den += __expf(sink - mx);
     const float denominator = den > 0.f ? den : 1.f;
@@ -1922,14 +2118,16 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
     *reinterpret_cast<uint2*>(p.att + row * 2048 + hg * 1024 + h * HD + 4 * d4) = make_uint2(w0, w1);
     float amx = fmaxf(fmaxf(fabsf(bf_lo(w0)), fabsf(bf_hi(w0))), fmaxf(fabsf(bf_lo(w1)), fabsf(bf_hi(w1))));
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) amx = fmaxf(amx, __shfl_xor_sync(0xffffffffu, amx, off));
+    for (int off = 16; off > 0; off >>= 1)
+      amx = fmaxf(amx, __shfl_xor_sync(0xffffffffu, amx, off));
     if (lane == 0) s.red[16 + warp] = amx;
   }
   bar_sync(1, NCT);
   float amx = 0.f;
   if (ctid == 0) {
 #pragma unroll
-    for (int w = 0; w < 8; ++w) amx = fmaxf(amx, s.red[16 + w]);
+    for (int w = 0; w < 8; ++w)
+      amx = fmaxf(amx, s.red[16 + w]);
   }
   bar_sync(1, NCT);  // the next GEMM phase reuses s.red for its weight scales
   if (ctid == 0) {
@@ -1993,7 +2191,7 @@ __global__ void __launch_bounds__(THREADS, 1) dflash_mega_kernel(const __grid_co
     mbar_init(s.cbar, 1);
     mbar_init(s.csbar, 1);
     mbar_init(reinterpret_cast<uint64_t*>(s.misc + 4), CS);  // full-K readiness: bytes1744..1751
-    s.misc[2] = 0;   // DM_QUIET release counter
+    s.misc[2] = 0;                                           // DM_QUIET release counter
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
   __syncthreads();
@@ -2032,7 +2230,8 @@ __global__ void __launch_bounds__(THREADS, 1) dflash_mega_kernel(const __grid_co
       if (c == 0 && rank == 0) {
         // zero the other parity's amax slots for the next launch
         unsigned* z = p.amax + ((E & 1u) ^ 1u) * 2u * NL * MT;
-        for (int i = ctid; i < 2 * NL * MT; i += NCT) z[i] = 0u;
+        for (int i = ctid; i < 2 * NL * MT; i += NCT)
+          z[i] = 0u;
       }
       if (ctid == 0) stamp(p, 0);
       int cslot = 0;
@@ -2065,7 +2264,8 @@ __global__ void __launch_bounds__(THREADS, 1) dflash_mega_kernel(const __grid_co
           atomicAdd(p.cnt + C_X, 2u * d * 32u);
           atomicAdd(p.cnt + C_ATT, d * 64u);
           atomicAdd(p.cnt + C_ACT, d * static_cast<unsigned>(GRID));
-          for (int i = 0; i < 36; ++i) atomicAdd(p.cnt + C_QKV + i, d * 8u);
+          for (int i = 0; i < 36; ++i)
+            atomicAdd(p.cnt + C_QKV + i, d * 8u);
           if (p.conv) atomicAdd(p.cnt + C_Y, 2u * d * 32u);
         }
         atomicAdd(p.cnt + C_LAUNCH, 1u);
@@ -2077,30 +2277,64 @@ __global__ void __launch_bounds__(THREADS, 1) dflash_mega_kernel(const __grid_co
   cluster_sync_all();
 }
 
-inline CUtensorMap make_map_3d(const void* base, uint64_t d0, uint64_t d1, uint64_t d2, uint64_t s1, uint64_t s2,
-                               uint32_t b0, uint32_t b1, uint32_t b2) {
+inline CUtensorMap make_map_3d(
+    const void* base,
+    uint64_t d0,
+    uint64_t d1,
+    uint64_t d2,
+    uint64_t s1,
+    uint64_t s2,
+    uint32_t b0,
+    uint32_t b1,
+    uint32_t b2) {
   CUtensorMap map;
   uint64_t dim[3] = {d0, d1, d2};
   uint64_t stride[2] = {s1, s2};
   uint32_t box[3] = {b0, b1, b2};
   uint32_t elem_stride[3] = {1, 1, 1};
-  const CUresult rc = cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(base), dim, stride, box,
-                                             elem_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-                                             CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  const CUresult rc = cuTensorMapEncodeTiled(
+      &map,
+      CU_TENSOR_MAP_DATA_TYPE_UINT8,
+      3,
+      const_cast<void*>(base),
+      dim,
+      stride,
+      box,
+      elem_stride,
+      CU_TENSOR_MAP_INTERLEAVE_NONE,
+      CU_TENSOR_MAP_SWIZZLE_128B,
+      CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   host::RuntimeCheck(rc == CUDA_SUCCESS, "dflash_mega: cuTensorMapEncodeTiled (3-D) failed");
   return map;
 }
 
-inline CUtensorMap make_map_2d(const void* base, uint64_t inner, uint64_t outer, uint64_t row_bytes, uint32_t box_inner,
-                               uint32_t box_outer, CUtensorMapDataType dtype = CU_TENSOR_MAP_DATA_TYPE_UINT8) {
+inline CUtensorMap make_map_2d(
+    const void* base,
+    uint64_t inner,
+    uint64_t outer,
+    uint64_t row_bytes,
+    uint32_t box_inner,
+    uint32_t box_outer,
+    CUtensorMapDataType dtype = CU_TENSOR_MAP_DATA_TYPE_UINT8) {
   CUtensorMap map;
   uint64_t dim[2] = {inner, outer};
   uint64_t stride[1] = {row_bytes};
   uint32_t box[2] = {box_inner, box_outer};
   uint32_t elem_stride[2] = {1, 1};
-  const CUresult rc = cuTensorMapEncodeTiled(&map, dtype, 2, const_cast<void*>(base), dim, stride, box,
-                                             elem_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-                                             CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  const CUresult rc = cuTensorMapEncodeTiled(
+      &map,
+      dtype,
+      2,
+      const_cast<void*>(base),
+      dim,
+      stride,
+      box,
+      elem_stride,
+      CU_TENSOR_MAP_INTERLEAVE_NONE,
+      CU_TENSOR_MAP_SWIZZLE_128B,
+      CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   host::RuntimeCheck(rc == CUDA_SUCCESS, "dflash_mega: cuTensorMapEncodeTiled failed");
   return map;
 }
@@ -2109,7 +2343,9 @@ inline CUtensorMap make_map_2d(const void* base, uint64_t inner, uint64_t outer,
 
 template <bool kUsePDL>
 struct DFlashMega {
-  static int64_t params_bytes() { return static_cast<int64_t>(sizeof(dflash_mega::Params)); }
+  static int64_t params_bytes() {
+    return static_cast<int64_t>(sizeof(dflash_mega::Params));
+  }
 
   // maps: cuda uint8 [(NL*NPH + 2) * 128]; wptr: host int64 [NL*NPH] fp8 weight bases ([N][K] contiguous rows) in the
   // order (qkv, o, gate_up, down, ca, cm) per layer (0: absent); xq: cuda uint8 [2][32][H] x buffers.
@@ -2134,14 +2370,19 @@ struct DFlashMega {
           h[l * NPH + ph] = make_map_2d(w, K[ph], N[ph], K[ph], 128, 64);
       }
     for (int b = 0; b < 2; ++b)
-      h[NL * NPH + b] = make_map_2d(static_cast<const uint8_t*>(xq.data_ptr()) + static_cast<int64_t>(b) * MT * H, H, MT, H, 128, MT);
+      h[NL * NPH + b] =
+          make_map_2d(static_cast<const uint8_t*>(xq.data_ptr()) + static_cast<int64_t>(b) * MT * H, H, MT, H, 128, MT);
     RuntimeDeviceCheck(cudaMemcpy(maps.data_ptr(), h, sizeof(h), cudaMemcpyHostToDevice));
   }
 
   // blob: host uint8 [sizeof(Params)]; ptrs: host int64 (layout below); ivals: host int64; fvals: host float32;
   // plan: host int16 [4*NCL*2*MAXT_PH + 4*NCL*2 + NCL]
-  static void fill(tvm::ffi::TensorView blob, tvm::ffi::TensorView ptrs, tvm::ffi::TensorView ivals,
-                   tvm::ffi::TensorView fvals, tvm::ffi::TensorView plan) {
+  static void fill(
+      tvm::ffi::TensorView blob,
+      tvm::ffi::TensorView ptrs,
+      tvm::ffi::TensorView ivals,
+      tvm::ffi::TensorView fvals,
+      tvm::ffi::TensorView plan) {
     using namespace host;
     using namespace dflash_mega;
     RuntimeCheck(blob.numel() >= static_cast<int64_t>(sizeof(Params)));
@@ -2156,7 +2397,8 @@ struct DFlashMega {
     std::memset(&prm, 0, sizeof(prm));
     for (int l = 0; l < NL; ++l) {
       const int64_t* q = pp + l * NPL;
-      for (int ph = 0; ph < 4; ++ph) prm.L[l].sw[ph] = reinterpret_cast<const float*>(q[ph]);
+      for (int ph = 0; ph < 4; ++ph)
+        prm.L[l].sw[ph] = reinterpret_cast<const float*>(q[ph]);
       q += 4;
       prm.L[l].ln_in = reinterpret_cast<const __nv_bfloat16*>(q[0]);
       prm.L[l].ln_post = reinterpret_cast<const __nv_bfloat16*>(q[1]);
@@ -2165,7 +2407,8 @@ struct DFlashMega {
       prm.L[l].sinks = reinterpret_cast<const void*>(q[4]);
       prm.L[l].kc = reinterpret_cast<__nv_bfloat16*>(q[5]);
       prm.L[l].vc = reinterpret_cast<__nv_bfloat16*>(q[6]);
-      for (int i = 0; i < 4; ++i) prm.L[l].cbase[i >> 1][i & 1] = reinterpret_cast<const __nv_bfloat16*>(q[7 + i]);
+      for (int i = 0; i < 4; ++i)
+        prm.L[l].cbase[i >> 1][i & 1] = reinterpret_cast<const __nv_bfloat16*>(q[7 + i]);
     }
     const int64_t* q = pp + NL * NPL;
     prm.maps = reinterpret_cast<const CUtensorMap*>(q[0]);
@@ -2182,7 +2425,8 @@ struct DFlashMega {
     prm.stamps = reinterpret_cast<unsigned long long*>(q[11]);
     prm.hn = reinterpret_cast<__nv_bfloat16*>(q[12]);
     prm.coef = reinterpret_cast<__nv_bfloat16*>(q[13]);
-    for (int i = 0; i < R; ++i) prm.peer[i] = reinterpret_cast<uint8_t*>(q[14 + i]);
+    for (int i = 0; i < R; ++i)
+      prm.peer[i] = reinterpret_cast<uint8_t*>(q[14 + i]);
     prm.rank = static_cast<int>(iv[0]);
     prm.cs_stride = iv[1];
     prm.cs_f32 = static_cast<int>(iv[2]);
@@ -2205,8 +2449,9 @@ struct DFlashMega {
       const int ns = prm.plan.nslot[cc];
       const int greg = cc < NATT ? GREG_ATT : GREG_FULL;
       const int kv = cc < NATT ? KV_BYTES : 0;
-      RuntimeCheck(ns >= 2 && ns <= MAX_SLOT && MISC_BYTES + ns * SLAB + greg + kv <= SMEM_BYTES,
-                   "dflash_mega: ring does not fit");
+      RuntimeCheck(
+          ns >= 2 && ns <= MAX_SLOT && MISC_BYTES + ns * SLAB + greg + kv <= SMEM_BYTES,
+          "dflash_mega: ring does not fit");
       for (int ph = 0; ph < 4; ++ph)
         for (int g = 0; g < 2; ++g) {
           const int n = prm.plan.n[ph][cc][g];
@@ -2216,17 +2461,23 @@ struct DFlashMega {
     std::memcpy(blob.data_ptr(), &prm, sizeof(prm));
   }
 
-  static void run(tvm::ffi::TensorView blob, tvm::ffi::TensorView hidden, tvm::ffi::TensorView out,
-                  tvm::ffi::TensorView positions, tvm::ffi::TensorView seqlens, tvm::ffi::TensorView page_table,
-                  tvm::ffi::TensorView loc) {
+  static void
+  run(tvm::ffi::TensorView blob,
+      tvm::ffi::TensorView hidden,
+      tvm::ffi::TensorView out,
+      tvm::ffi::TensorView positions,
+      tvm::ffi::TensorView seqlens,
+      tvm::ffi::TensorView page_table,
+      tvm::ffi::TensorView loc) {
     using namespace host;
     using namespace dflash_mega;
     RuntimeCheck(blob.numel() >= static_cast<int64_t>(sizeof(Params)));
     RuntimeCheck(hidden.ndim() == 2 && hidden.size(0) == MT && hidden.size(1) == H && hidden.stride(0) == H);
     RuntimeCheck(out.ndim() == 2 && out.size(0) == MT && out.size(1) == H && out.stride(0) == H);
     RuntimeCheck(positions.numel() == MT && loc.numel() == MT && seqlens.numel() == NREQ);
-    RuntimeCheck(seqlens.dtype().bits == 32 && page_table.dtype().bits == 32 && page_table.ndim() == 2 &&
-                 page_table.size(0) == NREQ && page_table.stride(1) == 1);
+    RuntimeCheck(
+        seqlens.dtype().bits == 32 && page_table.dtype().bits == 32 && page_table.ndim() == 2 &&
+        page_table.size(0) == NREQ && page_table.stride(1) == 1);
     Params prm;
     std::memcpy(&prm, blob.data_ptr(), sizeof(prm));
     prm.hidden = static_cast<__nv_bfloat16*>(hidden.data_ptr());

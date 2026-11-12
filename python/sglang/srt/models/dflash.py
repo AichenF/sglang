@@ -74,7 +74,9 @@ _TIE_BREAK_SMALL = 1
 def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
     # The selector's largest single cost: it reads the whole logits tensor.
     if _flashinfer_top_k is not None:
-        return _flashinfer_top_k(scores, k, sorted=True, deterministic=True, tie_break=_TIE_BREAK_SMALL)
+        return _flashinfer_top_k(
+            scores, k, sorted=True, deterministic=True, tie_break=_TIE_BREAK_SMALL
+        )
     return torch.topk(scores, k, dim=-1)
 
 
@@ -170,7 +172,14 @@ def candidate_topk(
         assert gatherer is not None and not with_partition and not tp
         rows, group, gstride, goff = row_map
         packed = selector_topk_pack(
-            logits, k, num_org, int(lm_head.shard_indices.org_vocab_start_index), rows, group, gstride, goff
+            logits,
+            k,
+            num_org,
+            int(lm_head.shard_indices.org_vocab_start_index),
+            rows,
+            group,
+            gstride,
+            goff,
         )
         gathered = gatherer(packed.view(torch.bfloat16)).view(torch.float32)
         gathered = gathered.view(rows, -1, 2, k)
@@ -186,7 +195,11 @@ def candidate_topk(
     if tp:
         return ids.long(), vals, lse
     id_offset = int(lm_head.shard_indices.org_vocab_start_index)
-    if gatherer is not None and lse is None and int(lm_head.org_vocab_size) <= (1 << 24):
+    if (
+        gatherer is not None
+        and lse is None
+        and int(lm_head.org_vocab_size) <= (1 << 24)
+    ):
         # one gather of fp32 [vals | ids] rows (ids < 2^24 are exact in fp32)
         rows = vals.shape[0]
         packed = pack_candidates(vals, ids, id_offset)
@@ -242,9 +255,7 @@ def _get_dflash_layer_attention_params(
             if "DFlash2DraftModel" in architectures
             else AttentionType.DECODER
         )
-        return sliding_window_size, _get_dflash_attention_type(
-            config, default=default
-        )
+        return sliding_window_size, _get_dflash_attention_type(config, default=default)
     raise ValueError(
         f"Unsupported DFLASH draft layer type. layer_types[{layer_id}]={layer_type!r}."
     )
@@ -890,7 +901,9 @@ class DFlashDraftModel(nn.Module):
                     and int(self.config.hidden_size) == 6144
                     and get_parallel().tp_size == 8
                 ):
-                    from sglang.kernels.ops.communication.dflash_tp_fused import get_state
+                    from sglang.kernels.ops.communication.dflash_tp_fused import (
+                        get_state,
+                    )
 
                     st = get_state() or False
             except Exception:
@@ -909,7 +922,9 @@ class DFlashDraftModel(nn.Module):
         out = torch.empty(
             local.shape[0], 6144, dtype=torch.bfloat16, device=local.device
         )
-        st.ag_norm(local, self.hidden_norm.weight, self.hidden_norm.variance_epsilon, out)
+        st.ag_norm(
+            local, self.hidden_norm.weight, self.hidden_norm.variance_epsilon, out
+        )
         return out
 
     @torch.no_grad()
@@ -941,10 +956,14 @@ class DFlashDraftModel(nn.Module):
             from sglang.srt.models.dflash_tp_fast import DFlashTPFast
 
             self._tp_fast = DFlashTPFast.try_create(self)
-        if getattr(self, "_tp_fast", None) is not None and self._tp_fast.applicable(hidden_states):
+        if getattr(self, "_tp_fast", None) is not None and self._tp_fast.applicable(
+            hidden_states
+        ):
             fused = self._tp_fast.forward(positions, hidden_states, forward_batch)
             if fused is not None:
-                return LogitsProcessorOutput(next_token_logits=None, hidden_states=fused)
+                return LogitsProcessorOutput(
+                    next_token_logits=None, hidden_states=fused
+                )
 
         for layer in self.layers:
             hidden_states, residual = layer(
@@ -1404,12 +1423,16 @@ class DFlash2DraftModel(DFlashDraftModel):
             and full_hidden.shape[0] == bs * (slots + 1)
             and full_hidden.is_contiguous()
             and is_dense_head_weight(getattr(head, "weight", None))
-            and not should_apply_lm_head_quant_method(head, getattr(head, "quant_method", None))
+            and not should_apply_lm_head_quant_method(
+                head, getattr(head, "quant_method", None)
+            )
             and getattr(head.weight, "dtype", None) == torch.bfloat16
             and int(head.shard_indices.num_org_elements) <= 4 * 8192
         )
 
-    def compute_lattice(self, hidden, anchor_token_ids, ids_out=None, full_hidden=None, side_stream=None):
+    def compute_lattice(
+        self, hidden, anchor_token_ids, ids_out=None, full_hidden=None, side_stream=None
+    ):
         """compute_candidates + build_lattice in one kernel after the packed gather, else None.
 
         full_hidden: the [bs * (slots + 1), H] draft output `hidden` ([bs, slots, H]) is a view of (anchor row first):
@@ -1428,7 +1451,9 @@ class DFlash2DraftModel(DFlashDraftModel):
         ):
             return None
         bs, slots, _ = hidden.shape
-        if full_hidden is not None and self._selector_topk_ok(full_hidden, bs, slots, k):
+        if full_hidden is not None and self._selector_topk_ok(
+            full_hidden, bs, slots, k
+        ):
             flat, hoff = full_hidden, 1
             row_map = (bs * slots, slots, slots + 1, 1)
         else:
@@ -1447,8 +1472,13 @@ class DFlash2DraftModel(DFlashDraftModel):
                 projected.append(selector.hidden_projection(flat))
 
         gathered = candidate_topk(
-            flat, self.lm_head, k, gatherer=self.candidate_gatherer, rows_only=True,
-            row_map=row_map, after_logits=project if side_stream is not None else None,
+            flat,
+            self.lm_head,
+            k,
+            gatherer=self.candidate_gatherer,
+            rows_only=True,
+            row_map=row_map,
+            after_logits=project if side_stream is not None else None,
         )
         if projected:
             torch.cuda.current_stream().wait_stream(side_stream)
@@ -1457,7 +1487,9 @@ class DFlash2DraftModel(DFlashDraftModel):
             projected.append(selector.hidden_projection(flat))
         proj = projected[0].view(bs, slots + hoff, -1)
         if ids_out is None:
-            ids_out = torch.empty((bs * slots, k), dtype=torch.int64, device=hidden.device)
+            ids_out = torch.empty(
+                (bs * slots, k), dtype=torch.int64, device=hidden.device
+            )
         ids = ids_out.view(bs, slots, k)
         scores = selector_lattice_triton(
             gathered,

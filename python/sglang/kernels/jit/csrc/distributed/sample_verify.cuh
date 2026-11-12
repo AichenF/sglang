@@ -21,8 +21,8 @@
 // order) scans its row and pushes the token id to every rank.
 //
 // Candidate-selector drafts (sel_ids != nullptr): the draft token of row j comes from a sparse q over K candidates. Row
-// j accepts iff coin * q(x) < p(x) and the bonus is drawn from max(p - q, 0): the candidates' owners send their logits in
-// round 1 and every rank subtracts min(p_c, q_c) from the owner's kept mass.
+// j accepts iff coin * q(x) < p(x) and the bonus is drawn from max(p - q, 0): the candidates' owners send their logits
+// in round 1 and every rank subtracts min(p_c, q_c) from the owner's kept mass.
 //
 // Output: predict [n] int64 in the greedy-verify layout (predict[b, j] = candidate j+1 for accepted rows, the bonus
 // at the first rejected row, -1 after it), consumed by the unchanged greedy accept kernel. Greedy requests (mode 0)
@@ -30,14 +30,16 @@
 // skip_greedy: when no request of the batch samples, every CTA returns at once (no output, no counter update); the
 // worker captures the kernel next to the in-graph greedy argmax, which then serves the batch.
 //
-// Uniforms: Philox4x32-10(seed, (call, request, k)) with the per-row call counter (identical on every rank), or explicit
-// coins (level coin [b, j] at b * coin_ld + j, final coin [b]). Transport as in dflash_tp_fused: pushes into the peers'
-// CUDA-IPC receive buffers,
-// every 8-byte half {payload, tag} with tag = (call + 1) | 2^30, two phases alternated by the per-row call counter.
-// The buffer addresses come from a device table, so a captured graph does not fix them (the worker allocates the
-// receive buffers after the KV cache and graph capture; until then it stages every batch greedy).
+// Uniforms: Philox4x32-10(seed, (call, request, k)) with the per-row call counter (identical on every rank), or
+// explicit coins (level coin [b, j] at b * coin_ld + j, final coin [b]). Transport as in dflash_tp_fused: pushes into
+// the peers' CUDA-IPC receive buffers, every 8-byte half {payload, tag} with tag = (call + 1) | 2^30, two phases
+// alternated by the per-row call counter. The buffer addresses come from a device table, so a captured graph does not
+// fix them (the worker allocates the receive buffers after the KV cache and graph capture; until then it stages every
+// batch greedy).
 #pragma once
 
+// Preserve the include initialization order used by the TP8 validation.
+// clang-format off
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -49,24 +51,26 @@
 
 #include <climits>
 #include <cstdint>
+// clang-format on
 
 namespace sglang {
 namespace dflash_sv {
 
-constexpr int R = 8;          // TP ranks
-constexpr int MAXN = 64;      // rows (requests x block)
-constexpr int MAXG = 16;      // block size
+constexpr int R = 8;      // TP ranks
+constexpr int MAXN = 64;  // rows (requests x block)
+constexpr int MAXG = 16;  // block size
 constexpr int THREADS = 512;
 constexpr int NW = THREADS / 32;
-constexpr int NB = 256;       // radix bins (one key byte)
-constexpr int NKEY = 65536;   // bf16 keys; count table = NKEY / 2 words, word w = 16-bit counts of keys w and w + 32768
-                              // (a negative and a positive value: adjacent keys never share a word -> fewer atomic conflicts)
-constexpr int HDR_V = 3;      // 16-B header vectors of a round-1 message
+constexpr int NB = 256;  // radix bins (one key byte)
+constexpr int NKEY =
+    65536;  // bf16 keys; count table = NKEY / 2 words, word w = 16-bit counts of keys w and w + 32768
+            // (a negative and a positive value: adjacent keys never share a word -> fewer atomic conflicts)
+constexpr int HDR_V = 3;        // 16-B header vectors of a round-1 message
 constexpr int HIST_V = NB / 2;  // 16-B vectors of a histogram {h, tag, h, tag}
 constexpr int R1_V = HDR_V + HIST_V;
-constexpr int SEL_K = 16;     // selector candidates per position
+constexpr int SEL_K = 16;         // selector candidates per position
 constexpr int SEL_V = SEL_K / 4;  // 16-B vectors of the owned candidate logits
-constexpr int COIN_V = 1;      // selector rows: rank 0's level and final coins
+constexpr int COIN_V = 1;         // selector rows: rank 0's level and final coins
 constexpr int64_t R1_SLOT = (R1_V + SEL_V + COIN_V) * 16;
 constexpr int64_t R2_SLOT = HIST_V * 16;
 constexpr int64_t R3_SLOT = 16;
@@ -77,34 +81,34 @@ constexpr int64_t R2_BYTES = 2LL * MAXN * R * R2_SLOT;
 constexpr int64_t R3_OFF = R2_OFF + R2_BYTES;
 constexpr int64_t R3_BYTES = 2LL * MAXN * R3_SLOT;
 constexpr int64_t BUF_BYTES = R3_OFF + R3_BYTES;
-constexpr int DBG = 32;       // floats per row in the optional debug output
+constexpr int DBG = 32;  // floats per row in the optional debug output
 
 struct SVParams {
   const __nv_bfloat16* logits;  // [n, Vs] this rank's shard, row stride ld (elements)
   int64_t ld;
   int Vs;
   int vocab_start;
-  int vocab;                    // full vocabulary (degenerate-sample fallback id vocab - 1)
-  const int64_t* cand;          // [n] verify input ids, block-major: cand[b*G] = bonus, cand[b*G + 1 + j] = draft j
-  const float* temp;            // [>= n/G] temperature (mode 1)
-  const float* top_p;           // [>= n/G] top-p (mode 1; >= 1 -> no top-p)
-  const int* mode;              // [>= n/G] 0 greedy argmax, 1 temperature/top-p sampling
-  int64_t* out;                 // [n] predict
-  int* calls;                   // [MAXN] per-row call counters
-  unsigned long long* flags;    // [MAXN] per-row accept flags {tag << 32 | accept} (this GPU)
+  int vocab;                        // full vocabulary (degenerate-sample fallback id vocab - 1)
+  const int64_t* cand;              // [n] verify input ids, block-major: cand[b*G] = bonus, cand[b*G + 1 + j] = draft j
+  const float* temp;                // [>= n/G] temperature (mode 1)
+  const float* top_p;               // [>= n/G] top-p (mode 1; >= 1 -> no top-p)
+  const int* mode;                  // [>= n/G] 0 greedy argmax, 1 temperature/top-p sampling
+  int64_t* out;                     // [n] predict
+  int* calls;                       // [MAXN] per-row call counters
+  unsigned long long* flags;        // [MAXN] per-row accept flags {tag << 32 | accept} (this GPU)
   const unsigned long long* peers;  // [R] device table: every rank's receive buffer (this rank's own at [rank])
   int rank;
   int n;
   int G;
   unsigned long long seed;
-  const float* coins;           // optional level coins [b * coin_ld + j]; nullptr -> Philox
+  const float* coins;  // optional level coins [b * coin_ld + j]; nullptr -> Philox
   int coin_ld;
-  const float* coins_final;     // [b]
-  float* dbg;                   // optional [n, DBG]
-  unsigned long long* stamps;   // optional [MAXN, 16] %globaltimer per phase (diagnostics)
-  int skip_greedy;              // 1: return at once when every request is greedy (mode 0)
-  const int64_t* sel_ids;       // optional [n/G, G - 1, SEL_K] selector candidate ids
-  const float* sel_q;           // [n/G, G - 1, SEL_K] q over sel_ids
+  const float* coins_final;    // [b]
+  float* dbg;                  // optional [n, DBG]
+  unsigned long long* stamps;  // optional [MAXN, 16] %globaltimer per phase (diagnostics)
+  int skip_greedy;             // 1: return at once when every request is greedy (mode 0)
+  const int64_t* sel_ids;      // optional [n/G, G - 1, SEL_K] selector candidate ids
+  const float* sel_q;          // [n/G, G - 1, SEL_K] q over sel_ids
 };
 
 __device__ __forceinline__ unsigned long long gtime() {
@@ -112,14 +116,20 @@ __device__ __forceinline__ unsigned long long gtime() {
   asm volatile("mov.u64 %0, %globaltimer;" : "=l"(v));
   return v;
 }
-#define SV_STAMP(k) do { if (p.stamps != nullptr && threadIdx.x == 0) p.stamps[blockIdx.x * 16 + (k)] = gtime(); } while (0)
+#define SV_STAMP(k)                                                                         \
+  do {                                                                                      \
+    if (p.stamps != nullptr && threadIdx.x == 0) p.stamps[blockIdx.x * 16 + (k)] = gtime(); \
+  } while (0)
 
 __device__ __forceinline__ void st_v4(void* p, uint4 v) {
   asm volatile("st.global.v4.u32 [%0], {%1, %2, %3, %4};" ::"l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
 }
 __device__ __forceinline__ uint4 ld_vol_v4(const void* p) {
   uint4 v;
-  asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p) : "memory");
+  asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+               : "l"(p)
+               : "memory");
   return v;
 }
 __device__ __forceinline__ void st_vol_u64(unsigned long long* p, unsigned long long v) {
@@ -137,9 +147,15 @@ __device__ __forceinline__ uint4 poll_tag(const void* p, uint32_t tag) {
   } while (d.y != tag || d.w != tag);
   return d;
 }
-__device__ __forceinline__ float bf_lo(uint32_t w) { return __uint_as_float(w << 16); }
-__device__ __forceinline__ float bf_hi(uint32_t w) { return __uint_as_float(w & 0xFFFF0000u); }
-__device__ __forceinline__ float bf16_bits_to_f(uint32_t raw) { return __uint_as_float(raw << 16); }
+__device__ __forceinline__ float bf_lo(uint32_t w) {
+  return __uint_as_float(w << 16);
+}
+__device__ __forceinline__ float bf_hi(uint32_t w) {
+  return __uint_as_float(w & 0xFFFF0000u);
+}
+__device__ __forceinline__ float bf16_bits_to_f(uint32_t raw) {
+  return __uint_as_float(raw << 16);
+}
 
 // torch.argmax order on fp32 values: NaN is the maximum, -0.0 == +0.0
 __device__ __forceinline__ int ordered_key(float v) {
@@ -175,16 +191,21 @@ __device__ __forceinline__ uint4 philox4x32(uint32_t k0, uint32_t k1, uint4 c) {
   return c;
 }
 // x / T exactly as torch's logits / temperature (IEEE division); T == 1 is the identity
-__device__ __forceinline__ float scaled(float x, float T, bool t1) { return t1 ? x : __fdiv_rn(x, T); }
+__device__ __forceinline__ float scaled(float x, float T, bool t1) {
+  return t1 ? x : __fdiv_rn(x, T);
+}
 
-__device__ __forceinline__ float u01(uint32_t x) { return static_cast<float>(x >> 8) * (1.0f / 16777216.0f); }
+__device__ __forceinline__ float u01(uint32_t x) {
+  return static_cast<float>(x >> 8) * (1.0f / 16777216.0f);
+}
 
 // coin k of request b (k < G: level coins, k == MAXG: the final-sampling coin)
 __device__ __forceinline__ float coin(const SVParams& p, int call, int b, int k) {
   if (p.coins != nullptr) return k < MAXG ? p.coins[b * p.coin_ld + k] : p.coins_final[b];
-  const uint4 r = philox4x32(static_cast<uint32_t>(p.seed), static_cast<uint32_t>(p.seed >> 32),
-                             make_uint4(static_cast<uint32_t>(call), static_cast<uint32_t>(b),
-                                        static_cast<uint32_t>(k >> 2), 0x5A3C96E1u));
+  const uint4 r = philox4x32(
+      static_cast<uint32_t>(p.seed),
+      static_cast<uint32_t>(p.seed >> 32),
+      make_uint4(static_cast<uint32_t>(call), static_cast<uint32_t>(b), static_cast<uint32_t>(k >> 2), 0x5A3C96E1u));
   const int c = k & 3;
   return u01(c == 0 ? r.x : c == 1 ? r.y : c == 2 ? r.z : r.w);
 }
@@ -192,12 +213,14 @@ __device__ __forceinline__ float coin(const SVParams& p, int call, int b, int k)
 // block-wide sum in a fixed order (deterministic); every thread gets the result
 __device__ __forceinline__ float block_sum(float v, float* s_red) {
 #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+  for (int o = 16; o > 0; o >>= 1)
+    v += __shfl_xor_sync(0xffffffffu, v, o);
   if ((threadIdx.x & 31) == 0) s_red[threadIdx.x >> 5] = v;
   __syncthreads();
   float t = 0.f;
 #pragma unroll
-  for (int w = 0; w < NW; ++w) t += s_red[w];
+  for (int w = 0; w < NW; ++w)
+    t += s_red[w];
   __syncthreads();
   return t;
 }
@@ -254,7 +277,7 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
   extern __shared__ __align__(16) uint8_t smem[];
   __shared__ float s_red[NW];
   __shared__ int s_wk[NW], s_wi[NW];
-  __shared__ uint32_t s_hdr[R][6];   // akey, aidx, m, Z, xc, -
+  __shared__ uint32_t s_hdr[R][6];  // akey, aidx, m, Z, xc, -
   __shared__ float s_scale[R], s_skr[R], s_w[R];
   __shared__ int s_i[8];
   __shared__ float s_f[8];
@@ -266,9 +289,9 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
   __shared__ uint32_t s_selmask;             // bit k: candidate k is owned here
   __shared__ int s_seli[SEL_K];              // candidate ids (-1: invalid or repeated)
   __shared__ float s_selq[SEL_K];
-  __shared__ float s_coin[2];                // rank 0's level and final coins (selector rows)
-  __shared__ float s_sele[SEL_K];            // kept mass relative to M (0 outside the top-p set)
-  __shared__ int s_selown[SEL_K];            // owner rank of a kept candidate, else -1
+  __shared__ float s_coin[2];      // rank 0's level and final coins (selector rows)
+  __shared__ float s_sele[SEL_K];  // kept mass relative to M (0 outside the top-p set)
+  __shared__ int s_selown[SEL_K];  // owner rank of a kept candidate, else -1
 
   const int t = blockIdx.x;
   const int tid = threadIdx.x;
@@ -280,7 +303,8 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
   }
   if (p.skip_greedy) {  // all-greedy batch: the in-graph argmax serves it (same staged modes on every rank)
     int any = 0;
-    for (int i = 0; i < p.n / p.G; ++i) any |= p.mode[i];
+    for (int i = 0; i < p.n / p.G; ++i)
+      any |= p.mode[i];
     if (any == 0) {
       device::PDLTriggerSecondary<kUsePDL>();
       return;
@@ -303,8 +327,8 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
   uint16_t* srow = reinterpret_cast<uint16_t*>(smem);
   uint32_t* cnt = reinterpret_cast<uint32_t*>(smem + rowbytes);  // [NKEY / 2] packed 16-bit key counts
   float* rh = reinterpret_cast<float*>(cnt + NKEY / 2);          // [R][NB] round-1 histograms by source rank
-  float* rh2 = rh + R * NB;                                       // [R][NB] round-2 histograms
-  float* H = rh2 + R * NB;                                        // [NB]
+  float* rh2 = rh + R * NB;                                      // [R][NB] round-2 histograms
+  float* H = rh2 + R * NB;                                       // [NB]
   __shared__ uint8_t* s_peer[R];
   if (tid < R) s_peer[tid] = reinterpret_cast<uint8_t*>(p.peers[tid]);  // read after the argmax reduce barrier
 
@@ -321,7 +345,8 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
       wv[u] = c8 < nv ? __ldcg(row4 + c8) : make_uint4(0u, 0u, 0u, 0u);
     }
     if (samp) {
-      for (int i = tid; i < NKEY / 8; i += THREADS) reinterpret_cast<uint4*>(cnt)[i] = make_uint4(0u, 0u, 0u, 0u);
+      for (int i = tid; i < NKEY / 8; i += THREADS)
+        reinterpret_cast<uint4*>(cnt)[i] = make_uint4(0u, 0u, 0u, 0u);
       __syncthreads();
     }
 #pragma unroll
@@ -341,8 +366,14 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
           const int k0 = ordered_key(bf_lo(ws[q])), k1 = ordered_key(bf_hi(ws[q]));
-          if (k0 > bk) { bk = k0; bi = c8 * 8 + 2 * q; }
-          if (k1 > bk) { bk = k1; bi = c8 * 8 + 2 * q + 1; }
+          if (k0 > bk) {
+            bk = k0;
+            bi = c8 * 8 + 2 * q;
+          }
+          if (k1 > bk) {
+            bk = k1;
+            bi = c8 * 8 + 2 * q + 1;
+          }
         }
       }
     }
@@ -361,8 +392,14 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
         const int k0 = ordered_key(bf_lo(ws[q])), k1 = ordered_key(bf_hi(ws[q]));
-        if (k0 > bk) { bk = k0; bi = c8 * 8 + 2 * q; }
-        if (k1 > bk) { bk = k1; bi = c8 * 8 + 2 * q + 1; }
+        if (k0 > bk) {
+          bk = k0;
+          bi = c8 * 8 + 2 * q;
+        }
+        if (k1 > bk) {
+          bk = k1;
+          bi = c8 * 8 + 2 * q + 1;
+        }
       }
     }
   }
@@ -370,16 +407,25 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
   for (int o = 16; o > 0; o >>= 1) {
     const int ok = __shfl_xor_sync(0xffffffffu, bk, o);
     const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
-    if (ok > bk || (ok == bk && oi < bi)) { bk = ok; bi = oi; }
+    if (ok > bk || (ok == bk && oi < bi)) {
+      bk = ok;
+      bi = oi;
+    }
   }
-  if (lane == 0) { s_wk[warp] = bk; s_wi[warp] = bi; }
+  if (lane == 0) {
+    s_wk[warp] = bk;
+    s_wi[warp] = bi;
+  }
   __syncthreads();
   uint8_t* const mybuf = s_peer[p.rank];
   {
     int k = s_wk[0], i = s_wi[0];
 #pragma unroll
     for (int w = 1; w < NW; ++w)
-      if (s_wk[w] > k || (s_wk[w] == k && s_wi[w] < i)) { k = s_wk[w]; i = s_wi[w]; }
+      if (s_wk[w] > k || (s_wk[w] == k && s_wi[w] < i)) {
+        k = s_wk[w];
+        i = s_wi[w];
+      }
     bk = k;
     bi = i;
   }
@@ -392,9 +438,9 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
   int cand_id = -1;
   if (samp) {
     m_loc = scaled(key_to_float(bk), T, t1);
-    // masses per high-byte bin from the count table: iteration k, thread tid reads words 4 (tid + 512 k) .. + 3, i.e. warp
-    // w covers 128 consecutive low keys (half of bin (w + 16 k) / 2) and the same half of bin + 128 in the high counts;
-    // per bin the two warps' partials are added in a fixed order (deterministic)
+    // masses per high-byte bin from the count table: iteration k, thread tid reads words 4 (tid + 512 k) .. + 3, i.e.
+    // warp w covers 128 consecutive low keys (half of bin (w + 16 k) / 2) and the same half of bin + 128 in the high
+    // counts; per bin the two warps' partials are added in a fixed order (deterministic)
     static_assert(THREADS == 512 && NKEY / 2 == THREADS * 4 * 16, "key ownership");
     float* bpart = rh2;  // [NB][2] scratch (round-2 buffers are not used yet)
     const uint4* cnt4 = reinterpret_cast<const uint4*>(cnt);
@@ -471,9 +517,12 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
       if (v >= nsel) {
         const float lvl = j < G - 1 ? coin(p, call, b, j) : 1.f;
         val = make_uint4(__float_as_uint(lvl), tag, __float_as_uint(coin(p, call, b, MAXG)), tag);
-      } else if (v == 0) val = make_uint4(akey, tag, aidx, tag);
-      else if (v == 1) val = make_uint4(__float_as_uint(m_loc), tag, __float_as_uint(z_loc), tag);
-      else if (v == 2) val = make_uint4(xc_info, tag, sel ? s_selmask : 0u, tag);
+      } else if (v == 0)
+        val = make_uint4(akey, tag, aidx, tag);
+      else if (v == 1)
+        val = make_uint4(__float_as_uint(m_loc), tag, __float_as_uint(z_loc), tag);
+      else if (v == 2)
+        val = make_uint4(xc_info, tag, sel ? s_selmask : 0u, tag);
       else if (v < R1_V)
         val = make_uint4(__float_as_uint(H[2 * (v - HDR_V)]), tag, __float_as_uint(H[2 * (v - HDR_V) + 1]), tag);
       else {
@@ -486,14 +535,29 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
     for (int idx = tid; idx < R * nvec; idx += THREADS) {
       const int s = idx / nvec, v = idx - s * nvec;
       const int slot_v = v < nsel ? v : R1_V + SEL_V;
-      const uint4 d = poll_tag(mybuf + R1_OFF + ((static_cast<int64_t>(phase) * MAXN + t) * R + s) * R1_SLOT + slot_v * 16, tag);
+      const uint4 d =
+          poll_tag(mybuf + R1_OFF + ((static_cast<int64_t>(phase) * MAXN + t) * R + s) * R1_SLOT + slot_v * 16, tag);
       if (v >= nsel) {
-        if (s == 0) { s_coin[0] = __uint_as_float(d.x); s_coin[1] = __uint_as_float(d.z); }
-      } else if (v == 0) { s_hdr[s][0] = d.x; s_hdr[s][1] = d.z; }
-      else if (v == 1) { s_hdr[s][2] = d.x; s_hdr[s][3] = d.z; }
-      else if (v == 2) { s_hdr[s][4] = d.x; s_hdr[s][5] = d.z; }
-      else if (v < R1_V) { rh[s * NB + 2 * (v - HDR_V)] = __uint_as_float(d.x); rh[s * NB + 2 * (v - HDR_V) + 1] = __uint_as_float(d.z); }
-      else { s_selw[s][2 * (v - R1_V)] = d.x; s_selw[s][2 * (v - R1_V) + 1] = d.z; }
+        if (s == 0) {
+          s_coin[0] = __uint_as_float(d.x);
+          s_coin[1] = __uint_as_float(d.z);
+        }
+      } else if (v == 0) {
+        s_hdr[s][0] = d.x;
+        s_hdr[s][1] = d.z;
+      } else if (v == 1) {
+        s_hdr[s][2] = d.x;
+        s_hdr[s][3] = d.z;
+      } else if (v == 2) {
+        s_hdr[s][4] = d.x;
+        s_hdr[s][5] = d.z;
+      } else if (v < R1_V) {
+        rh[s * NB + 2 * (v - HDR_V)] = __uint_as_float(d.x);
+        rh[s * NB + 2 * (v - HDR_V) + 1] = __uint_as_float(d.z);
+      } else {
+        s_selw[s][2 * (v - R1_V)] = d.x;
+        s_selw[s][2 * (v - R1_V) + 1] = d.z;
+      }
     }
     __syncthreads();
     SV_STAMP(4);
@@ -505,7 +569,10 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
 #pragma unroll
       for (int s = 1; s < R; ++s) {
         const int ks = static_cast<int>(s_hdr[s][0]), is = static_cast<int>(s_hdr[s][1]);
-        if (ks > k || (ks == k && is < i)) { k = ks; i = is; }
+        if (ks > k || (ks == k && is < i)) {
+          k = ks;
+          i = is;
+        }
       }
       p.out[t] = static_cast<int64_t>(i);
       p.calls[t] = call + 1;
@@ -517,16 +584,19 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
   // ---- 4) merge round 1: M, Z, global high-byte histogram ----
   float M = __uint_as_float(s_hdr[0][2]);
 #pragma unroll
-  for (int s = 1; s < R; ++s) M = fmaxf(M, __uint_as_float(s_hdr[s][2]));
+  for (int s = 1; s < R; ++s)
+    M = fmaxf(M, __uint_as_float(s_hdr[s][2]));
   if (tid < R) s_scale[tid] = expf(__uint_as_float(s_hdr[tid][2]) - M);
   __syncthreads();
   float Z = 0.f;
 #pragma unroll
-  for (int s = 0; s < R; ++s) Z += __uint_as_float(s_hdr[s][3]) * s_scale[s];
+  for (int s = 0; s < R; ++s)
+    Z += __uint_as_float(s_hdr[s][3]) * s_scale[s];
   for (int k = tid; k < NB; k += THREADS) {
     float h = 0.f;
 #pragma unroll
-    for (int s = 0; s < R; ++s) h += rh[s * NB + k] * s_scale[s];
+    for (int s = 0; s < R; ++s)
+      h += rh[s * NB + k] * s_scale[s];
     H[k] = h;
   }
   __syncthreads();
@@ -549,12 +619,14 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
     __syncthreads();
     for (int idx = tid; idx < R * HIST_V; idx += THREADS) {
       const int d = idx / HIST_V, v = idx - d * HIST_V;
-      st_v4(s_peer[d] + R2_OFF + ((static_cast<int64_t>(phase) * MAXN + t) * R + p.rank) * R2_SLOT + v * 16,
-            make_uint4(__float_as_uint(H[2 * v]), tag, __float_as_uint(H[2 * v + 1]), tag));
+      st_v4(
+          s_peer[d] + R2_OFF + ((static_cast<int64_t>(phase) * MAXN + t) * R + p.rank) * R2_SLOT + v * 16,
+          make_uint4(__float_as_uint(H[2 * v]), tag, __float_as_uint(H[2 * v + 1]), tag));
     }
     for (int idx = tid; idx < R * HIST_V; idx += THREADS) {
       const int s = idx / HIST_V, v = idx - s * HIST_V;
-      const uint4 d = poll_tag(mybuf + R2_OFF + ((static_cast<int64_t>(phase) * MAXN + t) * R + s) * R2_SLOT + v * 16, tag);
+      const uint4 d =
+          poll_tag(mybuf + R2_OFF + ((static_cast<int64_t>(phase) * MAXN + t) * R + s) * R2_SLOT + v * 16, tag);
       rh2[s * NB + 2 * v] = __uint_as_float(d.x);
       rh2[s * NB + 2 * v + 1] = __uint_as_float(d.z);
     }
@@ -563,7 +635,8 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
     for (int k = tid; k < NB; k += THREADS) {
       float h = 0.f;
 #pragma unroll
-      for (int s = 0; s < R; ++s) h += rh2[s * NB + k] * s_scale[s];
+      for (int s = 0; s < R; ++s)
+        h += rh2[s * NB + k] * s_scale[s];
       H[k] = h;
     }
     __syncthreads();
@@ -578,7 +651,8 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
         if (k >= d2) a += rh2[warp * NB + k];
       }
 #pragma unroll
-      for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+      for (int o = 16; o > 0; o >>= 1)
+        a += __shfl_xor_sync(0xffffffffu, a, o);
       if (lane == 0) s_skr[warp] = a * s_scale[warp];
     }
     keystar = (static_cast<uint32_t>(d1) << 8) | static_cast<uint32_t>(d2);
@@ -595,7 +669,10 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
     if (own >= 0 && s_seli[tid] >= 0) {
       const uint32_t raw = (s_selw[own][tid >> 1] >> ((tid & 1) * 16)) & 0xFFFFu;
       e = expf(scaled(bf16_bits_to_f(raw), T, t1) - M);
-      if (!(key16(raw) >= keystar && e > 0.f)) { e = 0.f; own = -1; }
+      if (!(key16(raw) >= keystar && e > 0.f)) {
+        e = 0.f;
+        own = -1;
+      }
     } else {
       own = -1;
     }
@@ -626,7 +703,11 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
     const int64_t x = p.cand[static_cast<int64_t>(b) * G + j + 1];
     float qx = 0.f, ex = 0.f;
     for (int k = 0; k < SEL_K; ++k)
-      if (s_seli[k] >= 0 && s_seli[k] == x) { qx = s_selq[k]; ex = s_sele[k]; break; }
+      if (s_seli[k] >= 0 && s_seli[k] == x) {
+        qx = s_selq[k];
+        ex = s_sele[k];
+        break;
+      }
     tp = ex > 0.f ? __fdiv_rn(ex, SK) : 0.f;
     acc = qx > 0.f && qx <= 1.f && cj * qx < tp;
   }
@@ -642,12 +723,23 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
   SV_STAMP(8);
   int a = G - 1;
   for (int i = 0; i < G; ++i)
-    if (!s_acc[i]) { a = i; break; }
+    if (!s_acc[i]) {
+      a = i;
+      break;
+    }
 
   if (p.dbg != nullptr && tid == 0) {
     float* dd = p.dbg + static_cast<int64_t>(t) * DBG;
-    dd[0] = M; dd[1] = Z; dd[2] = SK; dd[3] = static_cast<float>(keystar); dd[4] = tp; dd[5] = acc ? 1.f : 0.f;
-    dd[6] = static_cast<float>(a); dd[7] = cj; dd[8] = e_c; dd[9] = static_cast<float>(owner);
+    dd[0] = M;
+    dd[1] = Z;
+    dd[2] = SK;
+    dd[3] = static_cast<float>(keystar);
+    dd[4] = tp;
+    dd[5] = acc ? 1.f : 0.f;
+    dd[6] = static_cast<float>(a);
+    dd[7] = cj;
+    dd[8] = e_c;
+    dd[9] = static_cast<float>(owner);
     for (int s = 0; s < R; ++s) {
       dd[16 + s] = __uint_as_float(s_hdr[s][2]);  // m_r
       dd[24 + s] = __uint_as_float(s_hdr[s][3]);  // Z_r (relative to m_r)
@@ -667,7 +759,8 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
   if (tid == 0) {
     float sub[R];
 #pragma unroll
-    for (int s = 0; s < R; ++s) sub[s] = (!sel && s == owner) ? rejmass : 0.f;
+    for (int s = 0; s < R; ++s)
+      sub[s] = (!sel && s == owner) ? rejmass : 0.f;
     if (sel) {  // max(p - q, 0): the owner loses min(p_c, q_c) per candidate; the rejected token (p < q) loses p
       const int64_t x = p.cand[static_cast<int64_t>(b) * G + j + 1];
       for (int k = 0; k < SEL_K; ++k)
@@ -684,20 +777,29 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
     int rs = -1;
     float pre = 0.f, excl = 0.f;
     for (int s = 0; s < R; ++s) {
-      if (rs < 0 && pre + s_w[s] > u) { rs = s; excl = pre; }
+      if (rs < 0 && pre + s_w[s] > u) {
+        rs = s;
+        excl = pre;
+      }
       pre += s_w[s];
     }
     if (rs < 0) {  // rounding: the last rank with mass
       for (int s = R - 1; s >= 0; --s)
-        if (s_w[s] > 0.f) { rs = s; break; }
+        if (s_w[s] > 0.f) {
+          rs = s;
+          break;
+        }
       excl = 0.f;
-      for (int s = 0; s < rs; ++s) excl += s_w[s];
+      for (int s = 0; s < rs; ++s)
+        excl += s_w[s];
     }
     s_i[2] = total > 0.f ? rs : -1;
     s_f[4] = u - excl;
     if (p.dbg != nullptr) {
       float* dd = p.dbg + static_cast<int64_t>(t) * DBG;
-      dd[10] = total; dd[11] = u; dd[12] = static_cast<float>(rs);
+      dd[10] = total;
+      dd[11] = u;
+      dd[12] = static_cast<float>(rs);
     }
   }
   __syncthreads();
@@ -714,7 +816,9 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
   if (rs == p.rank) {
     const float ul = s_f[4];
     const float sc = s_scale[p.rank];
-    const int rej_loc = (j < G - 1 && owner == p.rank) ? static_cast<int>(p.cand[static_cast<int64_t>(b) * G + j + 1] - p.vocab_start) : -1;
+    const int rej_loc = (j < G - 1 && owner == p.rank)
+                            ? static_cast<int>(p.cand[static_cast<int64_t>(b) * G + j + 1] - p.vocab_start)
+                            : -1;
     // thread-contiguous chunks of C (a multiple of 8: 16-B row loads, 2 x 16-B mass stores per 8 elements)
     const int C = (((Vs + THREADS - 1) / THREADS) + 7) & ~7;
     const int i0 = min(tid * C, Vs), i1 = min(i0 + C, Vs);
@@ -742,7 +846,10 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
       }
       __syncthreads();
       for (int v = i0; v < i1; ++v)
-        if (wbuf[v] > 0.f) { ts += wbuf[v]; lastv = v; }
+        if (wbuf[v] > 0.f) {
+          ts += wbuf[v];
+          lastv = v;
+        }
     }
     for (int v = i0; v < i1 && !sel; v += 8) {
       const uint4 r4 = *reinterpret_cast<const uint4*>(srow + v);
@@ -758,7 +865,10 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
       *reinterpret_cast<float4*>(wbuf + v + 4) = make_float4(w[4], w[5], w[6], w[7]);
 #pragma unroll
       for (int q = 0; q < 8; ++q)
-        if (w[q] > 0.f) { ts += w[q]; lastv = v + q; }
+        if (w[q] > 0.f) {
+          ts += w[q];
+          lastv = v + q;
+        }
     }
     // exclusive block scan of the per-thread sums (thread order == vocab order): warp scans + warp totals
     float incl = ts;
@@ -768,10 +878,14 @@ __global__ void __launch_bounds__(THREADS) sample_verify_kernel(const __grid_con
       if (lane >= o) incl += y;
     }
     if (lane == 31) s_red[warp] = incl;
-    if (tid == 0) { s_i[3] = INT_MAX; s_i[4] = -1; }
+    if (tid == 0) {
+      s_i[3] = INT_MAX;
+      s_i[4] = -1;
+    }
     __syncthreads();
     float wbase = 0.f;
-    for (int w = 0; w < warp; ++w) wbase += s_red[w];
+    for (int w = 0; w < warp; ++w)
+      wbase += s_red[w];
     const float ex = wbase + incl - ts;
     s_tsum[tid] = ex;
     s_lastv[tid] = lastv;
@@ -834,8 +948,8 @@ template <bool kUsePDL>
 struct SampleVerify {
   // logits [n, Vs] bf16 shard (row stride free, 16-B aligned rows), cand [n] int64, temp/top_p [>= n/G] fp32,
   // mode [>= n/G] int32, out [>= n] int64, calls [MAXN] int32, flags [MAXN] int64, peers [8] int64 (device table).
-  static void run(
-      tvm::ffi::TensorView logits,
+  static void
+  run(tvm::ffi::TensorView logits,
       tvm::ffi::TensorView cand,
       tvm::ffi::TensorView temp,
       tvm::ffi::TensorView top_p,

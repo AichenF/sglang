@@ -113,7 +113,9 @@ class SampleVerifyState:
         Collective over the TP group's CPU group (every rank, same point, outside graph capture)."""
         if self.ready:
             return
-        from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
+        from sglang.srt.distributed.device_communicators.cuda_wrapper import (
+            CudaRTLibrary,
+        )
 
         lib = CudaRTLibrary()
         self._lib = lib
@@ -121,13 +123,17 @@ class SampleVerifyState:
         lib.cudaMemset(ptr, 0, BUF_BYTES)
         self._ptr = ptr
         handle = lib.cudaIpcGetMemHandle(ptr)
-        handles = _gather_objects(self._cpu_group, self._ranks, self.rank, bytes(handle))
+        handles = _gather_objects(
+            self._cpu_group, self._ranks, self.rank, bytes(handle)
+        )
         addrs = []
         for r, h in enumerate(handles):
             if r == self.rank:
                 addrs.append(ptr.value)
             else:
-                addrs.append(lib.cudaIpcOpenMemHandle(type(handle).from_buffer_copy(h)).value)
+                addrs.append(
+                    lib.cudaIpcOpenMemHandle(type(handle).from_buffer_copy(h)).value
+                )
         self.peer_table.copy_(torch.tensor(addrs, dtype=torch.int64))
         torch.cuda.synchronize(self.device)
         self.ready = True
@@ -147,7 +153,9 @@ class SampleVerifyState:
         if nb:
             mode[:nb] = torch.tensor([int(p[0]) for p in params], dtype=torch.int32)
             temp[:nb] = torch.tensor([float(p[1]) for p in params], dtype=torch.float32)
-            top_p[:nb] = torch.tensor([float(p[2]) for p in params], dtype=torch.float32)
+            top_p[:nb] = torch.tensor(
+                [float(p[2]) for p in params], dtype=torch.float32
+            )
         self.mode.copy_(mode.pin_memory(), non_blocking=True)
         self.temp.copy_(temp.pin_memory(), non_blocking=True)
         self.top_p.copy_(top_p.pin_memory(), non_blocking=True)
@@ -163,9 +171,15 @@ class SampleVerifyState:
         [MAXREQ, gamma], then final [MAXREQ]."""
         self.sel_gamma = int(gamma)
         n = max(int(rows), MAXREQ)
-        self.sel_ids = torch.zeros((n, gamma, SEL_K), dtype=torch.int64, device=self.device)
-        self.sel_q = torch.zeros((n, gamma, SEL_K), dtype=torch.float32, device=self.device)
-        self.sel_coins = torch.zeros(MAXREQ * gamma + MAXREQ, dtype=torch.float32, device=self.device)
+        self.sel_ids = torch.zeros(
+            (n, gamma, SEL_K), dtype=torch.int64, device=self.device
+        )
+        self.sel_q = torch.zeros(
+            (n, gamma, SEL_K), dtype=torch.float32, device=self.device
+        )
+        self.sel_coins = torch.zeros(
+            MAXREQ * gamma + MAXREQ, dtype=torch.float32, device=self.device
+        )
 
     def stage_selector(self, candidate_ids: torch.Tensor, q_rows: torch.Tensor) -> None:
         """No copy when the rows already are the first rows of the staging buffers (the draft graph's sampler writes
@@ -179,8 +193,18 @@ class SampleVerifyState:
     def draw_selector_coins(self, bs: int) -> torch.Tensor:
         """The reference accept's draws, in its order: torch.rand((bs, gamma)), torch.rand((bs,))."""
         g = self.sel_gamma
-        torch.rand((bs, g), dtype=torch.float32, device=self.device, out=self.sel_coins[: bs * g].view(bs, g))
-        torch.rand((bs,), dtype=torch.float32, device=self.device, out=self.sel_coins[MAXREQ * g : MAXREQ * g + bs])
+        torch.rand(
+            (bs, g),
+            dtype=torch.float32,
+            device=self.device,
+            out=self.sel_coins[: bs * g].view(bs, g),
+        )
+        torch.rand(
+            (bs,),
+            dtype=torch.float32,
+            device=self.device,
+            out=self.sel_coins[MAXREQ * g : MAXREQ * g + bs],
+        )
         return self.sel_coins
 
     # ---- the kernel ----
@@ -202,7 +226,11 @@ class SampleVerifyState:
         counters untouched (the caller takes the greedy argmax from elsewhere).
         selector: use the staged selector ids, q and coins."""
         n = int(logits.shape[0])
-        assert logits.ndim == 2 and int(logits.shape[1]) == self.local_vocab and logits.dtype == torch.bfloat16
+        assert (
+            logits.ndim == 2
+            and int(logits.shape[1]) == self.local_vocab
+            and logits.dtype == torch.bfloat16
+        )
         assert 1 <= n <= MAXN and n % group == 0 and 2 <= group <= MAXG
         assert cand.dtype == torch.int64 and cand.is_contiguous() and cand.numel() >= n
         if out is None:
@@ -210,14 +238,28 @@ class SampleVerifyState:
         nb = n // group
         coin_ptr = coin_ld = final_ptr = sel_ids = sel_q = 0
         if coins is not None:
-            assert coins.dtype == torch.float32 and coins.is_contiguous() and coins.numel() >= nb * group + nb
-            coin_ptr, coin_ld, final_ptr = coins.data_ptr(), group, coins.data_ptr() + nb * group * 4
+            assert (
+                coins.dtype == torch.float32
+                and coins.is_contiguous()
+                and coins.numel() >= nb * group + nb
+            )
+            coin_ptr, coin_ld, final_ptr = (
+                coins.data_ptr(),
+                group,
+                coins.data_ptr() + nb * group * 4,
+            )
         if selector:
             g = self.sel_gamma
             assert self.sel_ids is not None and g == group - 1
-            coin_ptr, coin_ld, final_ptr = self.sel_coins.data_ptr(), g, self.sel_coins.data_ptr() + MAXREQ * g * 4
+            coin_ptr, coin_ld, final_ptr = (
+                self.sel_coins.data_ptr(),
+                g,
+                self.sel_coins.data_ptr() + MAXREQ * g * 4,
+            )
             sel_ids, sel_q = self.sel_ids.data_ptr(), self.sel_q.data_ptr()
-        assert self.ready or (skip_greedy and all(p[0] == 0 for p in (self._staged_key or ()))), "receive buffer not allocated"
+        assert self.ready or (
+            skip_greedy and all(p[0] == 0 for p in (self._staged_key or ()))
+        ), "receive buffer not allocated"
         _module(_pdl()).run(
             logits,
             cand,
@@ -250,13 +292,19 @@ def smem_bytes(local_vocab: int) -> int:
     return ((local_vocab * 2 + 15) // 16) * 16 + NKEY * 2 + (2 * R * NB + NB) * 4
 
 
-def unsupported_reason(local_vocab: int, device: Optional[torch.device] = None) -> Optional[str]:
+def unsupported_reason(
+    local_vocab: int, device: Optional[torch.device] = None
+) -> Optional[str]:
     """None when the kernel can run on this device for a logits shard of ``local_vocab`` columns, else the reason."""
     if local_vocab % 8 != 0:
         return f"local vocab {local_vocab} not a multiple of 8"
-    if local_vocab > NKEY // 2:  # the bonus scan reuses the count table for the shard's masses
+    if (
+        local_vocab > NKEY // 2
+    ):  # the bonus scan reuses the count table for the shard's masses
         return f"local vocab {local_vocab} > {NKEY // 2}"
-    props = torch.cuda.get_device_properties(device if device is not None else torch.cuda.current_device())
+    props = torch.cuda.get_device_properties(
+        device if device is not None else torch.cuda.current_device()
+    )
     limit = min(220 * 1024, int(getattr(props, "shared_memory_per_block_optin", 0)))
     if smem_bytes(local_vocab) > limit:
         return f"needs {smem_bytes(local_vocab)} B of shared memory per CTA (device limit {limit} B)"
@@ -264,7 +312,13 @@ def unsupported_reason(local_vocab: int, device: Optional[torch.device] = None) 
 
 
 def create_state(
-    group, *, local_vocab: int, vocab_start: int, vocab: int, seed: int, defer_buffer: bool = False
+    group,
+    *,
+    local_vocab: int,
+    vocab_start: int,
+    vocab: int,
+    seed: int,
+    defer_buffer: bool = False,
 ) -> Optional[SampleVerifyState]:
     """Collective over the TP group unless defer_buffer (every rank, same point, outside graph capture). None if not
     TP8."""

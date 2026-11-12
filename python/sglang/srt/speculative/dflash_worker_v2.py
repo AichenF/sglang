@@ -3,10 +3,15 @@ import math
 import os
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
+# Keep the import initialization order used by the TP8 validation.
+# isort: off
 import torch
 import triton
 import torch.distributed as dist
+# isort: on
 
+# Keep the import initialization order used by the TP8 validation.
+# isort: off
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func,
     rebuild_compact_draft_req_to_token_func,
@@ -20,6 +25,8 @@ from sglang.kernels.ops.speculative.dflash import (
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     accept_sampling,
 )
+
+# isort: on
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.distributed.utils import get_group_rank_size
@@ -263,8 +270,12 @@ class _DflashDraftSampler:
                 and int(cand.numel()) >= n_tok
             )
             fused.argmax(
-                self._logits(hs), self.out, self.org_vocab_start, group=self.block_size,
-                cand=cand if use_cand else None, cand_src=input_ids if use_cand else None,
+                self._logits(hs),
+                self.out,
+                self.org_vocab_start,
+                group=self.block_size,
+                cand=cand if use_cand else None,
+                cand_src=input_ids if use_cand else None,
             )
             if use_cand and torch.cuda.is_current_stream_capturing():
                 self.g12_cand_bs.add(bs)
@@ -327,9 +338,20 @@ def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
 
 
-def _selector_lattice(draft_model, pred_hidden, anchor_token_ids, ids_out=None, full_hidden=None, side_stream=None):
+def _selector_lattice(
+    draft_model,
+    pred_hidden,
+    anchor_token_ids,
+    ids_out=None,
+    full_hidden=None,
+    side_stream=None,
+):
     fused = draft_model.compute_lattice(
-        pred_hidden, anchor_token_ids, ids_out, full_hidden=full_hidden, side_stream=side_stream
+        pred_hidden,
+        anchor_token_ids,
+        ids_out,
+        full_hidden=full_hidden,
+        side_stream=side_stream,
     )
     if fused is not None:
         return fused
@@ -355,7 +377,14 @@ class _SelectorDraftSampler:
     """
 
     def __init__(
-        self, *, draft_model, block_size, max_bs, device, sampling_enabled: bool, out_bufs=None
+        self,
+        *,
+        draft_model,
+        block_size,
+        max_bs,
+        device,
+        sampling_enabled: bool,
+        out_bufs=None,
     ):
         self.draft_model = draft_model
         self.selector = draft_model.candidate_selector
@@ -372,7 +401,10 @@ class _SelectorDraftSampler:
         if out_bufs is not None:
             # the sampling verify's selector staging buffers: its stage_selector then copies nothing
             ids_buf, q_buf = out_bufs
-            assert tuple(ids_buf.shape[1:]) == (gamma, top_k) and ids_buf.shape[0] >= max_bs
+            assert (
+                tuple(ids_buf.shape[1:]) == (gamma, top_k)
+                and ids_buf.shape[0] >= max_bs
+            )
             assert tuple(q_buf.shape[1:]) == (gamma, top_k) and q_buf.shape[0] >= max_bs
             self.candidate_out, self.q_out = ids_buf[:max_bs], q_buf[:max_bs]
         else:
@@ -750,7 +782,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._init_mat_in_verify()
         self._graph_tokens_buf = None
         self._tokens_graph_bs = set()
-        self._fused_publish_enabled = bool(envs.SGLANG_DFLASH_FUSED_PUBLISH.get()) and is_cuda() and not _is_npu
+        self._fused_publish_enabled = (
+            bool(envs.SGLANG_DFLASH_FUSED_PUBLISH.get()) and is_cuda() and not _is_npu
+        )
         self._fused_publish_target = None
         self._fused_publish_done = False
 
@@ -781,7 +815,9 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             # only MiMoV2ForCausalLM.forward runs dflash_pre/post_logits_hooks
             if not isinstance(target_model, MiMoV2ForCausalLM):
-                reason = f"target model {type(target_model).__name__} has no pre-logits hook"
+                reason = (
+                    f"target model {type(target_model).__name__} has no pre-logits hook"
+                )
         if reason is not None:
             if get_parallel().tp_rank == 0:
                 logger.info("DFLASH materialize-in-verify disabled: %s", reason)
@@ -810,8 +846,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         target_model.dflash_pre_logits_hooks.append(self._mat_fork_hook)
         target_model.dflash_post_logits_hooks.append(self._mat_join_hook)
         # in a captured graph, join after the tail hooks (vocab-parallel argmax) so the side chain also overlaps it
-        self._target_worker.model_runner.capture_tail_hooks.insert(0, self._mat_pre_argmax_hook)
-        self._target_worker.model_runner.capture_tail_hooks.append(self._mat_tail_join_hook)
+        self._target_worker.model_runner.capture_tail_hooks.insert(
+            0, self._mat_pre_argmax_hook
+        )
+        self._target_worker.model_runner.capture_tail_hooks.append(
+            self._mat_tail_join_hook
+        )
         self._mat_enabled = True
         if get_parallel().tp_rank == 0:
             logger.info(
@@ -823,16 +863,29 @@ class DFlashWorkerV2(BaseSpecWorker):
         if not self._mat_enabled or not forward_batch.forward_mode.is_target_verify():
             return
         spec_info = getattr(forward_batch, "spec_info", None)
-        if not isinstance(spec_info, DFlashVerifyInput) or spec_info.ragged_verify_layout is not None:
+        if (
+            not isinstance(spec_info, DFlashVerifyInput)
+            or spec_info.ragged_verify_layout is not None
+        ):
             return
         block = int(self.block_size)
         bs = int(forward_batch.batch_size)
         n = int(aux_hidden_states.shape[0])
-        if n == 0 or n != bs * block or n > self._mat_max_tokens or aux_hidden_states.ndim != 2:
+        if (
+            n == 0
+            or n != bs * block
+            or n > self._mat_max_tokens
+            or aux_hidden_states.ndim != 2
+        ):
             return
         out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
         positions = forward_batch.positions
-        if out_cache_loc is None or positions is None or out_cache_loc.numel() < n or positions.numel() < n:
+        if (
+            out_cache_loc is None
+            or positions is None
+            or out_cache_loc.numel() < n
+            or positions.numel() < n
+        ):
             return
         if bs > int(self._mat_full_commit.shape[0]):
             return
@@ -850,14 +903,25 @@ class DFlashWorkerV2(BaseSpecWorker):
             aux_pack(aux_hidden_states, pend)
         ev = torch.cuda.Event()
         ev.record(torch.cuda.current_stream())
-        self._mat_req = (ev, aux_hidden_states, forward_batch, bs, n, positions, out_cache_loc, None)
+        self._mat_req = (
+            ev,
+            aux_hidden_states,
+            forward_batch,
+            bs,
+            n,
+            positions,
+            out_cache_loc,
+            None,
+        )
         if envs.SGLANG_DFLASH_MAT_EARLY_FORK.get():
             # goal11-post: launch the side chain BEFORE the LM head: the fc gets the whole GPU first (~14 us), then the
             # LM head streams alone while ag_norm / K/V GEMM / norm-RoPE / KV write run on the SMs it leaves free
             self._mat_launch()
 
     def _mat_launch(self) -> None:
-        ev, aux_hidden_states, forward_batch, bs, n, positions, out_cache_loc, pend = self._mat_req
+        ev, aux_hidden_states, forward_batch, bs, n, positions, out_cache_loc, pend = (
+            self._mat_req
+        )
         self._mat_req = None
         block = int(self.block_size)
         side = self._mat_stream
@@ -888,7 +952,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             forward_batch._dflash_kv_materialized = True
         if not self._mat_logged and get_parallel().tp_rank == 0:
             self._mat_logged = True
-            logger.info("DFLASH materialize-in-verify: first fork (bs=%d, tokens=%d).", bs, n)
+            logger.info(
+                "DFLASH materialize-in-verify: first fork (bs=%d, tokens=%d).", bs, n
+            )
 
     def _mat_join(self) -> None:
         if self._mat_pending:
@@ -919,7 +985,9 @@ class DFlashWorkerV2(BaseSpecWorker):
     def _mat_write_kv(self, *, ctx_hidden, positions, loc_2d, commit_lens) -> None:
         """FusedKVMaterializeHelper.materialize with fresh (graph-pool) outputs instead of the helper's growable
         workspaces (a later eager prefill may reallocate those, which a captured graph must never see)."""
-        from sglang.kernels.ops.speculative.fused_kv_materialize import _fused_norm_rope_stacked
+        from sglang.kernels.ops.speculative.fused_kv_materialize import (
+            _fused_norm_rope_stacked,
+        )
 
         h = self._fused_kv_helper
         n = int(ctx_hidden.shape[0])
@@ -933,19 +1001,37 @@ class DFlashWorkerV2(BaseSpecWorker):
             # goal11-post: k-norm/RoPE/v-scale + the KV write of every draft layer in one launch (full commit only)
             pool = self.draft_model_runner.token_to_kv_pool
             attns = [layer.self_attn.attn for layer in self.draft_model.layers]
-            tables = _kv_write_tables(pool, attns, h.n_layers, h.num_kv_heads, h.head_dim, ctx_hidden.dtype)
-            full_commit = commit_lens.data_ptr() == self._mat_full_commit.data_ptr()  # every block row is written
+            tables = _kv_write_tables(
+                pool, attns, h.n_layers, h.num_kv_heads, h.head_dim, ctx_hidden.dtype
+            )
+            full_commit = (
+                commit_lens.data_ptr() == self._mat_full_commit.data_ptr()
+            )  # every block row is written
             if tables is not None and full_commit and positions.dtype == torch.int64:
-                from sglang.kernels.ops.speculative.mat_kv_write import norm_rope_kv_write
+                from sglang.kernels.ops.speculative.mat_kv_write import (
+                    norm_rope_kv_write,
+                )
 
                 norm_rope_kv_write(
-                    proj.view(n, h.n_layers, h.layer_out_dim), h.k_norm_weights, h.eps_values, cos_sin_cache, positions,
-                    loc_2d.reshape(-1).to(torch.int64), tables[0], tables[1], tables[2], h.num_kv_heads, h.head_dim,
-                    h.rotary_dim, v_scale=h.v_scale_values,
+                    proj.view(n, h.n_layers, h.layer_out_dim),
+                    h.k_norm_weights,
+                    h.eps_values,
+                    cos_sin_cache,
+                    positions,
+                    loc_2d.reshape(-1).to(torch.int64),
+                    tables[0],
+                    tables[1],
+                    tables[2],
+                    h.num_kv_heads,
+                    h.head_dim,
+                    h.rotary_dim,
+                    v_scale=h.v_scale_values,
                 )
                 return
         k_out = torch.empty(
-            (h.n_layers, n, h.num_kv_heads, h.head_dim), dtype=ctx_hidden.dtype, device=ctx_hidden.device
+            (h.n_layers, n, h.num_kv_heads, h.head_dim),
+            dtype=ctx_hidden.dtype,
+            device=ctx_hidden.device,
         )
         v_out = torch.empty_like(k_out)
         cache_k, cache_v = _fused_norm_rope_stacked(
@@ -969,13 +1055,23 @@ class DFlashWorkerV2(BaseSpecWorker):
             return
         for i, attn in enumerate(attns):
             pool.set_kv_buffer_prefix_valid(
-                attn, loc_2d, commit_lens, cache_k[i], cache_v[i], attn.k_scale, attn.v_scale
+                attn,
+                loc_2d,
+                commit_lens,
+                cache_k[i],
+                cache_v[i],
+                attn.k_scale,
+                attn.v_scale,
             )
 
     def _fused_publish_target_for(self, on_publish, bs: int):
         """(FutureMap, future_indices) when the scheduler's on_publish is FutureMap.publish bound to this batch's
         future indices (overlap spec-v2) and the fused accept+relay kernel applies, else None."""
-        if not self._fused_publish_enabled or on_publish is None or SIMULATE_ACC_LEN > 0:
+        if (
+            not self._fused_publish_enabled
+            or on_publish is None
+            or SIMULATE_ACC_LEN > 0
+        ):
             return None
         func = getattr(on_publish, "func", None)
         fm = getattr(func, "__self__", None)
@@ -1004,7 +1100,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             return None
         return (fm, idx)
 
-    def _draft_tokens_capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
+    def _draft_tokens_capture_hook(
+        self, runner, out, forward_batch, num_tokens
+    ) -> None:
         del runner, out
         buf = self._graph_tokens_buf
         block = int(self.block_size)
@@ -1016,7 +1114,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         ids = forward_batch.input_ids[:num_tokens].view(bs, block)
         toks = buf[:bs]
         toks[:, 0].copy_(ids[:, 0])
-        toks[:, 1:].copy_(self._draft_sampler.out[: bs * (block - 1)].view(bs, block - 1))
+        toks[:, 1:].copy_(
+            self._draft_sampler.out[: bs * (block - 1)].view(bs, block - 1)
+        )
         if torch.cuda.is_current_stream_capturing():
             self._tokens_graph_bs.add(bs)
 
@@ -1045,7 +1145,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         return ok
 
     def _prepare_verify_forward(
-        self, *, batch, draft_tokens, positions, verify_out_cache_loc, draft_input, block_size
+        self,
+        *,
+        batch,
+        draft_tokens,
+        positions,
+        verify_out_cache_loc,
+        draft_input,
+        block_size,
     ):
         """Target-verify ForwardBatch + graph replay prep (input copies, attention metadata). Returns
         (verify_forward_batch, verify_decode_graph, seq_lens_pre_verify)."""
@@ -1090,7 +1197,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         rows = []
         for layer in self.draft_model.layers:
             lid = layer.self_attn.attn.layer_id - getattr(pool, "start_layer", 0)
-            rows.append((pool.k_buffer[lid][loc].clone(), pool.v_buffer[lid][loc].clone()))
+            rows.append(
+                (pool.k_buffer[lid][loc].clone(), pool.v_buffer[lid][loc].clone())
+            )
         return rows
 
     def _mat_check_rows(self, before, loc_2d, commit_lens) -> None:
@@ -1098,15 +1207,26 @@ class DFlashWorkerV2(BaseSpecWorker):
         accepted prefix of every draft layer; logs mismatching rows + max |diff| (host sync, debug only)."""
         after = self._mat_snapshot_rows(loc_2d)
         block = int(loc_2d.shape[1])
-        valid = torch.arange(block, device=loc_2d.device)[None, :] < commit_lens.to(torch.int64)[:, None]
+        valid = (
+            torch.arange(block, device=loc_2d.device)[None, :]
+            < commit_lens.to(torch.int64)[:, None]
+        )
         bad = 0
         maxdiff = 0.0
         for (kb, vb), (ka, va) in zip(before, after):
             for x, y in ((kb, ka), (vb, va)):
                 ne = (x != y).reshape(x.shape[0], x.shape[1], -1).any(-1) & valid
                 bad += int(ne.sum().item())
-                d = (x.float() - y.float()).abs().reshape(x.shape[0], x.shape[1], -1).amax(-1)
-                maxdiff = max(maxdiff, float(torch.where(valid, d, torch.zeros_like(d)).max().item()))
+                d = (
+                    (x.float() - y.float())
+                    .abs()
+                    .reshape(x.shape[0], x.shape[1], -1)
+                    .amax(-1)
+                )
+                maxdiff = max(
+                    maxdiff,
+                    float(torch.where(valid, d, torch.zeros_like(d)).max().item()),
+                )
         self._mat_check_n = getattr(self, "_mat_check_n", 0) + 1
         self._mat_check_bad = getattr(self, "_mat_check_bad", 0) + bad
         if bad or self._mat_check_n <= 3 or self._mat_check_n % 200 == 0:
@@ -1120,7 +1240,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 int(valid.sum().item()) * 2 * len(before),
             )
 
-    def _mat_done_for_verify(self, verify_forward_batch, graph_prepared: bool, ran_graph: bool) -> bool:
+    def _mat_done_for_verify(
+        self, verify_forward_batch, graph_prepared: bool, ran_graph: bool
+    ) -> bool:
         if not self._mat_enabled:
             return False
         if getattr(verify_forward_batch, "_dflash_kv_materialized", False):
@@ -1240,12 +1362,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                             cap_bs = 0
                         if cap_bs > 0:
                             self._graph_tokens_buf = torch.empty(
-                                (cap_bs, int(self.block_size)), dtype=torch.long, device=self.device
+                                (cap_bs, int(self.block_size)),
+                                dtype=torch.long,
+                                device=self.device,
                             )
                             # goal11-post: with SGLANG_STEP_PREP_FUSED the candidates are assembled by the verify's fused
                             # replay prep instead (it reads the bonus column + the sampler output directly)
                             if not step_prep.enabled():
-                                self.draft_model_runner.capture_tail_hooks.append(self._draft_tokens_capture_hook)
+                                self.draft_model_runner.capture_tail_hooks.append(
+                                    self._draft_tokens_capture_hook
+                                )
                     self._g12_init_verify_early()
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
@@ -1261,8 +1387,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                     db = self.draft_model_runner.decode_cuda_graph_runner.buffers
                     logger.info(
                         "goal12 static input aliasing draft/target: %s",
-                        {k: getattr(tb, k).data_ptr() == getattr(db, k).data_ptr()
-                         for k in ("input_ids", "positions", "out_cache_loc", "req_pool_indices", "seq_lens")},
+                        {
+                            k: getattr(tb, k).data_ptr() == getattr(db, k).data_ptr()
+                            for k in (
+                                "input_ids",
+                                "positions",
+                                "out_cache_loc",
+                                "req_pool_indices",
+                                "seq_lens",
+                            )
+                        },
                     )
                 except Exception as e:
                     logger.info("goal12 static input aliasing check failed: %r", e)
@@ -1644,7 +1778,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             method = getattr(qkv, "quant_method", None)
             if type(method) is not Fp8LinearMethod or method.block_quant:
                 return None
-            if getattr(method, "use_marlin", False) or getattr(qkv, "bias", None) is not None:
+            if (
+                getattr(method, "use_marlin", False)
+                or getattr(qkv, "bias", None) is not None
+            ):
                 return None
             w = qkv.weight  # [K, N] fp8 (transposed view of [N, K])
             scale = qkv.weight_scale
@@ -1660,7 +1797,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             w_rows = w.t()[rows].float() * scale[rows, None]
             return w_rows.to(torch.bfloat16).contiguous()
         except Exception as e:
-            logger.warning("DFLASH fp8 K/V weight dequant for the fused path failed: %s", e)
+            logger.warning(
+                "DFLASH fp8 K/V weight dequant for the fused path failed: %s", e
+            )
             return None
 
     def _ensure_draft_block_buffers(self, bs: int) -> None:
@@ -1987,7 +2126,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         """goal12-glue (SGLANG_G12_EMBED_LOCAL): replicate the full target embedding table on this rank so the TP8
         fused step-start embeddings (embed_nq of the verify, embed_ag of the draft block) gather locally instead of
         exchanging rows over NVLink. Collective over the TP group (every rank runs __init__ at the same point)."""
-        if not envs.SGLANG_G12_EMBED_LOCAL.get() or get_parallel().attn_dp_enabled or _is_npu or not is_cuda():
+        if (
+            not envs.SGLANG_G12_EMBED_LOCAL.get()
+            or get_parallel().attn_dp_enabled
+            or _is_npu
+            or not is_cuda()
+        ):
             return
         if not envs.SGLANG_DFLASH_TP_EMBED.get():
             return
@@ -2014,25 +2158,41 @@ class DFlashWorkerV2(BaseSpecWorker):
         nums = [0] * tp_size
         for r in range(tp_size):
             si = emb._get_indices(
-                emb.num_embeddings_padded, emb.org_vocab_size_padded, emb.num_embeddings, emb.org_vocab_size, r, tp_size
+                emb.num_embeddings_padded,
+                emb.org_vocab_size_padded,
+                emb.num_embeddings,
+                emb.org_vocab_size,
+                r,
+                tp_size,
             )
             starts[r] = int(si.org_vocab_start_index)
             nums[r] = int(si.org_vocab_end_index) - int(si.org_vocab_start_index)
         vocab = sum(nums)
-        if nums[rank] != num_org or any(starts[r] != sum(nums[:r]) for r in range(tp_size)):
-            logger.warning("goal12 embed replica: unexpected shard layout %s / %s; disabled", starts, nums)
+        if nums[rank] != num_org or any(
+            starts[r] != sum(nums[:r]) for r in range(tp_size)
+        ):
+            logger.warning(
+                "goal12 embed replica: unexpected shard layout %s / %s; disabled",
+                starts,
+                nums,
+            )
             return
         shard_t = w.data[:num_org].contiguous()
         if all(n == num_org for n in nums):
             full = torch.empty((vocab, w.shape[1]), dtype=w.dtype, device=w.device)
             dist.all_gather_into_tensor(full, shard_t, group=tp_group.device_group)
         else:
-            parts = [torch.empty((n, w.shape[1]), dtype=w.dtype, device=w.device) for n in nums]
+            parts = [
+                torch.empty((n, w.shape[1]), dtype=w.dtype, device=w.device)
+                for n in nums
+            ]
             dist.all_gather(parts, shard_t, group=tp_group.device_group)
             full = torch.cat(parts, dim=0)
             del parts
         del shard_t
-        if not torch.equal(full[starts[rank] : starts[rank] + num_org], w.data[:num_org]):
+        if not torch.equal(
+            full[starts[rank] : starts[rank] + num_org], w.data[:num_org]
+        ):
             raise RuntimeError("goal12 embed replica: own shard mismatch")
         ranges = torch.zeros(2 * tp_size, dtype=torch.int64)
         ranges[tp_size + rank] = vocab
@@ -2047,27 +2207,46 @@ class DFlashWorkerV2(BaseSpecWorker):
         if rank == 0:
             logger.info(
                 "goal12 embed replica: full table %s (%.2f GB/rank) -> local embed_nq / embed_ag",
-                tuple(full.shape), full.numel() * full.element_size() / 1e9,
+                tuple(full.shape),
+                full.numel() * full.element_size() / 1e9,
             )
 
     def _g12_init_verify_early(self) -> None:
         """goal12-glue (SGLANG_G12_VERIFY_EARLY): point the draft sampler's candidate write at the target runner's static
         input_ids (before the draft graphs are captured)."""
         self._g12_cand_buf = None
-        if not envs.SGLANG_G12_VERIFY_EARLY.get() or not step_prep.enabled() or self._draft_sampler is None:
+        if (
+            not envs.SGLANG_G12_VERIFY_EARLY.get()
+            or not step_prep.enabled()
+            or self._draft_sampler is None
+        ):
             return
-        if self._is_domino or self.selector is not None or self.lilicorr is not None or self._need_mamba_verify_commit:
+        if (
+            self._is_domino
+            or self.selector is not None
+            or self.lilicorr is not None
+            or self._need_mamba_verify_commit
+        ):
             return
         tr = getattr(self._target_worker.model_runner, "decode_cuda_graph_runner", None)
         buf = getattr(getattr(tr, "buffers", None), "input_ids", None)
-        if buf is None or buf.dtype != torch.int64 or not buf.is_contiguous() or buf.dim() != 1:
-            logger.warning("goal12 verify-early: no usable target static input_ids; disabled")
+        if (
+            buf is None
+            or buf.dtype != torch.int64
+            or not buf.is_contiguous()
+            or buf.dim() != 1
+        ):
+            logger.warning(
+                "goal12 verify-early: no usable target static input_ids; disabled"
+            )
             return
         self._g12_cand_buf = buf
         self._draft_sampler.g12_cand = buf
         if get_parallel().tp_rank == 0:
-            logger.info("goal12 verify-early: draft argmax writes the verify candidates into the target input_ids %s",
-                        tuple(buf.shape))
+            logger.info(
+                "goal12 verify-early: draft argmax writes the verify candidates into the target input_ids %s",
+                tuple(buf.shape),
+            )
 
     def _g12_verify_early_ok(self, batch, bs: int) -> bool:
         buf = getattr(self, "_g12_cand_buf", None)
@@ -2101,7 +2280,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._g12_slope_g = g
         if get_parallel().tp_rank == 0:
             logger.info(
-                "goal12 slope diag: %d eager + %d graph launches per decode step", self._g12_slope_eager,
+                "goal12 slope diag: %d eager + %d graph launches per decode step",
+                self._g12_slope_eager,
                 self._g12_slope_graph,
             )
 
@@ -2786,7 +2966,11 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         def _write_all_layers_kv(cache_k: torch.Tensor, cache_v: torch.Tensor) -> bool:
             # goal11-dense: the per-layer prefix-valid commits as ONE launch (plain bf16 3-D MHA pool only)
-            if ctx_cache_loc_2d is None or commit_lens is None or not envs.SGLANG_DFLASH_KV_WRITE_ALL.get():
+            if (
+                ctx_cache_loc_2d is None
+                or commit_lens is None
+                or not envs.SGLANG_DFLASH_KV_WRITE_ALL.get()
+            ):
                 return False
             return _commit_all_layers_kv(
                 token_to_kv_pool,
@@ -2991,8 +3175,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             # No entry barrier: between two candidate gathers every rank passes the draft megakernel's /
             # fused-TP layers' cross-rank all-reduces of the next step (and the verify step), which a rank can
             # only enter after its lattice read the previous gather's buffer view (stream order).
-            self.draft_model.candidate_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
-                max_tokens=min(max_tokens, 2048), enabled=True, skip_entry_sync=True
+            self.draft_model.candidate_gatherer = (
+                triton_symm_mem_ag.MultimemAllGatherer(
+                    max_tokens=min(max_tokens, 2048), enabled=True, skip_entry_sync=True
+                )
             )
 
         if envs.SGLANG_DFLASH_FC_MULTIMEM.get():
@@ -3098,7 +3284,9 @@ class DFlashWorkerV2(BaseSpecWorker):
     # ------------------------------------------------------------------
     # SGLANG_DFLASH_SAMPLE_FUSED: vocab-parallel sampling verify
     # ------------------------------------------------------------------
-    def _init_sample_verify(self, tp_group, local_vocab: int, vocab_start: int, vocab: int) -> None:
+    def _init_sample_verify(
+        self, tp_group, local_vocab: int, vocab_start: int, vocab: int
+    ) -> None:
         reason = None
         if int(tp_group.world_size) != 8:
             reason = f"tp {tp_group.world_size} != 8"
@@ -3142,14 +3330,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                                 rows = max(get_exec().graph.cuda_graph_config.decode.bs)
                             except Exception:  # noqa: BLE001
                                 rows = 0
-                        self._sample_verify.enable_selector(int(self.block_size) - 1, rows=rows)
+                        self._sample_verify.enable_selector(
+                            int(self.block_size) - 1, rows=rows
+                        )
             except Exception as e:  # pragma: no cover - defensive
                 reason = f"init failed ({e})"
                 self._sample_verify = None
         if get_parallel().tp_rank == 0:
             logger.info(
                 "DFLASH vocab-parallel sampling verify %s.",
-                "enabled (<= 64 verify rows)" if reason is None else f"disabled ({reason})",
+                "enabled (<= 64 verify rows)"
+                if reason is None
+                else f"disabled ({reason})",
             )
 
     def _sv_params(self, batch):
@@ -3166,7 +3358,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             penalizer = getattr(si, "penalizer_orchestrator", None)
             if penalizer is not None and getattr(penalizer, "is_required", False):
                 return None
-            if getattr(si, "grammar_mask", None) is not None or getattr(si, "logit_bias", None) is not None:
+            if (
+                getattr(si, "grammar_mask", None) is not None
+                or getattr(si, "logit_bias", None) is not None
+            ):
                 return None
             if getattr(si, "need_min_p_sampling", False):
                 return None
@@ -3211,16 +3406,27 @@ class DFlashWorkerV2(BaseSpecWorker):
             sv.stage_all_greedy(bs)
             return False
         if self.selector is not None:
-            if self._selector_sample is None or int(self._selector_sample[0].shape[0]) != bs:
+            if (
+                self._selector_sample is None
+                or int(self._selector_sample[0].shape[0]) != bs
+            ):
                 sv.stage_all_greedy(bs)
                 return False
             sv.stage_selector(*self._selector_sample)
             # The kernel exchanges rank 0's coins with the existing first-round messages.
             sv.draw_selector_coins(bs)
         sv.stage(params)
-        if self._sv_logged == 0 and get_parallel().tp_rank == 0 and any(p[0] for p in params):
+        if (
+            self._sv_logged == 0
+            and get_parallel().tp_rank == 0
+            and any(p[0] for p in params)
+        ):
             self._sv_logged = 1
-            logger.info("DFLASH vocab-parallel sampling verify: first sampled step (bs=%d, params=%s).", bs, params)
+            logger.info(
+                "DFLASH vocab-parallel sampling verify: first sampled step (bs=%d, params=%s).",
+                bs,
+                params,
+            )
         return True
 
     def _sv_supported(self, logits: torch.Tensor, ids) -> bool:
@@ -3240,7 +3446,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             or ids.numel() < n
         )
 
-    def _sv_run(self, logits: torch.Tensor, ids, skip_greedy: bool = False) -> Optional[torch.Tensor]:
+    def _sv_run(
+        self, logits: torch.Tensor, ids, skip_greedy: bool = False
+    ) -> Optional[torch.Tensor]:
         if not self._sv_supported(logits, ids):
             return None
         n = int(logits.shape[0])
@@ -3322,10 +3530,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             return None
         if self._sv_step:
             if in_graph_head and n in self._sv_graph_tokens:
-                predict = self._sample_verify.out[:n]  # produced in-graph by the tail hook
+                predict = self._sample_verify.out[
+                    :n
+                ]  # produced in-graph by the tail hook
             else:
                 ids = candidates.reshape(-1) if candidates is not None else None
-                if ids is not None and (ids.dtype != torch.int64 or not ids.is_contiguous()):
+                if ids is not None and (
+                    ids.dtype != torch.int64 or not ids.is_contiguous()
+                ):
                     ids = ids.to(torch.int64).contiguous()
                 predict = self._sv_run(logits, ids)
             if predict is not None:
@@ -3723,10 +3935,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         # (one launch with the input copies, FA metadata and page table); nothing below reads its outputs eagerly
         # before the draft runner's load_batch (embedding in the graph, no compact cache, no early verify prep)
         sp_defer = self._step_prep_defer_ok() and self._step_prep_bs_ok(bs)
-        bonus_gather = getattr(draft_input, "bonus_gather", None) if draft_input.bonus_tokens is None else None
+        bonus_gather = (
+            getattr(draft_input, "bonus_gather", None)
+            if draft_input.bonus_tokens is None
+            else None
+        )
         if draft_input.bonus_tokens is None:
             if bonus_gather is None:
-                raise RuntimeError("DFLASH draft input has neither bonus_tokens nor a deferred bonus gather")
+                raise RuntimeError(
+                    "DFLASH draft input has neither bonus_tokens nor a deferred bonus gather"
+                )
             if not (sp_defer and self._use_triton_prepare_block):
                 draft_input.bonus_tokens = bonus_gather[0][bonus_gather[1]]
                 bonus_gather = None
@@ -3898,7 +4116,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         # goal12-glue (SGLANG_G12_VERIFY_EARLY): plan the target verify now; its replay prep is held and launched with
         # the draft's (one kernel), the draft graph's argmax writes the candidates into the target's static input_ids
         g12_early = None
-        if sp_defer and step_prep.is_recording() and self._g12_verify_early_ok(batch, bs):
+        if (
+            sp_defer
+            and step_prep.is_recording()
+            and self._g12_verify_early_ok(batch, bs)
+        ):
             cand_view = self._g12_cand_buf[: bs * block_size].view(bs, block_size)
             step_prep.group_begin()
             g12_early = self._prepare_verify_forward(
@@ -3912,15 +4134,23 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_tokens = cand_view
             tr = self._target_worker.model_runner.decode_cuda_graph_runner
             sig = getattr(tr, "_sp_plan_sig", None)
-            if g12_early[1] and sig is not None and step_prep.held_self_copy(self._g12_cand_buf):
+            if (
+                g12_early[1]
+                and sig is not None
+                and step_prep.held_self_copy(self._g12_cand_buf)
+            ):
                 tr._g12_early_sig = sig[:-1]
             else:
                 tr._g12_early_sig = None
         self._g12_steps = getattr(self, "_g12_steps", 0) + 1
         self._g12_early_n = getattr(self, "_g12_early_n", 0) + (g12_early is not None)
         if self._g12_steps % 128 == 0 and get_parallel().tp_rank == 0:
-            logger.info("goal12 glue stats: %d decode steps, %d verify-early; step_prep %s", self._g12_steps,
-                        self._g12_early_n, step_prep.stats())
+            logger.info(
+                "goal12 glue stats: %d decode steps, %d verify-early; step_prep %s",
+                self._g12_steps,
+                self._g12_early_n,
+                step_prep.stats(),
+            )
 
         with (
             torch.inference_mode(),
@@ -3928,7 +4158,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         ):
             draft_out = self.draft_model_runner.forward(forward_batch)
         if sp_defer and (step_prep.pending() or step_prep.is_recording()):
-            step_prep.flush("draft (after forward)")  # never expected: the runner flushes before replay / eager forward
+            step_prep.flush(
+                "draft (after forward)"
+            )  # never expected: the runner flushes before replay / eager forward
         draft_logits_output = draft_out.logits_output
 
         if (
@@ -4086,16 +4318,20 @@ class DFlashWorkerV2(BaseSpecWorker):
         if g12_early is not None:
             verify_forward_batch, verify_decode_graph, seq_lens_pre_verify = g12_early
         else:
-            verify_forward_batch, verify_decode_graph, seq_lens_pre_verify = self._prepare_verify_forward(
-                batch=batch,
-                draft_tokens=draft_tokens,
-                positions=positions,
-                verify_out_cache_loc=verify_out_cache_loc,
-                draft_input=draft_input,
-                block_size=block_size,
+            verify_forward_batch, verify_decode_graph, seq_lens_pre_verify = (
+                self._prepare_verify_forward(
+                    batch=batch,
+                    draft_tokens=draft_tokens,
+                    positions=positions,
+                    verify_out_cache_loc=verify_out_cache_loc,
+                    draft_input=draft_input,
+                    block_size=block_size,
+                )
             )
         if step_prep.pending() or step_prep.is_recording():
-            step_prep.flush("verify (after prepare)")  # paths that did not reach an eligible load_batch
+            step_prep.flush(
+                "verify (after prepare)"
+            )  # paths that did not reach an eligible load_batch
 
         # Idle-DP guard: an idle rank's eager verify contributes raw scheduler
         # counts while a graph-replaying rank assumes the padded bucket, so
@@ -4275,7 +4511,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
         # goal11-glue: skipped when the verify forward already materialized it on its side stream.
-        mat_done = self._mat_done_for_verify(verify_forward_batch, verify_decode_graph, can_run_cuda_graph)
+        mat_done = self._mat_done_for_verify(
+            verify_forward_batch, verify_decode_graph, can_run_cuda_graph
+        )
         mat_check = mat_done and envs.SGLANG_DFLASH_MAT_CHECK.get()
         if mat_check:
             mat_before = self._mat_snapshot_rows(verify_out_cache_loc_2d)
@@ -4323,9 +4561,15 @@ def _kv_write_tables(pool, attns, n_layers, num_kv_heads, head_dim, dtype):
     for mat_kv_write.norm_rope_kv_write, or None (unsupported pool -> the two-kernel path)."""
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
-    if type(pool) is not MHATokenToKVPool or getattr(pool, "is_quantized_kv_cache", False):
+    if type(pool) is not MHATokenToKVPool or getattr(
+        pool, "is_quantized_kv_cache", False
+    ):
         return None
-    if pool.dtype != dtype or pool.store_dtype != dtype or pool.v_row_dim != pool.row_dim:
+    if (
+        pool.dtype != dtype
+        or pool.store_dtype != dtype
+        or pool.v_row_dim != pool.row_dim
+    ):
         return None
     if len(attns) != n_layers or num_kv_heads * head_dim != pool.row_dim:
         return None
@@ -4334,7 +4578,9 @@ def _kv_write_tables(pool, attns, n_layers, num_kv_heads, head_dim, dtype):
     if t is None:
         ks = [pool.k_buffer[a.layer_id - pool.start_layer] for a in attns]
         vs = [pool.v_buffer[a.layer_id - pool.start_layer] for a in attns]
-        if any(x.dim() != 3 or not x.is_contiguous() or x.dtype != dtype for x in ks + vs):
+        if any(
+            x.dim() != 3 or not x.is_contiguous() or x.dtype != dtype for x in ks + vs
+        ):
             return None
         if len({x.stride(0) for x in ks + vs}) != 1 or ks[0].stride(0) != pool.row_dim:
             return None
@@ -4351,18 +4597,36 @@ def _kv_write_tables(pool, attns, n_layers, num_kv_heads, head_dim, dtype):
 def _commit_all_layers_kv(pool, attns, loc_2d, commit_lens, cache_k, cache_v) -> bool:
     """goal11-dense: set_kv_buffer_prefix_valid for every draft layer in one Triton launch. Only for the plain bf16
     MHATokenToKVPool (3-D per-layer buffers, equal K/V rows, no quantization); False -> caller falls back."""
-    from sglang.kernels.ops.kvcache.cache_move import set_kv_buffer_prefix_valid_multi_layer
+    from sglang.kernels.ops.kvcache.cache_move import (
+        set_kv_buffer_prefix_valid_multi_layer,
+    )
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
-    if type(pool) is not MHATokenToKVPool or getattr(pool, "is_quantized_kv_cache", False):
+    if type(pool) is not MHATokenToKVPool or getattr(
+        pool, "is_quantized_kv_cache", False
+    ):
         return False
-    if pool.dtype != cache_k.dtype or pool.store_dtype != cache_k.dtype or pool.v_row_dim != pool.row_dim:
+    if (
+        pool.dtype != cache_k.dtype
+        or pool.store_dtype != cache_k.dtype
+        or pool.v_row_dim != pool.row_dim
+    ):
         return False
     L = cache_k.shape[0]
-    if L != len(attns) or cache_k.dim() != 4 or cache_k.shape != cache_v.shape or cache_k.stride() != cache_v.stride():
+    if (
+        L != len(attns)
+        or cache_k.dim() != 4
+        or cache_k.shape != cache_v.shape
+        or cache_k.stride() != cache_v.stride()
+    ):
         return False
     T, Hkv, D = cache_k.shape[1], cache_k.shape[2], cache_k.shape[3]
-    if cache_k.stride(3) != 1 or cache_k.stride(2) != D or cache_k.stride(1) != Hkv * D or Hkv * D != pool.row_dim:
+    if (
+        cache_k.stride(3) != 1
+        or cache_k.stride(2) != D
+        or cache_k.stride(1) != Hkv * D
+        or Hkv * D != pool.row_dim
+    ):
         return False
     if loc_2d.numel() == 0 or commit_lens.numel() == 0:
         return True
