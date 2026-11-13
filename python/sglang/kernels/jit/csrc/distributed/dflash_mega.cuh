@@ -64,6 +64,13 @@
 #ifndef DM_NO_ATT
 #define DM_NO_ATT 0
 #endif
+#ifndef DFLASH_COEFF_TMA_GROUPED
+#if defined(DFLASH_V2_PHASE0_ONLY) && DFLASH_V2_PHASE0_ONLY
+#define DFLASH_COEFF_TMA_GROUPED 1
+#else
+#define DFLASH_COEFF_TMA_GROUPED 0
+#endif
+#endif
 #ifndef DM_QUIET
 #define DM_QUIET \
   0  // 1 (goal12): the weight producer does not TMA-issue units of the phases after a release point (qkv rows, gate_up
@@ -634,6 +641,16 @@ DEV void uit_issue(const Params& p, const UIt& it, bool pf, uint8_t* dst, uint64
   const int t0 = cf ? it.cft : it.tl[it.ks + stride * it.sl];
   const int t1 = cf ? it.cft : -1;
   const int kc = ((cf ? it.ks * it.nu : 0) + it.u) * 128;  // elements
+#if DFLASH_COEFF_TMA_GROUPED
+  if (cf) {
+    // One 16-KB box preserves the two consecutive BF16 K64 tiles in this ring unit.
+    if (pf)
+      tma_prefetch_l2_3d(map, 0, t0 * 64, kc / 64);
+    else
+      tma3d(map, dst, bar, 0, t0 * 64, kc / 64, pol);
+    return;
+  }
+#endif
 #pragma unroll
   for (int w = 0; w < 2; ++w) {
     const int t = w ? t1 : t0;
@@ -2314,7 +2331,8 @@ inline CUtensorMap make_map_3d(
     uint64_t s2,
     uint32_t b0,
     uint32_t b1,
-    uint32_t b2) {
+    uint32_t b2,
+    CUtensorMapDataType dtype = CU_TENSOR_MAP_DATA_TYPE_UINT8) {
   CUtensorMap map;
   uint64_t dim[3] = {d0, d1, d2};
   uint64_t stride[2] = {s1, s2};
@@ -2322,7 +2340,7 @@ inline CUtensorMap make_map_3d(
   uint32_t elem_stride[3] = {1, 1, 1};
   const CUresult rc = cuTensorMapEncodeTiled(
       &map,
-      CU_TENSOR_MAP_DATA_TYPE_UINT8,
+      dtype,
       3,
       const_cast<void*>(base),
       dim,
@@ -2390,8 +2408,14 @@ struct DFlashMega {
       for (int ph = 0; ph < NPH; ++ph) {
         if (wp[l * NPH + ph] == 0) continue;
         const void* w = reinterpret_cast<const void*>(wp[l * NPH + ph]);
-        if (ph == PH_CA || ph == PH_CM)  // BF16 [1536][H]: 64-element (128-byte) boxes
+        if (ph == PH_CA || ph == PH_CM)
+#if DFLASH_COEFF_TMA_GROUPED
+          // BF16 [K64][rank coefficient rows][K / 64]: two K64 tiles per unit
+          h[l * NPH + ph] =
+              make_map_3d(w, 64, N[ph], K[ph] / 64, K[ph] * 2, 128, 64, 64, 2, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16);
+#else
           h[l * NPH + ph] = make_map_2d(w, K[ph], N[ph], K[ph] * 2, 64, 64, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16);
+#endif
         else if (ph == PH_GU)  // [2 (gate, up)][INTER][K]: 128 x 32 x 2 boxes
           h[l * NPH + ph] = make_map_3d(w, K[ph], INTER, 2, K[ph], static_cast<uint64_t>(INTER) * K[ph], 128, 32, 2);
         else
