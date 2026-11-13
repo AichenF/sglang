@@ -23,7 +23,7 @@
 //   polls; cross-rank: Lamport-marked IPC pushes (tp_arnq).
 #pragma once
 
-// Preserve the include initialization order used by the TP8 validation.
+// Preserve the validated include initialization order.
 // clang-format off
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
@@ -117,7 +117,7 @@ constexpr int CF_TILES = 24;  // CTAs taking a K chunk of one of the rank's 3 co
 constexpr int CF_K_PARTS = 4;
 constexpr int CF_ROUND_NU = SL / 128;
 constexpr int CF_NU = 2 * CF_ROUND_NU;  // 1536 K columns per active CTA, streamed in two 768-column rounds
-enum { C_LAUNCH = 0, C_X = 1, C_ATT = 2, C_ACT = 3, C_Y = 6, C_QKV = 8, C_N = 64 };
+enum { C_LAUNCH = 0, C_X = 1, C_ATT = 2, C_ACT = 3, C_OQ = 4, C_DQ = 5, C_Y = 6, C_QKV = 8, C_N = 64 };
 
 // smem layout (bytes from the 1024-aligned dynamic base)
 constexpr int MISC_BYTES = 2048;
@@ -182,6 +182,8 @@ struct Params {
   __nv_bfloat16* qkv;  // [2][MT][QKV_N] (layer-parity double buffer; DM_LL_QKV: Lamport-marked words)
   __nv_bfloat16* att;  // [MT][2048]
   __nv_bfloat16* act;  // [MT][INTER]
+  uint8_t* lateq;      // [O, down][MT][INTER], separate from the original xq
+  float* lates;        // [O, down][MT], original per-token quantization scales  // codespell:ignore lates
   unsigned* amax;      // [2 parity][2 kind][NL][MT]
   unsigned* cnt;       // [C_N]
   int* calls;          // [MT] tp_arnq per-token call counters
@@ -1445,6 +1447,47 @@ DEV void phase0(const Params& p, Smem& s, int t, int ctid, unsigned E, int& cslo
 #endif
 }
 
+// Existing token CTAs quantize disjoint completed rows once. Original counters
+// publish BF16 and amax; the new counters publish packed bytes after a CTA
+// barrier. O/down results precede the next normalized-input handoff, preventing
+// later layers from overwriting buffers still read by an earlier GEMM.
+template <int PH>
+DEV void quantize_late_row(const Params& p, Smem& s, int l, int t, int ctid, unsigned E) {
+  static_assert(PH == PH_O || PH == PH_DN);
+  constexpr int KIND = PH == PH_DN ? 1 : 0;
+  const __nv_bfloat16* sp = PH == PH_O ? p.att : p.act;
+  if (ctid == 0) {
+    const unsigned tgt = (E * 5u + static_cast<unsigned>(l) + 1u) * (PH == PH_O ? 64u : static_cast<unsigned>(GRID));
+    wait_ge(p.cnt + (PH == PH_O ? C_ATT : C_ACT), tgt);
+    const unsigned* am = p.amax + ((((E & 1u) * 2u + KIND) * NL + l) * MT);
+    const float a = __uint_as_float(ld_acq(am + t));
+    const float sc = (PH == PH_O) ? __fdividef(a, FP8_MAX) : __fdividef(fmaxf(a, 1e-10f), FP8_MAX);
+    s.sinv[0] = sc == 0.f ? 0.f : rcp_scale(sc);
+    p.lates[KIND * MT + t] = sc;  // codespell:ignore lates
+  }
+  bar_sync(1, NCT);
+  const float inv = s.sinv[0];
+  for (int i = ctid; i < INTER / 16; i += NCT) {
+    const uint4 a0 = ldcg_v4(sp + t * INTER + i * 16);
+    const uint4 a1 = ldcg_v4(sp + t * INTER + i * 16 + 8);
+    const uint32_t w[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+    uint32_t q[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const uint16_t lo = pack_e4m3x2(
+          fminf(fmaxf(bf_lo(w[2 * j]) * inv, -FP8_MAX), FP8_MAX),
+          fminf(fmaxf(bf_hi(w[2 * j]) * inv, -FP8_MAX), FP8_MAX));
+      const uint16_t hi = pack_e4m3x2(
+          fminf(fmaxf(bf_lo(w[2 * j + 1]) * inv, -FP8_MAX), FP8_MAX),
+          fminf(fmaxf(bf_hi(w[2 * j + 1]) * inv, -FP8_MAX), FP8_MAX));
+      q[j] = static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16);
+    }
+    *reinterpret_cast<uint4*>(p.lateq + (KIND * MT + t) * INTER + i * 16) = make_uint4(q[0], q[1], q[2], q[3]);
+  }
+  bar_sync(1, NCT);
+  if (ctid == 0) red_release(p.cnt + (PH == PH_O ? C_OQ : C_DQ), 1u);
+}
+
 // ------------------------------------------------------------------ GEMM phase
 template <int PH>
 DEV void gemm(
@@ -1497,16 +1540,12 @@ DEV void gemm(
       s.sx[ctid] = __uint_as_float(ld_acq(reinterpret_cast<const unsigned*>(p.xs + (e & 1) * MT + ctid)));
     }
   } else {
-    const unsigned tgt = (E * 5u + static_cast<unsigned>(l) + 1u) * (PH == PH_O ? 64u : static_cast<unsigned>(GRID));
+    const unsigned tgt = (E * 5u + static_cast<unsigned>(l) + 1u) * 32u;
     if (ctid < 32) {
-      if (ctid == 0) wait_ge(p.cnt + (PH == PH_O ? C_ATT : C_ACT), tgt);
+      if (ctid == 0) wait_ge(p.cnt + (PH == PH_O ? C_OQ : C_DQ), tgt);
       __syncwarp();
-      const unsigned* am = p.amax + ((((E & 1u) * 2u + (PH == PH_DN ? 1u : 0u)) * NL + l) * MT);
-      const float a = __uint_as_float(ld_acq(am + ctid));
-      // Match the SM90 reference quantizer's fast division, including FP8 rounding ties.
-      const float sc = (PH == PH_O) ? __fdividef(a, FP8_MAX) : __fdividef(fmaxf(a, 1e-10f), FP8_MAX);
-      s.sx[ctid] = sc;
-      s.sinv[ctid] = sc == 0.f ? 0.f : rcp_scale(sc);
+      const float* scales = p.lates + (PH == PH_DN ? MT : 0);  // codespell:ignore lates
+      s.sx[ctid] = __uint_as_float(ld_acq(reinterpret_cast<const unsigned*>(scales + ctid)));
     }
   }
   bar_sync(1, NCT);
@@ -1555,23 +1594,8 @@ DEV void gemm(
           const uint8_t* row = p.xq + (static_cast<int64_t>(e & 1) * MT + t) * H;
           packed = ldcg_v4(row + u * 128 + cc * 16);
         } else {
-          const __nv_bfloat16* sp = PH == PH_O ? p.att : p.act;
-          const float inv = s.sinv[t];
-          const uint4 a0 = ldcg_v4(sp + t * 2048 + u * 128 + cc * 16);
-          const uint4 a1 = ldcg_v4(sp + t * 2048 + u * 128 + cc * 16 + 8);
-          const uint32_t w[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
-          uint32_t q[4];
-#pragma unroll
-          for (int j = 0; j < 4; ++j) {
-            const uint16_t lo = pack_e4m3x2(
-                fminf(fmaxf(bf_lo(w[2 * j]) * inv, -FP8_MAX), FP8_MAX),
-                fminf(fmaxf(bf_hi(w[2 * j]) * inv, -FP8_MAX), FP8_MAX));
-            const uint16_t hi = pack_e4m3x2(
-                fminf(fmaxf(bf_lo(w[2 * j + 1]) * inv, -FP8_MAX), FP8_MAX),
-                fminf(fmaxf(bf_hi(w[2 * j + 1]) * inv, -FP8_MAX), FP8_MAX));
-            q[j] = static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16);
-          }
-          packed = make_uint4(q[0], q[1], q[2], q[3]);
+          const uint8_t* row = p.lateq + ((PH == PH_DN ? MT : 0) + t) * INTER;
+          packed = ldcg_v4(row + u * 128 + cc * 16);
         }
         *reinterpret_cast<uint4*>(Xu + t * 128 + ((cc ^ (t & 7)) * 16)) = packed;
       }
@@ -2246,12 +2270,14 @@ __global__ void __launch_bounds__(THREADS, 1) dflash_mega_kernel(const __grid_co
         if (is_att) attention(p, s, l, c, rank, ctid, E);
 #endif
         if (ctid == 0) stamp(p, 2 + 8 * l);
+        if (is_ar) quantize_late_row<PH_O>(p, s, l, t_ar, ctid, E);
         gemm<PH_O>(p, s, l, c, rank, ctid, E, cslot, cpar, gph, xph);
         if (ctid == 0) stamp(p, 3 + 8 * l);
         if (is_ar) allreduce(p, s, t_ar, 2 * l, ctid, E, cslot, cpar);
         if (ctid == 0) stamp(p, 4 + 8 * l);
         gemm<PH_GU>(p, s, l, c, rank, ctid, E, cslot, cpar, gph, xph);
         if (ctid == 0) stamp(p, 5 + 8 * l);
+        if (is_ar) quantize_late_row<PH_DN>(p, s, l, t_ar, ctid, E);
         gemm<PH_DN>(p, s, l, c, rank, ctid, E, cslot, cpar, gph, xph);
         if (ctid == 0) stamp(p, 6 + 8 * l);
         if (is_ar) allreduce(p, s, t_ar, 2 * l + 1, ctid, E, cslot, cpar);
@@ -2264,6 +2290,8 @@ __global__ void __launch_bounds__(THREADS, 1) dflash_mega_kernel(const __grid_co
           atomicAdd(p.cnt + C_X, 2u * d * 32u);
           atomicAdd(p.cnt + C_ATT, d * 64u);
           atomicAdd(p.cnt + C_ACT, d * static_cast<unsigned>(GRID));
+          atomicAdd(p.cnt + C_OQ, d * 32u);
+          atomicAdd(p.cnt + C_DQ, d * 32u);
           for (int i = 0; i < 36; ++i)
             atomicAdd(p.cnt + C_QKV + i, d * 8u);
           if (p.conv) atomicAdd(p.cnt + C_Y, 2u * d * 32u);
@@ -2387,7 +2415,7 @@ struct DFlashMega {
     using namespace dflash_mega;
     RuntimeCheck(blob.numel() >= static_cast<int64_t>(sizeof(Params)));
     constexpr int NPL = 15;
-    RuntimeCheck(ptrs.numel() == NL * NPL + 14 + R, "dflash_mega: pointer table size");
+    RuntimeCheck(ptrs.numel() == NL * NPL + 16 + R, "dflash_mega: pointer table size");
     RuntimeCheck(ivals.numel() == 8 && fvals.numel() == 4);
     RuntimeCheck(plan.numel() == 4 * NCL * 2 * MAXT_PH + 4 * NCL * 2 + NCL);
     const int64_t* pp = static_cast<const int64_t*>(ptrs.data_ptr());
@@ -2425,8 +2453,11 @@ struct DFlashMega {
     prm.stamps = reinterpret_cast<unsigned long long*>(q[11]);
     prm.hn = reinterpret_cast<__nv_bfloat16*>(q[12]);
     prm.coef = reinterpret_cast<__nv_bfloat16*>(q[13]);
+    prm.lateq = reinterpret_cast<uint8_t*>(q[14]);
+    prm.lates = reinterpret_cast<float*>(q[15]);                                       // codespell:ignore lates
+    RuntimeCheck(prm.lateq && prm.lates, "dflash_mega: O/down quantization buffers");  // codespell:ignore lates
     for (int i = 0; i < R; ++i)
-      prm.peer[i] = reinterpret_cast<uint8_t*>(q[14 + i]);
+      prm.peer[i] = reinterpret_cast<uint8_t*>(q[16 + i]);
     prm.rank = static_cast<int>(iv[0]);
     prm.cs_stride = iv[1];
     prm.cs_f32 = static_cast<int>(iv[2]);

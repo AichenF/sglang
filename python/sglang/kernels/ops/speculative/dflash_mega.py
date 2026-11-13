@@ -241,6 +241,10 @@ class DFlashMegaState:
         self.qkv = torch.zeros(2, MT, 2304, dtype=torch.bfloat16, device=dev)
         self.att = torch.zeros(MT, 2048, dtype=torch.bfloat16, device=dev)
         self.act = torch.zeros(MT, 2048, dtype=torch.bfloat16, device=dev)
+        self.lateq = torch.zeros(2, MT, 2048, dtype=torch.uint8, device=dev)
+        self.lates = torch.zeros(  # codespell:ignore lates
+            2, MT, dtype=torch.float32, device=dev
+        )  # codespell:ignore lates
         self.amax = torch.zeros(2 * 2 * NL * MT, dtype=torch.int32, device=dev)
         self.cnt = torch.zeros(64, dtype=torch.int32, device=dev)
         self.stamps = (
@@ -321,6 +325,8 @@ class DFlashMegaState:
             0 if self.stamps is None else self.stamps.data_ptr(),
             0 if self.hn is None else self.hn.data_ptr(),
             0 if self.coef is None else self.coef.data_ptr(),
+            self.lateq.data_ptr(),
+            self.lates.data_ptr(),  # codespell:ignore lates
         ] + peers
         sinks = [L.get("sinks") for L in layers]
         sink_f32 = int(sinks[0] is not None and sinks[0].dtype == torch.float32)
