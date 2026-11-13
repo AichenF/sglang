@@ -1600,22 +1600,24 @@ DEV void gemm(
         cslot = 0;
         cpar ^= 1u;
       }
-      mbar_wait(&s.full[slot], par);
-      // The preceding MMA group may still read the other 4-KiB input stage.
+      // The previous wait_group1 and CTA barrier released this stage; the
+      // preceding MMA group can still read only the other 4-KiB stage.
+      // Start the copy before waiting for weights to cover that wait with input traffic.
       uint8_t* Xu = X + (u & 1) * XU;
       for (int i = ctid; i < MT * 8; i += NCT) {
         const int t = i >> 3, cc = i & 7;
-        uint4 packed;
+        const uint8_t* row;
         if constexpr (S8) {
           const int e = 2 * l + (PH == PH_GU ? 1 : 0);
-          const uint8_t* row = p.xq + (static_cast<int64_t>(e & 1) * MT + t) * H;
-          packed = ldcg_v4(row + u * 128 + cc * 16);
+          row = p.xq + (static_cast<int64_t>(e & 1) * MT + t) * H;
         } else {
-          const uint8_t* row = p.lateq + ((PH == PH_DN ? MT : 0) + t) * INTER;
-          packed = ldcg_v4(row + u * 128 + cc * 16);
+          row = p.lateq + ((PH == PH_DN ? MT : 0) + t) * INTER;
         }
-        *reinterpret_cast<uint4*>(Xu + t * 128 + ((cc ^ (t & 7)) * 16)) = packed;
+        cp_async16(Xu + t * 128 + ((cc ^ (t & 7)) * 16), row + u * 128 + cc * 16);
       }
+      asm volatile("cp.async.commit_group;" ::: "memory");
+      mbar_wait(&s.full[slot], par);
+      asm volatile("cp.async.wait_group 0;" ::: "memory");
       fence_proxy_async_shared();
       bar_sync(1, NCT);
       if (wg == 0) {
