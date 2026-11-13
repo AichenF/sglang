@@ -1013,6 +1013,101 @@ class TestFactory(CustomTestCase):
 class TestDflashDraftKvBudget(CustomTestCase):
     """DFLASH draft KV pool as a flat bytes/token term on the target's budget."""
 
+    def _chunk_cap_configurator(self, draft_bytes, dcp_size, page_size):
+        """Create the request-capped hybrid pool with a separate draft geometry.
+
+        :param draft_bytes: Draft bytes per logical token, or None when absent.
+        :type draft_bytes: int or None
+        :param dcp_size: Number of replicated draft address spaces.
+        :type dcp_size: int
+        :param page_size: Token allocation alignment.
+        :type page_size: int
+        :return: Configurator for ten full and sixty SWA BF16 cache layers.
+        :rtype: SWAChunkCapPoolConfigurator
+        """
+        mr = _make_model_runner(
+            self,
+            num_kv_heads=1,
+            head_dim=192,
+            v_head_dim=128,
+            num_layers=70,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=list(range(10)),
+            swa_attention_layer_ids=list(range(10, 70)),
+            swa_num_kv_heads=1,
+            page_size=page_size,
+            disable_radix_cache=True,
+            chunked_prefill_size=8192,
+            sliding_window_size=128,
+            speculative_algorithm="DFLASH",
+            speculative_num_draft_tokens=8,
+            speculative_num_steps=1,
+            speculative_eagle_topk=1,
+            max_running_requests=8,
+        )
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.spec_aux_config = SimpleNamespace(
+            eagle_draft_num_layers=None,
+            dflash_draft_num_layers=5,
+            dflash_draft_cell_size_per_token=draft_bytes,
+        )
+        with (
+            mock_cpu_env(tp_size=8),
+            get_parallel().override(attn_dcp_size=dcp_size),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                SWAChunkCapPoolConfigurator,
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+        self.assertIsInstance(cfg, SWAChunkCapPoolConfigurator)
+        return cfg
+
+    def test_chunk_cap_accounts_for_target_and_replicated_draft_allocations(self):
+        """Fit actual full, SWA and replicated draft footprints in the byte budget."""
+        budget = 2 << 30
+        full_bytes = 10 * (192 + 128) * KV_SIZE
+        swa_bytes = 60 * (192 + 128) * KV_SIZE
+        for draft_bytes in (None, 0, 2560):
+            for dcp_size in (1, 8):
+                for page_size in (1, 64, 128):
+                    with self.subTest(
+                        draft_bytes=draft_bytes,
+                        dcp_size=dcp_size,
+                        page_size=page_size,
+                    ):
+                        cfg = self._chunk_cap_configurator(
+                            draft_bytes, dcp_size, page_size
+                        )
+                        config = cfg.calculate_pool_sizes(budget, page_size)
+                        token_bytes = full_bytes + (draft_bytes or 0) * dcp_size
+                        allocated = (
+                            config.full_max_total_num_tokens * token_bytes
+                            + config.swa_max_total_num_tokens * swa_bytes
+                        )
+                        self.assertLessEqual(allocated, budget)
+                        self.assertGreater(allocated + page_size * token_bytes, budget)
+                        self.assertEqual(
+                            config.full_max_total_num_tokens % page_size, 0
+                        )
+
+    def test_chunk_cap_rejects_budget_below_one_target_and_draft_page(self):
+        """Reject room for a target page when its accompanying draft cannot fit."""
+        draft_bytes = 2560
+        full_bytes = 10 * (192 + 128) * KV_SIZE
+        swa_bytes = 60 * (192 + 128) * KV_SIZE
+        for page_size in (1, 64, 128):
+            with self.subTest(page_size=page_size):
+                cfg = self._chunk_cap_configurator(draft_bytes, 1, page_size)
+                # The public constrained path exposes the fixed SWA allocation.
+                fixed = cfg.calculate_pool_sizes_from_max_tokens(
+                    1 << 20, page_size
+                ).swa_max_total_num_tokens
+                budget = fixed * swa_bytes + page_size * (full_bytes + draft_bytes) - 1
+                with self.assertRaises(RuntimeError):
+                    cfg.calculate_pool_sizes(budget, page_size)
+
     def test_bytes_per_token_from_draft_geometry(self):
         import torch
 
