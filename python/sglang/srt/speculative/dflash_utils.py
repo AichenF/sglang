@@ -140,8 +140,22 @@ def _dflash_top_k_renorm_prob(
 def _dflash_top_p_renorm_prob(
     probs: torch.Tensor, top_ps: torch.Tensor
 ) -> torch.Tensor:
+    """Preserve full probability support for FlashInfer rows with top-p equal to one.
+
+    :param probs: Normalized probability rows before nucleus filtering.
+    :type probs: torch.Tensor
+    :param top_ps: Per-row nucleus thresholds.
+    :type top_ps: torch.Tensor
+    :return: Filtered rows with top-p-one rows preserved exactly.
+    :rtype: torch.Tensor
+    """
     if top_p_renorm_prob is not None:
-        return top_p_renorm_prob(probs, top_ps)
+        full_support = top_ps.reshape(-1) == 1.0
+        # FlashInfer's threshold search expects (0, 1); discard its result for
+        # unfiltered rows instead of allowing it to trim their low-probability tail.
+        backend_top_ps = torch.where(full_support, 0.5, top_ps.reshape(-1))
+        filtered = top_p_renorm_prob(probs, backend_top_ps)
+        return torch.where(full_support[:, None], probs, filtered)
     npu_probs = _dflash_npu_top_k_top_p_renorm_prob(probs, top_ps=top_ps)
     if npu_probs is not None:
         return npu_probs
@@ -406,7 +420,9 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> Lis
 def get_dflash_layer_types(config: Any) -> Optional[Sequence[str]]:
     text_config = _get_text_config(config)
     layer_types = _cfg_get(text_config, "layer_types", _cfg_get(config, "layer_types"))
-    architectures = _cfg_get(text_config, "architectures", _cfg_get(config, "architectures")) or []
+    architectures = (
+        _cfg_get(text_config, "architectures", _cfg_get(config, "architectures")) or []
+    )
     if layer_types is None and "DFlash2DraftModel" in architectures:
         draft_config = _get_dflash_config(text_config)
         if "use_swa" in draft_config:
@@ -432,7 +448,9 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     sliding_window = _cfg_get(
         text_config, "sliding_window", _cfg_get(config, "sliding_window")
     )
-    architectures = _cfg_get(text_config, "architectures", _cfg_get(config, "architectures")) or []
+    architectures = (
+        _cfg_get(text_config, "architectures", _cfg_get(config, "architectures")) or []
+    )
     is_dflash2 = "DFlash2DraftModel" in architectures
     if sliding_window is None and (is_nemotron_35_draft_config(config) or is_dflash2):
         draft_source = text_config if is_dflash2 else config
