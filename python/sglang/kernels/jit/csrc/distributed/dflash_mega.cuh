@@ -1531,7 +1531,7 @@ DEV void gemm(
   uint8_t* X = s.greg;
   float* recv = reinterpret_cast<float*>(s.greg + XREG);
   const float* sw = p.L[l].sw[PH];
-  if (ctid == 0) mbar_expect_tx(s.recvbar, static_cast<uint32_t>(nt) * 8192u);
+  if (ctid == 0) mbar_expect_tx(s.recvbar, static_cast<uint32_t>(nt) * (8192u / NS));
   if (ctid < MT) s.amax[ctid] = 0u;
   // the per-channel weight scales of the rows this rank finalizes -> s.red (free during GEMM phases): tile k at k * 16
   // (qkv: 8 rows, gate_up: 4 gate + 4 up, o / down: 16 rows); loaded now, consumed after the receive wait
@@ -1582,11 +1582,11 @@ DEV void gemm(
   static_assert(2 * XU <= XREG, "GEMM input stages must precede the receive region");
 #pragma unroll 1
   for (int sl = 0; sl < nslab; ++sl) {
-    // Other CTAs publish the same zero partials; the receiver and reduction
-    // order remain unchanged. Only this slab's owner consumes its weight ring.
+    // Only this slab's owner consumes its weight ring and publishes partials.
+    // Receivers substitute the other CTAs' known +0 in the original sum order.
     const bool full_owner = src == sl % NS;
     const int k = sl;
-    const bool have = wg == 0;
+    const bool have = wg == 0 && full_owner;
     float acc[16];
 #pragma unroll
     for (int r = 0; r < 16; ++r)
@@ -1689,7 +1689,7 @@ DEV void gemm(
       for (int q = 0; q < 8; ++q)
 #pragma unroll
         for (int rr = 0; rr < 8; ++rr)
-          v[rr] += recv[((k * 8 + q) * 8 + rr) * 32 + tpos(t)];
+          v[rr] += q == k % NS ? recv[((k * 8 + q) * 8 + rr) * 32 + tpos(t)] : 0.f;
       const int n0 = tl[k] * 64 + rank * 8;
       const float sxv = s.sx[t];
       uint32_t w[4];
@@ -1741,7 +1741,7 @@ DEV void gemm(
       for (int q = 0; q < 8; ++q)
 #pragma unroll
         for (int rr = 0; rr < 8; ++rr)
-          v[rr] += recv[((k * 8 + q) * 8 + rr) * 32 + tpos(t)];
+          v[rr] += q == k % NS ? recv[((k * 8 + q) * 8 + rr) * 32 + tpos(t)] : 0.f;
       const int cg = tl[k] * 32 + rank * 4;
       const float sxv = s.sx[t];
       float a[4];
@@ -1784,7 +1784,7 @@ DEV void gemm(
       for (int q = 0; q < 4; ++q)
 #pragma unroll
         for (int rr = 0; rr < 8; ++rr)
-          v[rr] += recv[((k * 4 + q) * 16 + 8 * h + rr) * 32 + tpos(t)];
+          v[rr] += q == k % NS ? recv[((k * 4 + q) * 16 + 8 * h + rr) * 32 + tpos(t)] : 0.f;
       const int n0 = tl[k] * 64 + (rank & 3) * 16 + 8 * h;
       const float sxv = s.sx[t];
       uint32_t w[4];
