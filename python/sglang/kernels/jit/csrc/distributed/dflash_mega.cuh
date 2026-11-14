@@ -1681,6 +1681,13 @@ DEV void gemm(
   if constexpr (PH == PH_QKV) {
     for (int i = ctid; i < nt * MT; i += NCT) {
       const int k = i >> 5, t = i & 31;
+#if defined(DFLASH_V2_PHASE0_ONLY) && !DFLASH_V2_PHASE0_ONLY
+      float v[8];
+      // Retain one explicit +0 addition when folding the inactive partials.
+#pragma unroll
+      for (int rr = 0; rr < 8; ++rr)
+        v[rr] = __fadd_rn(0.f, recv[((k * 8 + k % NS) * 8 + rr) * 32 + tpos(t)]);
+#else
       float v[8];
 #pragma unroll
       for (int rr = 0; rr < 8; ++rr)
@@ -1690,6 +1697,7 @@ DEV void gemm(
 #pragma unroll
         for (int rr = 0; rr < 8; ++rr)
           v[rr] += q == k % NS ? recv[((k * 8 + q) * 8 + rr) * 32 + tpos(t)] : 0.f;
+#endif
       const int n0 = tl[k] * 64 + rank * 8;
       const float sxv = s.sx[t];
       uint32_t w[4];
@@ -1733,6 +1741,13 @@ DEV void gemm(
   } else if constexpr (PH == PH_GU) {
     for (int i = ctid; i < nt * MT; i += NCT) {
       const int k = i >> 5, t = i & 31;
+#if defined(DFLASH_V2_PHASE0_ONLY) && !DFLASH_V2_PHASE0_ONLY
+      float v[8];
+      // Retain one explicit +0 addition when folding the inactive partials.
+#pragma unroll
+      for (int rr = 0; rr < 8; ++rr)
+        v[rr] = __fadd_rn(0.f, recv[((k * 8 + k % NS) * 8 + rr) * 32 + tpos(t)]);
+#else
       float v[8];
 #pragma unroll
       for (int rr = 0; rr < 8; ++rr)
@@ -1742,6 +1757,7 @@ DEV void gemm(
 #pragma unroll
         for (int rr = 0; rr < 8; ++rr)
           v[rr] += q == k % NS ? recv[((k * 8 + q) * 8 + rr) * 32 + tpos(t)] : 0.f;
+#endif
       const int cg = tl[k] * 32 + rank * 4;
       const float sxv = s.sx[t];
       float a[4];
@@ -1776,6 +1792,13 @@ DEV void gemm(
     const int kar = 2 * l + (PH == PH_DN ? 1 : 0);
     for (int i = ctid; i < nt * MT * 2; i += NCT) {
       const int k = i >> 6, t = (i >> 1) & 31, h = i & 1;
+#if defined(DFLASH_V2_PHASE0_ONLY) && !DFLASH_V2_PHASE0_ONLY
+      float v[8];
+      // Retain one explicit +0 addition when folding the inactive partials.
+#pragma unroll
+      for (int rr = 0; rr < 8; ++rr)
+        v[rr] = __fadd_rn(0.f, recv[((k * 4 + k % NS) * 16 + 8 * h + rr) * 32 + tpos(t)]);
+#else
       float v[8];
 #pragma unroll
       for (int rr = 0; rr < 8; ++rr)
@@ -1785,6 +1808,7 @@ DEV void gemm(
 #pragma unroll
         for (int rr = 0; rr < 8; ++rr)
           v[rr] += q == k % NS ? recv[((k * 4 + q) * 16 + 8 * h + rr) * 32 + tpos(t)] : 0.f;
+#endif
       const int n0 = tl[k] * 64 + (rank & 3) * 16 + 8 * h;
       const float sxv = s.sx[t];
       uint32_t w[4];
