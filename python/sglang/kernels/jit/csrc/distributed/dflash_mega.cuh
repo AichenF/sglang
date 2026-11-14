@@ -1588,7 +1588,8 @@ DEV void gemm(
   bar_sync(1, NCT);
   // One 64-row output tile per pass. WG0 retains the original MMA shape and K order.
   const int nslab = nt;
-  static_assert(2 * XU <= XREG, "GEMM input stages must precede the receive region");
+  constexpr int INPUT_STAGES = 3;
+  static_assert(INPUT_STAGES * XU <= XREG, "GEMM input stages must precede the receive region");
 #pragma unroll 1
   for (int sl = 0; sl < nslab; ++sl) {
     // Only this slab's owner consumes its weight ring and publishes partials.
@@ -1601,18 +1602,8 @@ DEV void gemm(
     for (int r = 0; r < 16; ++r)
       acc[r] = 0.f;
     int previous_slot = -1;
-#pragma unroll 1
-    for (int u = 0; u < (full_owner ? NU : 0); ++u) {
-      const int slot = cslot;
-      const uint32_t par = cpar;
-      if (++cslot == s.nslot) {
-        cslot = 0;
-        cpar ^= 1u;
-      }
-      // The previous wait_group1 and CTA barrier released this stage; the
-      // preceding MMA group can still read only the other 4-KiB stage.
-      // Start the copy before waiting for weights to cover that wait with input traffic.
-      uint8_t* Xu = X + (u & 1) * XU;
+    auto issue_input = [&](int unit, int stage) {
+      uint8_t* Xu = X + stage * XU;
       for (int i = ctid; i < MT * 8; i += NCT) {
         const int t = i >> 3, cc = i & 7;
         const uint8_t* row;
@@ -1622,13 +1613,34 @@ DEV void gemm(
         } else {
           row = p.lateq + ((PH == PH_DN ? MT : 0) + t) * INTER;
         }
-        cp_async16(Xu + t * 128 + ((cc ^ (t & 7)) * 16), row + u * 128 + cc * 16);
+        cp_async16(Xu + t * 128 + ((cc ^ (t & 7)) * 16), row + unit * 128 + cc * 16);
       }
       asm volatile("cp.async.commit_group;" ::: "memory");
+    };
+    int input_stage = 0;
+    if (full_owner) issue_input(0, input_stage);
+#pragma unroll 1
+    for (int u = 0; u < (full_owner ? NU : 0); ++u) {
+      const int slot = cslot;
+      const uint32_t par = cpar;
+      if (++cslot == s.nslot) {
+        cslot = 0;
+        cpar ^= 1u;
+      }
+      int next_input_stage = input_stage + 1;
+      if (next_input_stage == INPUT_STAGES) next_input_stage = 0;
+      // The third slot holds the next input while the preceding MMA group
+      // can still read its operand. The previous wait_group1 plus CTA barrier
+      // retired the old group before this lookahead reuses its slot.
+      if (u + 1 < NU) issue_input(u + 1, next_input_stage);
       mbar_wait(&s.full[slot], par);
-      asm volatile("cp.async.wait_group 0;" ::: "memory");
+      if (u + 1 < NU)
+        asm volatile("cp.async.wait_group 1;" ::: "memory");
+      else
+        asm volatile("cp.async.wait_group 0;" ::: "memory");
       fence_proxy_async_shared();
       bar_sync(1, NCT);
+      uint8_t* Xu = X + input_stage * XU;
       if (wg == 0) {
         // Warpgroup-uniform: the second warpgroup still participates in CTA barriers.
         const uint64_t da = make_desc(s.ring + slot * SLAB);
@@ -1646,6 +1658,7 @@ DEV void gemm(
       bar_sync(1, NCT);
       if (previous_slot >= 0 && lane == 0) mbar_arrive(&s.empty[previous_slot]);
       previous_slot = slot;
+      input_stage = next_input_stage;
     }
     // Every compute warpgroup drains before accumulator consumption.
     // This also closes empty paths, so the compiler can preserve the pipeline.
