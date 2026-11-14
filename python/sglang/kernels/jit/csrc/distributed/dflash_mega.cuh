@@ -134,7 +134,9 @@ constexpr int GREG_FULL = XREG + 5 * TILEB;       // others: <= 5 tiles -> 64 KB
 constexpr int KV_BYTES = 2 * KV_MAXK * HD * 2;    // 81920
 constexpr int COMB_STRIDE = 132;                  // floats per (src, head): 128 o + lse + pad
 constexpr int COMB_SRC_BYTES = 8 * (HD * 4 + 4);  // 4128 bytes per source split
-constexpr int QREG = 34 * 1024;                   // Q tile inside the GEMM region (after COMB)
+constexpr int ATT_SPLITS = 2 * CS;
+static_assert(ATT_SPLITS * 8 * COMB_STRIDE * 4 <= KV_BYTES, "Attention combine must fit the retired KV region");
+constexpr int QREG = 34 * 1024;  // Q tile inside the GEMM region (after COMB)
 
 // IPC receive-buffer layout of csrc/distributed/dflash_tp_fused.cuh (keep in sync)
 constexpr int64_t RS_SLOT = SL * 2;
@@ -190,7 +192,7 @@ struct Params {
   __nv_bfloat16* att;  // [MT][2048]
   __nv_bfloat16* act;  // [MT][INTER]
   uint8_t* lateq;      // [O, down][MT][INTER], separate from the original xq
-  float* lates;        // [O, down][MT], original per-token quantization scales  // codespell:ignore lates
+  float* lates;        // [O, down][MT], original per-token quantization scales
   unsigned* amax;      // [2 parity][2 kind][NL][MT]
   unsigned* cnt;       // [C_N]
   int* calls;          // [MT] tp_arnq per-token call counters
@@ -762,11 +764,16 @@ DEV Split split_of(int seqlen, int rank) {
   const int L0 = (max(0, seqlen - (BLK + WIN)) / KVU) * KVU;
   const int nk = max(0, seqlen - L0);
   const int U = (nk + KVU - 1) / KVU;
-  const int u0 = rank * U / CS, u1 = (rank + 1) * U / CS;
-  sp.nu = u1 - u0;
-  sp.kbase = L0 + KVU * u0;
-  sp.ntot = max(0, min(KVU * sp.nu, seqlen - sp.kbase));
-  sp.nold = max(0, min(sp.ntot, seqlen - BLK - sp.kbase));
+  // CTA rank r stages every eighth tile; its WGs own reference splits r and r+8.
+  sp.nu = max(0, (U + CS - 1 - rank) / CS);
+  sp.kbase = L0 + KVU * rank;
+  sp.ntot = sp.nold = 0;
+#pragma unroll 1
+  for (int u = 0; u < sp.nu; ++u) {
+    const int first = sp.kbase + KVU * CS * u;
+    sp.ntot += max(0, min(KVU, seqlen - first));
+    sp.nold += max(0, min(KVU, seqlen - BLK - first));
+  }
   return sp;
 }
 
@@ -777,8 +784,8 @@ DEV void gather(const Params& p, Smem& s, int b, int c, int rank, int lane) {
   // writes them to the KV cache (head half 0, rank 0) and by the CTA whose key split holds them. Lane = (token,
   // quarter).
   const bool store = ((c & 1) == 0 && rank == 0);
-  const int first_new = sp.seqlen - BLK - sp.kbase;  // local index of block row 0
-  const bool need = (first_new + BLK > sp.nold) && (first_new < sp.ntot);
+  const int tile_origin = sp.kbase - rank * KVU;
+  const bool need = sp.nold < sp.ntot;
   const bool kvw = need || store;
   const int tk = lane >> 2, qq = lane & 3;
   long long kslot = 0;
@@ -791,7 +798,7 @@ DEV void gather(const Params& p, Smem& s, int b, int c, int rank, int lane) {
   const float* scs = reinterpret_cast<const float*>(s.greg + CSREG);
   const __nv_bfloat16* skn = reinterpret_cast<const __nv_bfloat16*>(s.greg + CSREG + 2048) + HD;
   for (int i = lane; i < sp.nold; i += 32)
-    s.slot[i] = __ldg(p.page_table + b * p.pt_stride + sp.kbase + i);
+    s.slot[i] = __ldg(p.page_table + b * p.pt_stride + sp.kbase + (i / KVU) * KVU * CS + i % KVU);
   __syncwarp();
   uint8_t* sK = s.kv;
   uint8_t* sV = s.kv + KV_MAXK * HD * 2;
@@ -843,8 +850,10 @@ DEV void gather(const Params& p, Smem& s, int b, int c, int rank, int lane) {
         for (int j = 0; j < 4; ++j)
           ov[4 * i + j] = pack_bf2(bf_lo(vw[j]) * p.v_scale, bf_hi(vw[j]) * p.v_scale);
       }
-      const int i = first_new + tk;
-      if (i >= 0 && i < sp.ntot) {
+      const int relative = sp.seqlen - BLK + tk - tile_origin;
+      const bool mine = relative >= 0 && (relative / KVU) % CS == rank;
+      const int i = (relative / (KVU * CS)) * KVU + relative % KVU;
+      if (mine && i >= 0 && i < sp.ntot) {
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
           *reinterpret_cast<uint4*>(sK + i * 256 + swz(4 * qq + j, i) * 16) =
@@ -1480,7 +1489,7 @@ DEV void quantize_late_row(const Params& p, Smem& s, int l, int t, int ctid, uns
     const float a = __uint_as_float(ld_acq(am + t));
     const float sc = (PH == PH_O) ? __fdividef(a, FP8_MAX) : __fdividef(fmaxf(a, 1e-10f), FP8_MAX);
     s.sinv[0] = sc == 0.f ? 0.f : rcp_scale(sc);
-    p.lates[KIND * MT + t] = sc;  // codespell:ignore lates
+    p.lates[KIND * MT + t] = sc;
   }
   bar_sync(1, NCT);
   const float inv = s.sinv[0];
@@ -1561,7 +1570,7 @@ DEV void gemm(
     if (ctid < 32) {
       if (ctid == 0) wait_ge(p.cnt + (PH == PH_O ? C_OQ : C_DQ), tgt);
       __syncwarp();
-      const float* scales = p.lates + (PH == PH_DN ? MT : 0);  // codespell:ignore lates
+      const float* scales = p.lates + (PH == PH_DN ? MT : 0);
       s.sx[ctid] = __uint_as_float(ld_acq(reinterpret_cast<const unsigned*>(scales + ctid)));
     }
   }
@@ -1880,14 +1889,12 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
   const Split sp = split_of(s.misc[1], rank);
   uint8_t* sK = s.kv;
   uint8_t* sV = s.kv + KV_MAXK * HD * 2;
-  float* comb = reinterpret_cast<float*>(s.greg);
+  float* comb = reinterpret_cast<float*>(s.kv);
   uint8_t* sQ = s.greg + QREG;
   float* scs = reinterpret_cast<float*>(s.greg + CSREG);
   __nv_bfloat16* sqn = reinterpret_cast<__nv_bfloat16*>(s.greg + CSREG + 2048);
   __nv_bfloat16* skn = sqn + HD;
-  if (ctid == 0) mbar_expect_tx(s.combbar, CS * COMB_SRC_BYTES);
-  // my GEMM region (aliased by the combine buffer) is free: tell every cluster peer
-  if (ctid < CS) mbar_arrive_remote(mapa(smem_u32(s.combok), ctid));
+  if (ctid == 0) mbar_expect_tx(s.combbar, ATT_SPLITS * COMB_SRC_BYTES);
   // stage what does not depend on this layer's qkv while the tiles are produced
   for (int i = ctid; i < BLK * 64; i += NCT) {
     const long long pos = s.pos[i >> 6];
@@ -1947,14 +1954,12 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
   mbar_wait(s.kvfull, l & 1);
   bar_sync(1, NCT);
   if (ctid == 0) dstamp(p, l, 58);
-  // ---- online softmax over 32-key units: warp w -> 16 query rows (tokens 2(w&3), 2(w&3)+1 x 8 heads); the two
-  // warpgroups split the split's key units (WG1 takes the last half, merged into WG0 through the freed KV tile) ----
+  // ---- original16-split online softmax: WG half owns split rank+8*half,
+  // taking alternating local tiles from the CTA's strided-eight gather. ----
   {
     const int rt = warp & 3, half = warp >> 2;
-    const int hsplit = (sp.nu + 1) >> 1;
-    const bool ksplit = (sp.nu - hsplit) >= 2;  // WG1 contributes >= 2 x 8 KB: enough for each 16 KB merge buffer
-    const int ub = half == 0 ? 0 : hsplit;
-    const int ue = half == 0 ? (ksplit ? hsplit : sp.nu) : (ksplit ? sp.nu : hsplit);  // codespell:ignore ue
+    const int ub = half;
+    const int ue = sp.nu;
     const uint32_t qb = smem_u32(sQ), kb = smem_u32(sK), vb = smem_u32(sV);
     uint32_t aq[8][4];
 #pragma unroll
@@ -1971,7 +1976,7 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
     const int lo0 = sp.seqlen - (BLK + WIN) + 2 * rt;
     const float scale = p.sm_scale;
 #pragma unroll 1
-    for (int u = ub; u < ue; ++u) {  // codespell:ignore ue
+    for (int u = ub; u < ue; u += 2) {
       // Both 16-key MMA fragments share one 32-key max before BF16 probability rounding.
       float sc[4][4];
 #pragma unroll
@@ -1994,7 +1999,7 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
       for (int jt = 0; jt < 4; ++jt) {
 #pragma unroll
         for (int e = 0; e < 4; ++e) {
-          const int key = sp.kbase + KVU * u + 8 * jt + (lane & 3) * 2 + (e & 1);
+          const int key = sp.kbase + KVU * CS * u + 8 * jt + (lane & 3) * 2 + (e & 1);
           const bool ok = (key < sp.seqlen) && (key >= lo0 + (e >> 1));
           const float v = ok ? sc[jt][e] * scale : -INFINITY;
           sc[jt][e] = v;
@@ -2057,103 +2062,88 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
         }
       }
     }
-    // WG1 -> WG0 merge (same lane -> (row, dims) mapping in both warpgroups; [chunk][thread] float4 layout)
-    {
-      float4* oK = reinterpret_cast<float4*>(sK + hsplit * KVU * 256);
-      float4* oV = reinterpret_cast<float4*>(sV + hsplit * KVU * 256);
-      float4* ml = reinterpret_cast<float4*>(sQ);  // Q is in registers (aq) by now
-      const int tw = ctid & 127;
-      if (half == 1 && ksplit) {
-        bar_sync(3, 128);  // every WG1 warp is done reading the K / V rows the merge buffer overwrites
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-          oK[i * 128 + tw] = make_float4(O[i][0], O[i][1], O[i][2], O[i][3]);
-          oV[i * 128 + tw] = make_float4(O[8 + i][0], O[8 + i][1], O[8 + i][2], O[8 + i][3]);
-        }
-        ml[tw] = make_float4(m0, m1, l0, l1);
-      }
-      bar_sync(1, NCT);
-      if (half == 0 && ksplit) {
-        const float4 o = ml[tw];
-        const float M0 = fmaxf(m0, o.x), M1 = fmaxf(m1, o.y);
-        const float a0 = __expf(m0 - M0), b0 = __expf(o.x - M0), a1 = __expf(m1 - M1), b1 = __expf(o.y - M1);
-        l0 = l0 * a0 + o.z * b0;
-        l1 = l1 * a1 + o.w * b1;
-        m0 = M0;
-        m1 = M1;
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-          const float4 k4 = oK[i * 128 + tw], v4 = oV[i * 128 + tw];
-          O[i][0] = O[i][0] * a0 + k4.x * b0;
-          O[i][1] = O[i][1] * a0 + k4.y * b0;
-          O[i][2] = O[i][2] * a1 + k4.z * b1;
-          O[i][3] = O[i][3] * a1 + k4.w * b1;
-          O[8 + i][0] = O[8 + i][0] * a0 + v4.x * b0;
-          O[8 + i][1] = O[8 + i][1] * a0 + v4.y * b0;
-          O[8 + i][2] = O[8 + i][2] * a1 + v4.z * b1;
-          O[8 + i][3] = O[8 + i][3] * a1 + v4.w * b1;
-        }
-      }
-    }
-    // normalized partial + lse -> the combine buffers of the two token ranks (2rt, 2rt+1)
+    // Every local KV read is retired before any peer overwrites the KV alias.
+    bar_sync(1, NCT);
+    if (ctid < CS) mbar_arrive_remote(mapa(smem_u32(s.combok), ctid));
     const float lse0 = l0 > 0.f ? m0 + logf(l0) : -INFINITY;
     const float lse1 = l1 > 0.f ? m1 + logf(l1) : -INFINITY;
     const int g = lane >> 2;
     if (ctid == 0) dstamp(p, l, 59);
-    if (half == 0) {
-      mbar_wait_cluster(s.combok, l & 1);
-      const uint32_t cbase = smem_u32(comb), cbar = smem_u32(s.combbar);
+    mbar_wait_cluster(s.combok, l & 1);
+    const uint32_t cbase = smem_u32(comb), cbar = smem_u32(s.combbar);
 #pragma unroll
-      for (int hf = 0; hf < 2; ++hf) {
-        const int dst = 2 * rt + hf;
-        const uint32_t rb = mapa(cbase, dst) + ((rank * 8 + g) * COMB_STRIDE) * 4;
-        const uint32_t rbar = mapa(cbar, dst);
-        const float partial_l = hf ? l1 : l0;
-        const float denominator = partial_l > 0.f ? partial_l : 1.f;
+    for (int hf = 0; hf < 2; ++hf) {
+      const int dst = 2 * rt + hf;
+      const int split = rank + CS * half;
+      const uint32_t rb = mapa(cbase, dst) + ((split * 8 + g) * COMB_STRIDE) * 4;
+      const uint32_t rbar = mapa(cbar, dst);
+      const float partial_l = hf ? l1 : l0;
+      const float denominator = partial_l > 0.f ? partial_l : 1.f;
 #pragma unroll
-        for (int j = 0; j < 16; ++j) {
-          const int d = 8 * j + (lane & 3) * 2;
-          st_async_v2(
-              rb + d * 4, attention_div(O[j][2 * hf], denominator), attention_div(O[j][2 * hf + 1], denominator), rbar);
-        }
-        if ((lane & 3) == 0) st_async_b32(rb + HD * 4, hf ? lse1 : lse0, rbar);
+      for (int j = 0; j < 16; ++j) {
+        const int d = 8 * j + (lane & 3) * 2;
+        st_async_v2(
+            rb + d * 4, attention_div(O[j][2 * hf], denominator), attention_div(O[j][2 * hf + 1], denominator), rbar);
       }
+      if ((lane & 3) == 0) st_async_b32(rb + HD * 4, hf ? lse1 : lse0, rbar);
     }
   }
-  // KV region no longer read: the gather warp may fetch the next layer's keys
   bar_sync(1, NCT);
-  if (ctid == 0) mbar_arrive(s.kvempty);
-  // ---- combine the 8 splits for token `rank` of request b (heads 8hg..8hg+7) ----
+  // ---- combine the 16 reference splits for token `rank` of request b (heads 8hg..8hg+7) ----
   mbar_wait(s.combbar, l & 1);
   if (ctid == 0) dstamp(p, l, 60);
   {
     const int h = ctid >> 5, d4 = ctid & 31;
-    float lse[CS];
+    float lse[ATT_SPLITS], weights[ATT_SPLITS];
     float mx = -INFINITY;
 #pragma unroll
-    for (int q = 0; q < CS; ++q) {
+    for (int q = 0; q < ATT_SPLITS; ++q) {
       lse[q] = comb[(q * 8 + h) * COMB_STRIDE + HD];
       mx = fmaxf(mx, lse[q]);
     }
-    const bool empty = (mx == -INFINITY);
+    const bool empty = mx == -INFINITY;
     const float sink = s.red[32 + h];
     const bool has_sink = LP.sinks != nullptr;
     if (has_sink) mx = fmaxf(mx, sink);
-    mx = (mx > -INFINITY) ? mx : 0.f;
-    float den = 0.f;
-    float o[4] = {0.f, 0.f, 0.f, 0.f};
+    mx = mx > -INFINITY ? mx : 0.f;
+    float sums[ATT_SPLITS];
 #pragma unroll
-    for (int q = 0; q < CS; ++q) {
-      const float w = __expf(lse[q] - mx);
-      den += w;
-      const float4 v = *reinterpret_cast<const float4*>(comb + (q * 8 + h) * COMB_STRIDE + 4 * d4);
-      // Round products before the split sum, matching the original reference reduction.
-      o[0] = __fadd_rn(o[0], __fmul_rn(v.x, w));
-      o[1] = __fadd_rn(o[1], __fmul_rn(v.y, w));
-      o[2] = __fadd_rn(o[2], __fmul_rn(v.z, w));
-      o[3] = __fadd_rn(o[3], __fmul_rn(v.w, w));
+    for (int q = 0; q < ATT_SPLITS; ++q)
+      sums[q] = weights[q] = __expf(lse[q] - mx);
+    // Actual reference PTX: denominator XOR tree8,4,2,1.
+#pragma unroll
+    for (int distance = ATT_SPLITS / 2; distance > 0; distance >>= 1) {
+#pragma unroll
+      for (int q = 0; q < distance; ++q)
+        sums[q] = __fadd_rn(sums[q], sums[q + distance]);
     }
-    if (has_sink && !empty) den += __expf(sink - mx);
+    float den = sums[0];
+    float groups[4][4];
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const float4 a = *reinterpret_cast<const float4*>(comb + (q * 8 + h) * COMB_STRIDE + 4 * d4);
+      const float4 b = *reinterpret_cast<const float4*>(comb + ((q + 4) * 8 + h) * COMB_STRIDE + 4 * d4);
+      const float4 c = *reinterpret_cast<const float4*>(comb + ((q + 8) * 8 + h) * COMB_STRIDE + 4 * d4);
+      const float4 d = *reinterpret_cast<const float4*>(comb + ((q + 12) * 8 + h) * COMB_STRIDE + 4 * d4);
+      // The reference contracts these pairs into FMA before the four-warp tree.
+      groups[q][0] = __fadd_rn(
+          __fmaf_rn(a.x, weights[q], __fmul_rn(b.x, weights[q + 4])),
+          __fmaf_rn(c.x, weights[q + 8], __fmul_rn(d.x, weights[q + 12])));
+      groups[q][1] = __fadd_rn(
+          __fmaf_rn(a.y, weights[q], __fmul_rn(b.y, weights[q + 4])),
+          __fmaf_rn(c.y, weights[q + 8], __fmul_rn(d.y, weights[q + 12])));
+      groups[q][2] = __fadd_rn(
+          __fmaf_rn(a.z, weights[q], __fmul_rn(b.z, weights[q + 4])),
+          __fmaf_rn(c.z, weights[q + 8], __fmul_rn(d.z, weights[q + 12])));
+      groups[q][3] = __fadd_rn(
+          __fmaf_rn(a.w, weights[q], __fmul_rn(b.w, weights[q + 4])),
+          __fmaf_rn(c.w, weights[q + 8], __fmul_rn(d.w, weights[q + 12])));
+    }
+    float o[4];
+#pragma unroll
+    for (int d = 0; d < 4; ++d)
+      o[d] = __fadd_rn(__fadd_rn(groups[0][d], groups[2][d]), __fadd_rn(groups[1][d], groups[3][d]));
+    if (has_sink && !empty) den = __fadd_rn(den, __expf(sink - mx));
     const float denominator = den > 0.f ? den : 1.f;
     const uint32_t w0 = pack_bf2(attention_div(o[0], denominator), attention_div(o[1], denominator));
     const uint32_t w1 = pack_bf2(attention_div(o[2], denominator), attention_div(o[3], denominator));
@@ -2166,6 +2156,8 @@ DEV void attention(const Params& p, Smem& s, int l, int c, int rank, int ctid, u
     if (lane == 0) s.red[16 + warp] = amx;
   }
   bar_sync(1, NCT);
+  // All combine reads are complete; the gather warp may now reuse the KV alias.
+  if (ctid == 0) mbar_arrive(s.kvempty);
   float amx = 0.f;
   if (ctid == 0) {
 #pragma unroll
@@ -2480,8 +2472,8 @@ struct DFlashMega {
     prm.hn = reinterpret_cast<__nv_bfloat16*>(q[12]);
     prm.coef = reinterpret_cast<__nv_bfloat16*>(q[13]);
     prm.lateq = reinterpret_cast<uint8_t*>(q[14]);
-    prm.lates = reinterpret_cast<float*>(q[15]);                                       // codespell:ignore lates
-    RuntimeCheck(prm.lateq && prm.lates, "dflash_mega: O/down quantization buffers");  // codespell:ignore lates
+    prm.lates = reinterpret_cast<float*>(q[15]);
+    RuntimeCheck(prm.lateq && prm.lates, "dflash_mega: O/down quantization buffers");
     for (int i = 0; i < R; ++i)
       prm.peer[i] = reinterpret_cast<uint8_t*>(q[16 + i]);
     prm.rank = static_cast<int>(iv[0]);
