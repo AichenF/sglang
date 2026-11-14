@@ -12,7 +12,7 @@ import unittest
 
 import torch
 
-from sglang.kernels.jit.utils import cuda_stubs_dir, load_jit
+from sglang.kernels.jit.utils import KERNEL_PATH, cuda_stubs_dir, load_jit
 from sglang.kernels.ops.attention.bidir_decode import bidir_decode_attention
 from sglang.kernels.ops.speculative.dflash_mega import _src_hash
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -33,6 +33,7 @@ def _module():
         "dflash_attention_regression_" + _src_hash(),
         cuda_files=[str(Path(__file__).with_name("dflash_attention_test.cuh"))],
         cuda_wrappers=[("run", "DFlashAttentionTest::run")],
+        extra_include_paths=[str(KERNEL_PATH / "csrc")],
         extra_cuda_cflags=["-O3"],
         extra_ldflags=[f"-L{cuda_stubs_dir()}", "-lcuda"],
     )
