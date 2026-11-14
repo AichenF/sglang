@@ -315,6 +315,20 @@ DEV void tma3d(const CUtensorMap* map, void* dst, uint64_t* bar, int c0, int c1,
       "l"(pol)
       : "memory");
 }
+// Two consecutive K128 units occupy one 16-KiB ring slot.
+DEV void tma4d(const CUtensorMap* map, void* dst, uint64_t* bar, int c0, int c1, int c2, int c3, uint64_t pol) {
+  asm volatile(
+      "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+      " [%0], [%1, {%3, %4, %5, %6}], [%2], %7;" ::"r"(smem_u32(dst)),
+      "l"(reinterpret_cast<uint64_t>(map)),
+      "r"(smem_u32(bar)),
+      "r"(c0),
+      "r"(c1),
+      "r"(c2),
+      "r"(c3),
+      "l"(pol)
+      : "memory");
+}
 DEV void cp_async16(void* dst, const void* src) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem_u32(dst)), "l"(src) : "memory");
 }
@@ -580,7 +594,7 @@ DEV bool uit_settle(const Params& p, int c, int rank, UIt& it) {
     } else {
       const bool s8 = (it.ph == PH_QKV || it.ph == PH_GU);
       const int g = s8 ? 0 : (rank >> 2);
-      it.nu = s8 ? 48 : 16;
+      it.nu = s8 ? 24 : 8;  // one main-projection unit contains two ordered K128 tiles
       // One output tile per CTA pass; larger plans wrap over the available CTAs.
       const int owner = s8 ? rank : (rank & 3);
       const int stride = s8 ? CS : CS / 2;
@@ -626,6 +640,15 @@ DEV void tma_prefetch_l2_3d(const CUtensorMap* map, int c0, int c1, int c2) {
       "r"(c2)
       : "memory");
 }
+DEV void tma_prefetch_l2_4d(const CUtensorMap* map, int c0, int c1, int c2, int c3) {
+  asm volatile(
+      "cp.async.bulk.prefetch.tensor.4d.L2.global.tile [%0, {%1, %2, %3, %4}];" ::"l"(reinterpret_cast<uint64_t>(map)),
+      "r"(c0),
+      "r"(c1),
+      "r"(c2),
+      "r"(c3)
+      : "memory");
+}
 DEV bool mbar_test(uint64_t* b, uint32_t parity) {
   uint32_t ok;
   asm volatile("{\n.reg .pred P1;\nmbarrier.test_wait.parity.shared::cta.b64 P1, [%1], %2;\nselp.u32 %0, 1, 0, P1;\n}\n"
@@ -642,7 +665,22 @@ DEV void uit_issue(const Params& p, const UIt& it, bool pf, uint8_t* dst, uint64
   const int stride = it.ph == PH_QKV || it.ph == PH_GU ? CS : CS / 2;
   const int t0 = cf ? it.cft : it.tl[it.ks + stride * it.sl];
   const int t1 = cf ? it.cft : -1;
-  const int kc = ((cf ? it.ks * it.nu : 0) + it.u) * 128;  // elements
+  const int kc = ((cf ? it.ks * it.nu : 0) + it.u) * 128;  // coefficient elements
+  if (!cf) {
+    if (it.ph == PH_GU) {
+      // [K128][row][gate/up][K pair]: each half retains gate then up.
+      if (pf)
+        tma_prefetch_l2_4d(map, 0, t0 * 32, 0, it.u * 2);
+      else
+        tma4d(map, dst, bar, 0, t0 * 32, 0, it.u * 2, pol);
+    } else {
+      if (pf)
+        tma_prefetch_l2_3d(map, 0, t0 * 64, it.u * 2);
+      else
+        tma3d(map, dst, bar, 0, t0 * 64, it.u * 2, pol);
+    }
+    return;
+  }
 #if DFLASH_COEFF_TMA_GROUPED
   if (cf) {
     // One 16-KB box preserves the two consecutive BF16 K64 tiles in this ring unit.
@@ -732,8 +770,7 @@ DEV void producer(const Params& p, Smem& s, int c, int rank) {
     }
 #endif
     if (ld.sl == 0 && ld.u == 0 && ld.ph != PH_QKV) dstamp(p, ld.l, 60 + ld.ph);
-    const int t1 = (ld.ph == PH_CA || ld.ph == PH_CM) ? 1 : 0;
-    mbar_expect_tx(&s.full[slot], (1 + t1) * TILEB);
+    mbar_expect_tx(&s.full[slot], SLAB);  // coefficients and paired main units each deliver 16 KiB
     uit_issue(p, ld, false, s.ring + slot * SLAB, &s.full[slot], pol);
     vld = uit_next(p, c, rank, ld);
     ++pu;
@@ -1529,7 +1566,7 @@ DEV void gemm(
     int& gph,
     int& xph) {
   constexpr bool S8 = (PH == PH_QKV || PH == PH_GU);
-  constexpr int NU = S8 ? 48 : 16;
+  constexpr int NU = S8 ? 24 : 8;
   constexpr int NS = S8 ? 8 : 4;
   constexpr int ROWS = S8 ? 8 : 16;
   const int g = S8 ? 0 : (rank >> 2);
@@ -1589,7 +1626,8 @@ DEV void gemm(
   // One 64-row output tile per pass. WG0 retains the original MMA shape and K order.
   const int nslab = nt;
   constexpr int INPUT_STAGES = 3;
-  static_assert(INPUT_STAGES * XU <= XREG, "GEMM input stages must precede the receive region");
+  constexpr int INPUT_PAIR_BYTES = 2 * XU;
+  static_assert(INPUT_STAGES * INPUT_PAIR_BYTES <= XREG, "Paired GEMM input stages must precede the receive region");
 #pragma unroll 1
   for (int sl = 0; sl < nslab; ++sl) {
     // Only this slab's owner consumes its weight ring and publishes partials.
@@ -1603,9 +1641,10 @@ DEV void gemm(
       acc[r] = 0.f;
     int previous_slot = -1;
     auto issue_input = [&](int unit, int stage) {
-      uint8_t* Xu = X + stage * XU;
-      for (int i = ctid; i < MT * 8; i += NCT) {
-        const int t = i >> 3, cc = i & 7;
+      uint8_t* Xu = X + stage * INPUT_PAIR_BYTES;
+      for (int i = ctid; i < 2 * MT * 8; i += NCT) {
+        const int part = i / (MT * 8), item = i % (MT * 8);
+        const int t = item >> 3, cc = item & 7;
         const uint8_t* row;
         if constexpr (S8) {
           const int e = 2 * l + (PH == PH_GU ? 1 : 0);
@@ -1613,7 +1652,7 @@ DEV void gemm(
         } else {
           row = p.lateq + ((PH == PH_DN ? MT : 0) + t) * INTER;
         }
-        cp_async16(Xu + t * 128 + ((cc ^ (t & 7)) * 16), row + unit * 128 + cc * 16);
+        cp_async16(Xu + part * XU + t * 128 + ((cc ^ (t & 7)) * 16), row + (2 * unit + part) * 128 + cc * 16);
       }
       asm volatile("cp.async.commit_group;" ::: "memory");
     };
@@ -1640,15 +1679,19 @@ DEV void gemm(
         asm volatile("cp.async.wait_group 0;" ::: "memory");
       fence_proxy_async_shared();
       bar_sync(1, NCT);
-      uint8_t* Xu = X + input_stage * XU;
+      uint8_t* Xu = X + input_stage * INPUT_PAIR_BYTES;
       if (wg == 0) {
-        // Warpgroup-uniform: the second warpgroup still participates in CTA barriers.
-        const uint64_t da = make_desc(s.ring + slot * SLAB);
-        const uint64_t db = make_desc(Xu);
+        // Preserve K32 instruction order across both halves; one fence/commit
+        // and CTA synchronization sequence now covers the complete K256 pair.
         wgmma_fence();
 #pragma unroll
-        for (int kk = 0; kk < 4; ++kk)
-          wgmma_m64n32k32_e4m3(acc, da + 2 * kk, db + 2 * kk);
+        for (int part = 0; part < 2; ++part) {
+          const uint64_t da = make_desc(s.ring + slot * SLAB + part * TILEB);
+          const uint64_t db = make_desc(Xu + part * XU);
+#pragma unroll
+          for (int kk = 0; kk < 4; ++kk)
+            wgmma_m64n32k32_e4m3(acc, da + 2 * kk, db + 2 * kk);
+        }
         wgmma_commit();
         // Preserve every accumulator's K order while overlapping the next
         // input load with this group. The previous group's two operands are
@@ -2362,6 +2405,41 @@ inline CUtensorMap make_map_3d(
   return map;
 }
 
+inline CUtensorMap make_map_4d(
+    const void* base,
+    uint64_t d0,
+    uint64_t d1,
+    uint64_t d2,
+    uint64_t d3,
+    uint64_t s1,
+    uint64_t s2,
+    uint64_t s3,
+    uint32_t b0,
+    uint32_t b1,
+    uint32_t b2,
+    uint32_t b3) {
+  CUtensorMap map;
+  uint64_t dim[4] = {d0, d1, d2, d3};
+  uint64_t stride[3] = {s1, s2, s3};
+  uint32_t box[4] = {b0, b1, b2, b3};
+  uint32_t elem_stride[4] = {1, 1, 1, 1};
+  const CUresult rc = cuTensorMapEncodeTiled(
+      &map,
+      CU_TENSOR_MAP_DATA_TYPE_UINT8,
+      4,
+      const_cast<void*>(base),
+      dim,
+      stride,
+      box,
+      elem_stride,
+      CU_TENSOR_MAP_INTERLEAVE_NONE,
+      CU_TENSOR_MAP_SWIZZLE_128B,
+      CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  host::RuntimeCheck(rc == CUDA_SUCCESS, "dflash_mega: cuTensorMapEncodeTiled (4-D) failed");
+  return map;
+}
+
 inline CUtensorMap make_map_2d(
     const void* base,
     uint64_t inner,
@@ -2423,10 +2501,11 @@ struct DFlashMega {
 #else
           h[l * NPH + ph] = make_map_2d(w, K[ph], N[ph], K[ph] * 2, 64, 64, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16);
 #endif
-        else if (ph == PH_GU)  // [2 (gate, up)][INTER][K]: 128 x 32 x 2 boxes
-          h[l * NPH + ph] = make_map_3d(w, K[ph], INTER, 2, K[ph], static_cast<uint64_t>(INTER) * K[ph], 128, 32, 2);
+        else if (ph == PH_GU)  // two K128 boxes, each containing 32 gate then 32 up rows
+          h[l * NPH + ph] = make_map_4d(
+              w, 128, INTER, 2, K[ph] / 128, K[ph], static_cast<uint64_t>(INTER) * K[ph], 128, 128, 32, 2, 2);
         else
-          h[l * NPH + ph] = make_map_2d(w, K[ph], N[ph], K[ph], 128, 64);
+          h[l * NPH + ph] = make_map_3d(w, 128, N[ph], K[ph] / 128, K[ph], 128, 128, 64, 2);
       }
     for (int b = 0; b < 2; ++b)
       h[NL * NPH + b] =
