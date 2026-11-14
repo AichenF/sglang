@@ -7,8 +7,8 @@ positions. The CUDA adapter calls production gather/attention directly.
 """
 
 import functools
-from pathlib import Path
 import unittest
+from pathlib import Path
 
 import torch
 
