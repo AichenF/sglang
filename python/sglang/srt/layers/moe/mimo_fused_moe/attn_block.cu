@@ -1958,6 +1958,7 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
             for (int r = 0; r < 16; ++r) acc[r] = 0.f;
             const int rot = MEGA_PSTAGE ? ((p * MEGA_ROT) % (QKH / 2)) * 2 : (p * MEGA_ROT) % QKH;
             const float* sxt = reinterpret_cast<const float*>(smem + MG_OFF_SX);
+            static_assert(MG_OFF_SX % alignof(float2) == 0 && M % 2 == 0, "paired scale loads");
             const bool nomma = P.mode & MODE_DBG_GNOMMA;
             // software pipeline over this warpgroup's 12 units (i = g, g + 2, ..): the wgmma group of unit i is in flight while unit i - 2 is
             // promoted (acc += partial * sw * sx in unit order: the per-thread summation order is unchanged)
@@ -2023,7 +2024,11 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
                 const float* sx = sxt + ki * M;
                 float sc[8];
 #pragma unroll
-                for (int q = 0; q < 8; ++q) sc[q] = sx[(q >> 1) * 8 + fcol + (q & 1)];
+                for (int q = 0; q < 4; ++q) {
+                    const float2 scale = *reinterpret_cast<const float2*>(sx + q * 8 + fcol);
+                    sc[2 * q] = scale.x;
+                    sc[2 * q + 1] = scale.y;
+                }
 #pragma unroll
                 for (int r = 0; r < 16; ++r) acc[r] += t[r] * ((r & 2) ? sw1 : sw0) * sc[(r >> 2) * 2 + (r & 1)];
             };
