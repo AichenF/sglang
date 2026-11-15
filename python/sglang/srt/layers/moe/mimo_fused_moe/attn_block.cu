@@ -1686,7 +1686,7 @@ __device__ __forceinline__ void named_bar_arrive(int id, int n) { asm volatile("
 // the layer kernel's setmaxnreg phases give them different register budgets, which ptxas assigns per disjoint branch)
 // QONLY: the full-attention layers' qkv-only launch as its own instance -- the attention / o_proj code is compiled out and the qkv-ready
 // flags are not released (nothing polls them: the next kernel reads the rows after griddepcontrol.wait), so the CTAs retire earlier
-template <int WINDOW, bool FUSED, int ROLE = 0, bool QONLY = false>
+template <int WINDOW, bool FUSED, int ROLE = 0, bool QONLY = false, bool TRACE_WAITS = true>
 __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
     constexpr bool R_MATH = ROLE != 2, R_PROD = ROLE != 1;
     uint64_t* wfull = reinterpret_cast<uint64_t*>(smem + MG_OFF_BAR);
@@ -1998,7 +1998,7 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
             // software pipeline over this warpgroup's unit PAIRS (warpgroup g: units 4 q + 2 g, 4 q + 2 g + 1, q = 0..5): one fence / commit /
             // wait per two k-blocks (the per-iteration warpgroup sync + barrier overhead was ~4x the m64n32k32 time); the group of pair q is in
             // flight while pair q - 1 is promoted (acc += partial * sw * sx in unit order)
-            long long cw = 0, c0 = clock64();
+            long long cw = 0, c0 = TRACE_WAITS ? clock64() : 0;
             const uint32_t sbase = sa(smem) & 0x3FFFF;
             int cs = 2 * g, cp = 0;   // stage / lap parity of the next unit to issue (2g < gns)
             int fs = 2 * g;           // stage of the next unit to finish
@@ -2013,9 +2013,9 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
                 (void)i;
                 const int s0 = ps_, p0 = pp_;
                 ps_ += 2; if (ps_ >= nps) { ps_ -= nps; pp_ ^= 1; }
-                const long long ca = clock64();
+                const long long ca = TRACE_WAITS ? clock64() : 0;
                 mbar_wait(&gfull[s0], p0);
-                cw += clock64() - ca;
+                if (TRACE_WAITS) cw += clock64() - ca;
                 const uint32_t lo0 = ((sbase + s0 * 2 * G_ST) >> 4) | (1u << 16), lo1 = lo0 + (wsp >> 4);
                 constexpr uint32_t HI = (1024 >> 4) | (1u << 30), XA = (2 * G_W) >> 4;
                 const uint32_t XB = (2 * G_W + G_X - wsp) >> 4;
@@ -2034,10 +2034,10 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
                 const int s0 = cs, p0 = cp;
                 int s1 = cs, p1 = cp; adv(s1, p1, 1);
                 adv(cs, cp, 4);
-                const long long ca = clock64();
+                const long long ca = TRACE_WAITS ? clock64() : 0;
                 mbar_wait(&gfull[s0], p0);
                 mbar_wait(&gfull[s1], p1);
-                cw += clock64() - ca;
+                if (TRACE_WAITS) cw += clock64() - ca;
                 // descriptor = {(addr >> 4) & 0x3FFF | 1 << 16, SBO 64 | swizzle 128B}: the k32 steps only add 2 to the low word (no carry)
                 const uint32_t lo0 = ((sbase + s0 * G_ST) >> 4) | (1u << 16), lo1 = ((sbase + s1 * G_ST) >> 4) | (1u << 16);
                 constexpr uint32_t HI = (1024 >> 4) | (1u << 30), XO = G_W >> 4;
@@ -2112,9 +2112,9 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
             auto issue1 = [&](float* t) {
                 const int s0 = us_, p0 = up_;
                 us_ += 2; if (us_ >= gns) { us_ -= gns; up_ ^= 1; }
-                const long long ca = clock64();
+                const long long ca = TRACE_WAITS ? clock64() : 0;
                 mbar_wait(&gfull[s0], p0);
-                cw += clock64() - ca;
+                if (TRACE_WAITS) cw += clock64() - ca;
                 const uint32_t lo0 = ((sbase + s0 * G_ST) >> 4) | (1u << 16);
                 constexpr uint32_t HI = (1024 >> 4) | (1u << 30), XO = G_W >> 4;
                 wg_fence();
@@ -2146,7 +2146,7 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
             wg_wait<0>();
             finish_1(g + QKH - 2, tB);
 #endif
-            if (P.dbg && (tid & 127) == 0) { P.dbg[blockIdx.x * NDBG + 27 + g] = cw; P.dbg[blockIdx.x * NDBG + 29] = clock64() - c0; }
+            if (TRACE_WAITS && P.dbg && (tid & 127) == 0) { P.dbg[blockIdx.x * NDBG + 27 + g] = cw; P.dbg[blockIdx.x * NDBG + 29] = clock64() - c0; }
 #if MEGA_LATE_GATHER && !MEGA_MID_GATHER && !MEGA_GWARP
             if (att && !MEGA_REL_EARLY) { named_bar_sync(1, NMATH); mega_gather_issue<WINDOW>(P, smem, h); }   // every unit consumed: the ring is dead
 #endif
@@ -2482,11 +2482,11 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
     }
 }
 
-template <int WINDOW, bool QONLY = false>
+template <int WINDOW, bool QONLY = false, bool TRACE_WAITS = true>
 __global__ void __launch_bounds__(MG_NTHREADS, 1) attn_block_mega_kernel(const __grid_constant__ MegaParams P) {
     extern __shared__ uint8_t smem_raw[];
     uint8_t* smem = smem_raw + ((1024u - (sa(smem_raw) & 1023u)) & 1023u);
-    mega_body<WINDOW, false, 0, QONLY>(P, smem);
+    mega_body<WINDOW, false, 0, QONLY, TRACE_WAITS>(P, smem);
 }
 
 // ------------------------------------------------------------------------------------------------------------------ host
@@ -2676,15 +2676,15 @@ static void set_xflags(MegaParams& P, const torch::Tensor& xflags, const torch::
 struct MegaCapture { MegaParams P; int window; bool pdl; bool valid; };
 static MegaCapture* g_mega_capture = nullptr;
 #endif
-template <int WINDOW, bool QONLY = false>
-static void launch_mega_t(const MegaParams& P, cudaStream_t stream, bool pdl) {
+template <int WINDOW, bool QONLY, bool TRACE_WAITS>
+static void launch_mega_instance_t(const MegaParams& P, cudaStream_t stream, bool pdl) {
 #ifdef BLK_LAYER_CAPTURE
     if (g_mega_capture) { g_mega_capture->P = P; g_mega_capture->window = WINDOW; g_mega_capture->pdl = pdl; g_mega_capture->valid = true; return; }
 #endif
     static bool configured[16] = {false};
     int dev = 0; cudaGetDevice(&dev);
     if (!configured[dev]) {
-        TORCH_CHECK(cudaFuncSetAttribute(attn_block_mega_kernel<WINDOW, QONLY>, cudaFuncAttributeMaxDynamicSharedMemorySize, MG_SMEM_ALLOC) == cudaSuccess, "smem attribute");
+        TORCH_CHECK(cudaFuncSetAttribute(attn_block_mega_kernel<WINDOW, QONLY, TRACE_WAITS>, cudaFuncAttributeMaxDynamicSharedMemorySize, MG_SMEM_ALLOC) == cudaSuccess, "smem attribute");
         configured[dev] = true;
     }
     cudaLaunchConfig_t cfg = {};
@@ -2693,7 +2693,15 @@ static void launch_mega_t(const MegaParams& P, cudaStream_t stream, bool pdl) {
     at[0].id = cudaLaunchAttributeClusterDimension; at[0].val.clusterDim.x = CL; at[0].val.clusterDim.y = 1; at[0].val.clusterDim.z = 1;
     at[1].id = cudaLaunchAttributeProgrammaticStreamSerialization; at[1].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = at; cfg.numAttrs = pdl ? 2 : 1;
-    TORCH_CHECK(cudaLaunchKernelEx(&cfg, attn_block_mega_kernel<WINDOW, QONLY>, P) == cudaSuccess, "attn_block_mega launch failed");
+    TORCH_CHECK(cudaLaunchKernelEx(&cfg, attn_block_mega_kernel<WINDOW, QONLY, TRACE_WAITS>, P) == cudaSuccess, "attn_block_mega launch failed");
+}
+
+// Select the counter specialization on the host; normal launches contain no
+// wait-timing clock reads. Keep the existing body default for fused-layer callers.
+template <int WINDOW, bool QONLY = false>
+static void launch_mega_t(const MegaParams& P, cudaStream_t stream, bool pdl) {
+    if (P.dbg) launch_mega_instance_t<WINDOW, QONLY, true>(P, stream, pdl);
+    else launch_mega_instance_t<WINDOW, QONLY, false>(P, stream, pdl);
 }
 
 // x [32][6144] fp8 (row stride % 16 B == 0) | x_scale_t [48][>= 32] fp32 rows (= the deep_gemm column-major [32, 48] scale's transpose
