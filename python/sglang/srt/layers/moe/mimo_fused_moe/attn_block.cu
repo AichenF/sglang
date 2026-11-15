@@ -1027,6 +1027,9 @@ constexpr int G_W = 8192, G_X = M * QBK, G_SX = M * 4, G_ST = 12288;   // <= 60 
 #ifndef MEGA_LATE_GATHER
 #define MEGA_LATE_GATHER (MEGA_EARLY_KV ? 0 : 1)                     // 1: attention CTAs compute their window slots in the prologue but issue the K / V gathers after their
 #endif                                         //    GEMM loop (L2-resident rows, landing during the handoff) -> their GEMM ring can use 16 stages
+#ifndef BLK_EPILOGUE_SYNC
+#define BLK_EPILOGUE_SYNC 0                   // standalone experiment: overlap final cluster barrier with output publication
+#endif
 #ifndef MEGA_KVPF_END
 #define MEGA_KVPF_END 0                        // 1: the next SWA layer's K / V L2 prefetch at the kernel end; 0: right after the attention release
 #endif
@@ -2383,6 +2386,13 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
             }
         }
         named_bar_sync(1, NMATH);
+#if BLK_EPILOGUE_SYNC
+        // Every math warp has consumed its DSMEM partial; this barrier also
+        // completes all local BF16 output writes before publication below.
+        // Only the lifetime rendezvous moves: every original output store and
+        // its PDL publication remain in their original order.
+        if constexpr (!FUSED && !QONLY) asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+#endif
         const unsigned epoch = s_epoch[0];
         const int c0 = rbase + COLS * h;
         const int tok = tid >> 3, g6 = tid & 7;
@@ -2399,7 +2409,19 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
         }
         if constexpr (FUSED) { if (c < LAYER_TOKC) named_bar_arrive(LAYER_PUSH_BAR, 2 * NMATH); }   // -> the layer kernel's token-reduce warps
         }   // !qonly
+#if BLK_EPILOGUE_SYNC
+        else {
+            // Dynamic QKV-only mode reuses the existing !qonly branch.
+            if constexpr (!FUSED && !QONLY) asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+        }
+#endif
     }
+#if BLK_EPILOGUE_SYNC
+    else {
+        // Producer roles reuse the existing math-role branch; no extra warp test.
+        if constexpr (!FUSED && !QONLY) asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+    }
+#endif
     if (R_MATH && MEGA_KVPF_END && att && P.nkc && ((c / CL) % NHG) == 0 && tid < NMATH) {
         const int* sl_ = reinterpret_cast<const int*>(smem + MG_OFF_XG);
         const int NR = h ? (144 - 64) : 64;
@@ -2417,7 +2439,12 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
     // FUSED: the layer kernel's MoE phase reuses this shared memory (generic and TMA writes): order this phase's generic smem writes
     // before later async-proxy writes, and invalidate the mbarrier objects once both CTAs of the pair are past the end sync
     if constexpr (FUSED && R_MATH) asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+#if BLK_EPILOGUE_SYNC
+    if constexpr (!FUSED && !QONLY) asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
+    else cluster_sync_relaxed();
+#else
     cluster_sync_relaxed();
+#endif
     if constexpr (FUSED && R_MATH) {
         constexpr int MG_NBAR = 3 * NS + 6 + 2 * GNS_OTH + 10;   // wfull, bfull, sempty | att_in .. bgo | gfull, gempty | gdone .. qrel
         static_assert(MG_NBAR * 8 <= MG_OFF_MISC - MG_OFF_BAR, "mega barrier region");

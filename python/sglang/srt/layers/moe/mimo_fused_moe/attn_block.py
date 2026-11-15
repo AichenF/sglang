@@ -33,7 +33,7 @@ def ext():
             name=name,
             sources=[os.path.join(HERE, "attn_block.cu")],
             # --use_fast_math: the attention math must match swa_decode_mma (JIT-built with it: approximate 1/l, ftz exp2) bit for bit
-            extra_cuda_cflags=["-O3", "--use_fast_math", "-gencode=arch=compute_90a,code=sm_90a", "-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK"] + extra,
+            extra_cuda_cflags=["-O3", "--use_fast_math", "-gencode=arch=compute_90a,code=sm_90a", "-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK", "-DBLK_EPILOGUE_SYNC=1"] + extra,
             verbose=False,
         )
     return _ext
