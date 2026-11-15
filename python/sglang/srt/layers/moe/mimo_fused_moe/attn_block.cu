@@ -1716,6 +1716,8 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
     const int h = (int)cluster_rank(), p = c / CL;
     const int kbase = h * (KO / CL), rbase = p * PCOLS;
     const bool qonly = QONLY || (P.mode & MODE_QKV_ONLY);   // FA layers: the qkv GEMM alone (rows into qout), no attention / o_proj
+    constexpr bool late_kt_producer = BLK_LATE_KT_PRODUCER && !FUSED && !QONLY && MEGA_KTREADY && !MEGA_LL
+                                      && NW == 8 && NS == 13 && NKT == 16;
     const bool att = c < NATT && !qonly;
     const int gns = att ? MEGA_GNS_ATT : MEGA_GNS_OTH;   // ring stage / lap parity tracked incrementally (no runtime division)
     const int qrow0 = q_row0(p), qg = q_rows(p), qmid = (qg + 1) / 2;
@@ -1929,10 +1931,8 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
 #endif
         }
         __syncwarp();
-        if constexpr (!FUSED && BLK_LATE_KT_PRODUCER) {
+        if constexpr (late_kt_producer) {
             if (!qonly) {
-                static_assert(MEGA_KTREADY && !MEGA_LL && NW == 8 && NS == 13 && NKT == 16,
-                              "late tile producer geometry");
                 // Reuse the retired x producer for tiles 8..15. Its writes
                 // must follow this CTA's last use of the shared tile region.
                 if (lane == 0) {
@@ -2317,7 +2317,7 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
             // (acquire by the issuing thread), then issues that k-tile's TMA; k-tiles NS.. are lane 1 of the producer warp's (after bgo)
             // lanes 4 j .. 4 j + 3 of warp w: k-tile w + 8 j, one producer flag per lane (concurrent polls), then lane 4 j issues the TMA
             // (k-tiles 13..15: the stage is still busy -> lane 4 j arrives kt_seen and the producer warp's lane 1 issues them later)
-            if (lane < ((!FUSED && BLK_LATE_KT_PRODUCER) ? 4 : 8)) {
+            if (lane < (late_kt_producer ? 4 : 8)) {
                 const int j = lane >> 2, kt = warp + NW * j, b = lane & 3;
                 if (kt < NKT) {
                     const unsigned* fl = P.flags + (2 * (b * NHG + 4 * h + kt / 4) + (kt & 1)) * FLAG_STRIDE;
