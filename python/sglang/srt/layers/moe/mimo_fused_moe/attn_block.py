@@ -19,7 +19,7 @@ PREPUSHED_MODE = 1 << 30
 def ext():
     global _ext
     if _ext is None:
-        extra = os.environ.get("BLK_NVCC_FLAGS", "").split()
+        extra = ["-DBLK_LATE_KT_PRODUCER=1"] + os.environ.get("BLK_NVCC_FLAGS", "").split()
         # the extension name carries a hash of the source: torch's JIT build decides by file mtimes (ninja), and E2E runs of different
         # snapshots share one TORCH_EXTENSIONS_DIR -- an older-mtime source would otherwise silently load another version's binary
         import hashlib

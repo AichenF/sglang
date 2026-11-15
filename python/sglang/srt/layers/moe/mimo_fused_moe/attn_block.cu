@@ -1030,6 +1030,9 @@ constexpr int G_W = 8192, G_X = M * QBK, G_SX = M * 4, G_ST = 12288;   // <= 60 
 #ifndef BLK_EPILOGUE_SYNC
 #define BLK_EPILOGUE_SYNC 0                   // standalone experiment: overlap final cluster barrier with output publication
 #endif
+#ifndef BLK_LATE_KT_PRODUCER
+#define BLK_LATE_KT_PRODUCER 0
+#endif
 #ifndef MEGA_KVPF_END
 #define MEGA_KVPF_END 0                        // 1: the next SWA layer's K / V L2 prefetch at the kernel end; 0: right after the attention release
 #endif
@@ -1926,6 +1929,33 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
 #endif
         }
         __syncwarp();
+        if constexpr (!FUSED && BLK_LATE_KT_PRODUCER) {
+            if (!qonly) {
+                static_assert(MEGA_KTREADY && !MEGA_LL && NW == 8 && NS == 13 && NKT == 16,
+                              "late tile producer geometry");
+                // Reuse the retired x producer for tiles 8..15. Its writes
+                // must follow this CTA's last use of the shared tile region.
+                if (lane == 0) {
+                    mbar_wait(ep_bar, 0);
+                    mbar_wait(att ? att_done : qready, 0);
+                }
+                __syncwarp();
+                const int kt = NW + (lane >> 2), b = lane & 3;
+                const unsigned epoch = s_epoch[0];
+                const unsigned* fl = P.flags + (2 * (b * NHG + 4 * h + kt / 4) + (kt & 1)) * FLAG_STRIDE;
+                while (ld_acquire_gpu(fl) != epoch) __nanosleep(32);
+                __syncwarp(0xFu << (4 * (lane >> 2)));
+                if (b == 0) {
+                    if (kt < NS) {
+                        asm volatile("fence.proxy.async.global;" ::: "memory");
+                        mbar_expect(&bfull[kt], BT_BYTES);
+                        tma_load_2d_nohint(smem + kt * ST_BYTES + WT_BYTES, &P.tm_a, kbase + kt * KT, 0, &bfull[kt]);
+                    } else {
+                        mbar_arrive(kt_seen);
+                    }
+                }
+            }
+        }
 #if MEGA_GWARP
     } else if (warp >= NW + 3) {
         if (att) {
@@ -2287,7 +2317,7 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
             // (acquire by the issuing thread), then issues that k-tile's TMA; k-tiles NS.. are lane 1 of the producer warp's (after bgo)
             // lanes 4 j .. 4 j + 3 of warp w: k-tile w + 8 j, one producer flag per lane (concurrent polls), then lane 4 j issues the TMA
             // (k-tiles 13..15: the stage is still busy -> lane 4 j arrives kt_seen and the producer warp's lane 1 issues them later)
-            if (lane < 8) {
+            if (lane < ((!FUSED && BLK_LATE_KT_PRODUCER) ? 4 : 8)) {
                 const int j = lane >> 2, kt = warp + NW * j, b = lane & 3;
                 if (kt < NKT) {
                     const unsigned* fl = P.flags + (2 * (b * NHG + 4 * h + kt / 4) + (kt & 1)) * FLAG_STRIDE;
