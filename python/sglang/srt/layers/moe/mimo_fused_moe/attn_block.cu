@@ -2146,7 +2146,12 @@ __device__ __forceinline__ void mega_body(const MegaParams& P, uint8_t* smem) {
             wg_wait<0>();
             finish_1(g + QKH - 2, tB);
 #endif
-            if (TRACE_WAITS && P.dbg && (tid & 127) == 0) { P.dbg[blockIdx.x * NDBG + 27 + g] = cw; P.dbg[blockIdx.x * NDBG + 29] = clock64() - c0; }
+            if (TRACE_WAITS && P.dbg && (tid & 127) == 0) {
+                P.dbg[blockIdx.x * NDBG + 27 + g] = cw;
+                // Standalone slot 29 belongs to warpgroup 0; two leaders must not race on one duration.
+                // Preserve the separately maintained fused path's existing instrumentation.
+                if (FUSED || g == 0) P.dbg[blockIdx.x * NDBG + 29] = clock64() - c0;
+            }
 #if MEGA_LATE_GATHER && !MEGA_MID_GATHER && !MEGA_GWARP
             if (att && !MEGA_REL_EARLY) { named_bar_sync(1, NMATH); mega_gather_issue<WINDOW>(P, smem, h); }   // every unit consumed: the ring is dead
 #endif
